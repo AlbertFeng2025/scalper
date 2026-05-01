@@ -24,147 +24,109 @@ using NinjaTrader.NinjaScript.DrawingTools;
 #endregion
 
 // =============================================================================
-//  STRATEGY:    LongScalper v2.3
+//  STRATEGY:    LongScalper v2.4
 //  AUTHOR:      Drafted with help from Claude
-//  VERSION:     2.3 - ORPHAN ORDER CLEANUP
+//  VERSION:     2.4 - FIXED LIMIT PRICE OPTION
 // =============================================================================
 //
-//  WHAT THIS STRATEGY DOES (PLAIN ENGLISH)
-//  ---------------------------------------
-//  Human-triggered LONG-ONLY scalper.
-//  Core idea: after entry, hold winners as long as price keeps going up,
-//             exit fast when price stalls or pulls back.
+//  v2.4 CHANGES vs v2.3
+//  --------------------
+//  Two small changes, all other logic unchanged.
 //
-//  v2.3 CHANGES vs v2.2:
-//  ---------------------
-//  This version addresses the "orphan working order" issue where, after
-//  the position closed, a leftover stop or target order remained working
-//  in NT, causing user confusion and chart display showing position-like
-//  state.
+//  CHANGE 1: New "Limit Mode" dropdown for entry price.
 //
-//  Three improvements:
-//  1) Track stop and target order objects by capturing them in
-//     OnOrderUpdate using NT's automatic names ("Stop loss" and
-//     "Profit target"). This lets us CANCEL them directly.
-//  2) New CleanupRemainingBrackets() function that explicitly cancels
-//     any working stop/target orders. Called when position closes
-//     and when entry order times out.
-//  3) Small delay (DisableDelaySeconds, default 1.5s) between cleanup
-//     and DisableStrategy. Gives NT time to finish OCO processing
-//     before the strategy shuts down.
+//    Two options:
+//      (a) OffsetFromLastPrice - the existing behavior. Limit price is
+//          computed as: lastPrice - (EntryOffsetMultiplier x avgBarSize).
+//          Use this for fast scalping near current price. (DEFAULT)
 //
-//  These changes are defensive: NT's managed brackets SHOULD auto-cancel
-//  via OCO, but in real-world conditions they don't always. The cleanup
-//  is belt-and-suspenders insurance.
+//      (b) FixedPrice - the user types a specific price. Limit price is
+//          set directly to whatever they typed. Use this when you want
+//          to set a deep limit (e.g. 1000 points below current price)
+//          and let the order sit waiting.
 //
-//  TRADE LIFECYCLE:
-//  ----------------
-//  1. YOU enable the strategy.
-//  2. SAFETY CHECKS: refuse if existing position or working orders.
-//  3. Read last traded price. Calculate avg recent bar size (volatility).
-//  4. Calculate limit price, target price, stop price.
-//  5. PRE-DECLARE bracket: SetProfitTarget + SetStopLoss with target/stop
-//     based on the LIMIT PRICE (which equals our expected fill price).
-//  6. Place buy limit at: lastPrice - (Multiplier x avgBarSize).
-//  7. Wait up to OrderLifeSeconds for fill.
-//     - Not filled -> cleanup brackets, audit, disable. END.
-//  8. Filled -> NT auto-attaches the pre-declared brackets. We are now
-//     in position with stop and target already protecting us. We capture
-//     references to those bracket orders as they appear.
-//  9. MONITOR LOOP starts. Every MonitorIntervalSeconds:
-//     - Trade healthy: ratchet stop UP toward currentPrice - TrailDistance
-//     - Pullback detected: leave stop where it is.
-//     - Stop only ever moves UP, never down.
-// 10. Position closes (target, trailed stop, or manual):
-//     - Audit log
-//     - Cleanup any remaining bracket orders
-//     - Wait DisableDelaySeconds for NT to finish processing
-//     - Disable the strategy
+//    The dropdown is a parameter called `LimitMode`. The price for fixed
+//    mode is a parameter called `FixedLimitPrice`.
 //
-//  PARAMETERS (defaults):
-//  ----------------------
-//  Quantity                 1     - contracts per trade
-//  EntryOffsetMultiplier    0.10  - limit offset = this x avgBarSize
-//  BarSizeAveragePeriod    10    - 1-min bars in EMA volatility calc
-//  OrderLifeSeconds         5    - cancel limit if not filled
-//  ProfitTargetPoints      10    - target = expectedFill + this many points
-//  HardStopPoints          20    - INITIAL stop = expectedFill - this many points
-//  MonitorIntervalSeconds   3    - how often the trailing loop runs
-//  PullbackTolerancePoints  2    - allowed pullback before considering reversal
-//  TrailDistancePoints      8    - trailing stop sits this far below price
-//  DisableDelaySeconds   1.5    - wait this long between cleanup and disable
-//  EnableSoundOnFill     true    - play sound on entry fill
-//  AuditLogPath        C:\temp   - where to write CSV
+//    When using FixedPrice mode, you also probably want to raise
+//    OrderLifeSeconds to something larger than 5 -- otherwise the deep
+//    limit will get cancelled before it has a chance to fill.
 //
-//  HOW TO USE:
-//  -----------
-//  1. Compile in NinjaScript Editor (F5).
-//  2. Right-click chart -> Strategies -> Add LongScalper.
-//  3. Set "Stop behavior" = "Close position".
-//  4. Verify Positions and Orders tabs are empty before enabling.
-//  5. Enable when you see your trade setup.
-//  6. Strategy executes ONE trade then disables itself.
+//  CHANGE 2: OrderLifeSeconds maximum raised from 3600 (1 hour) to
+//    86400 (24 hours). This lets you set very long-life orders for the
+//    fixed-price mode.
+//
+//    Useful values:
+//      5      = 5 seconds (fast scalp)
+//      60     = 1 minute
+//      3600   = 1 hour
+//      36000  = 10 hours
+//      86400  = 24 hours
+//
+//  Everything else (entry sequence, brackets, trailing stop, exit, audit,
+//  cleanup) is identical to v2.3.
+//
+//  AUDIT LOG: One new column `LimitMode` was added so you can later
+//  filter by which mode was used.
 //
 // =============================================================================
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
+    // -------------------------------------------------------------------------
+    // [v2.4 NEW] Enum defining the two limit-price modes.
+    // Placed at namespace level (not inside the class) so NinjaTrader's
+    // property dialog can render it as a dropdown.
+    // -------------------------------------------------------------------------
+    public enum EntryLimitMode
+    {
+        OffsetFromLastPrice,
+        FixedPrice
+    }
+
     public class LongScalper : Strategy
     {
         #region Variables
 
-        // ---- Trade lifecycle state machine ----
-        // Idle -> WaitingForFill -> InPosition -> ClosingDelay -> Done
-        // ClosingDelay is new in v2.3: brief pause after position closes
-        // to let NT finish OCO processing before we disable.
         private enum TradeState
         {
-            Idle,              // Just enabled, haven't placed entry yet
-            WaitingForFill,    // Buy limit submitted, waiting for fill or timeout
-            InPosition,        // Filled. NT manages exits via bracket; we trail the stop.
-            ClosingDelay,      // Position closed, waiting for OCO/cleanup to finish
-            Done               // Cycle complete. Strategy will disable.
+            Idle,
+            WaitingForFill,
+            InPosition,
+            ClosingDelay,
+            Done
         }
         private TradeState currentState = TradeState.Idle;
 
-        // ---- Order tracking ----
-        // We track our entry directly. v2.3 also tracks the bracket
-        // orders so we can cancel them by reference if needed.
         private Order entryOrder        = null;
         private Order stopLossOrder     = null;
         private Order profitTargetOrder = null;
 
-        // ---- Time tracking ----
-        private DateTime entryOrderPlacedTime;   // when we sent the buy limit
-        private DateTime fillTime;               // when buy limit filled
-        private DateTime lastMonitorCheckTime;   // last trailing check ran
-        private DateTime closingDelayStartTime;  // when ClosingDelay began
+        private DateTime entryOrderPlacedTime;
+        private DateTime fillTime;
+        private DateTime lastMonitorCheckTime;
+        private DateTime closingDelayStartTime;
 
-        // ---- Price tracking ----
-        private double entryLastTradedPrice = 0;  // price at moment of enable
-        private double calculatedLimitPrice = 0;  // our buy limit price
-        private double actualFillPrice      = 0;  // where we actually filled
-        private double avgBarSizeAtEntry    = 0;  // recent volatility, for audit
-        private double previousCheckPrice   = 0;  // last price seen by monitor
-        private double currentStopPrice     = 0;  // where the stop sits NOW
-        private double finalExitPrice       = 0;  // captured at position close
-        private double finalPnLPoints       = 0;  // captured at position close
-        private string finalExitReason      = "UNKNOWN";  // captured at position close
+        private double entryLastTradedPrice = 0;
+        private double calculatedLimitPrice = 0;
+        private double actualFillPrice      = 0;
+        private double avgBarSizeAtEntry    = 0;
+        private double previousCheckPrice   = 0;
+        private double currentStopPrice     = 0;
+        private double finalExitPrice       = 0;
+        private double finalPnLPoints       = 0;
+        private string finalExitReason      = "UNKNOWN";
 
-        // ---- Constants ----
         private const int MinuteBarsIndex = 1;
         private const string EntrySignalName = "LongScalperEntry";
 
         #endregion
 
-        // =====================================================================
-        // OnStateChange: runs at each NinjaScript lifecycle stage.
-        // =====================================================================
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
             {
-                Description                                 = "Long-only scalper with trailing stop and orphan-order cleanup.";
+                Description                                 = "Long-only scalper with trailing stop, orphan-order cleanup, and fixed-limit-price option.";
                 Name                                        = "LongScalper";
                 Calculate                                   = Calculate.OnEachTick;
                 EntriesPerDirection                         = 1;
@@ -185,6 +147,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 // ---- Defaults ----
                 Quantity                = 1;
+
+                // [v2.4 NEW] Default to existing behavior so old configs work unchanged.
+                LimitMode               = EntryLimitMode.OffsetFromLastPrice;
+                FixedLimitPrice         = 0;
+
                 EntryOffsetMultiplier   = 0.10;
                 BarSizeAveragePeriod    = 10;
                 OrderLifeSeconds        = 5;
@@ -208,7 +175,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Realtime)
             {
                 Print("================================================================");
-                Print(string.Format("[INIT] LongScalper v2.3 armed at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
+                Print(string.Format("[INIT] LongScalper v2.4 armed at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
+                Print(string.Format("[INIT] LimitMode={0}, FixedLimitPrice={1}",
+                    LimitMode, FixedLimitPrice));
                 Print(string.Format("[INIT] Parameters: OrderLife={0}s, Monitor={1}s, Target={2}pts, InitStop={3}pts, Trail={4}pts, Tolerance={5}pts, DisableDelay={6}s",
                     OrderLifeSeconds, MonitorIntervalSeconds, ProfitTargetPoints,
                     HardStopPoints, TrailDistancePoints, PullbackTolerancePoints, DisableDelaySeconds));
@@ -218,14 +187,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Terminated)
             {
                 Print(string.Format("[TERM] Strategy terminated at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
-                // Final safety net: try to cleanup on terminate too.
                 try { CleanupRemainingBrackets(); } catch { }
             }
         }
 
-        // =====================================================================
-        // OnBarUpdate: runs on every tick. Drives the state machine.
-        // =====================================================================
         protected override void OnBarUpdate()
         {
             if (CurrentBars[0] < BarsRequiredToTrade) return;
@@ -239,18 +204,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                     break;
 
                 case TradeState.WaitingForFill:
-                    // Check if order life expired.
                     if ((DateTime.Now - entryOrderPlacedTime).TotalSeconds >= OrderLifeSeconds)
                     {
-                        // Only cancel + disable if order is still working.
-                        // If order already filled, the fill handler in OnExecutionUpdate
-                        // has already moved us to InPosition; do nothing here.
                         if (entryOrder != null && entryOrder.OrderState == OrderState.Working)
                         {
                             Print(string.Format("[TIMEOUT] Order life expired ({0}s). Cancelling.", OrderLifeSeconds));
                             CancelOrder(entryOrder);
-                            // The actual cleanup/disable will happen in OnOrderUpdate
-                            // when the entry order's state becomes Cancelled.
                         }
                     }
                     break;
@@ -263,12 +222,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     break;
 
                 case TradeState.ClosingDelay:
-                    // Wait DisableDelaySeconds for NT to finish OCO processing,
-                    // then write audit and disable.
                     if ((DateTime.Now - closingDelayStartTime).TotalSeconds >= DisableDelaySeconds)
                     {
                         Print(string.Format("[CLOSE] Delay elapsed. Writing audit and disabling."));
-                        // Final cleanup pass (in case anything remained working).
                         CleanupRemainingBrackets();
                         WriteAuditLog(finalExitReason, actualFillPrice, finalExitPrice, finalPnLPoints);
                         currentState = TradeState.Done;
@@ -281,15 +237,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // =====================================================================
-        // PlaceEntryOrder: safety checks, calculate prices, declare brackets,
-        // place the buy limit.
-        // =====================================================================
         private void PlaceEntryOrder()
         {
             Print("================================================================");
             Print(string.Format("[STEP1] PlaceEntryOrder called at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
             Print(string.Format("[STEP1] Position: {0} qty={1}", Position.MarketPosition, Position.Quantity));
+            Print(string.Format("[STEP1] LimitMode={0}", LimitMode));
 
             // ----- SAFETY CHECK 1: Strategy's own position must be flat -----
             if (Position.MarketPosition != MarketPosition.Flat)
@@ -359,7 +312,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(string.Format("[STEP1] WARN: Working orders check failed: {0}", ex.Message));
             }
 
-            // ----- Read current price -----
+            // ----- Read current price (always useful for logging/audit) -----
             entryLastTradedPrice = GetCurrentLastPrice();
             if (entryLastTradedPrice <= 0)
             {
@@ -369,23 +322,54 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // ----- Compute volatility-adjusted offset and limit price -----
-            avgBarSizeAtEntry = CalculateEmaBarSize();
-            if (avgBarSizeAtEntry <= 0)
+            // -----------------------------------------------------------------
+            // [v2.4 NEW] Branch on LimitMode to compute the limit price.
+            // -----------------------------------------------------------------
+            if (LimitMode == EntryLimitMode.FixedPrice)
             {
-                Print("[STEP1] ERROR: Could not calculate bar size. Disabling.");
-                currentState = TradeState.Done;
-                DisableStrategy();
-                return;
+                // ---- Fixed price mode: use whatever the user typed. ----
+
+                // Sanity check: must be a positive price.
+                if (FixedLimitPrice <= 0)
+                {
+                    Print(string.Format("[STEP1] *** BLOCKED *** FixedLimitPrice is {0} (must be > 0).",
+                        FixedLimitPrice));
+                    WriteAuditLog("BLOCKED_INVALID_FIXED_PRICE", 0, 0, 0);
+                    currentState = TradeState.Done;
+                    DisableStrategy();
+                    return;
+                }
+
+                // We still compute avgBarSize for audit logging.
+                avgBarSizeAtEntry = CalculateEmaBarSize();
+
+                // Round the user's price to the instrument's tick size.
+                calculatedLimitPrice = Instrument.MasterInstrument.RoundToTickSize(FixedLimitPrice);
+
+                Print(string.Format("[STEP1] FixedPrice mode: lastPrice={0}, userTyped={1}, rounded limitPrice={2}",
+                    entryLastTradedPrice, FixedLimitPrice, calculatedLimitPrice));
+            }
+            else
+            {
+                // ---- OffsetFromLastPrice mode: original v2.3 behavior. ----
+
+                avgBarSizeAtEntry = CalculateEmaBarSize();
+                if (avgBarSizeAtEntry <= 0)
+                {
+                    Print("[STEP1] ERROR: Could not calculate bar size. Disabling.");
+                    currentState = TradeState.Done;
+                    DisableStrategy();
+                    return;
+                }
+
+                double offset = EntryOffsetMultiplier * avgBarSizeAtEntry;
+                calculatedLimitPrice = Instrument.MasterInstrument.RoundToTickSize(entryLastTradedPrice - offset);
+
+                Print(string.Format("[STEP1] Offset mode: lastPrice={0}, avgBarSize={1:F2}, offset={2:F2}, limitPrice={3}",
+                    entryLastTradedPrice, avgBarSizeAtEntry, offset, calculatedLimitPrice));
             }
 
-            double offset = EntryOffsetMultiplier * avgBarSizeAtEntry;
-            calculatedLimitPrice = Instrument.MasterInstrument.RoundToTickSize(entryLastTradedPrice - offset);
-
-            Print(string.Format("[STEP1] lastPrice={0}, avgBarSize={1:F2}, offset={2:F2}, limitPrice={3}",
-                entryLastTradedPrice, avgBarSizeAtEntry, offset, calculatedLimitPrice));
-
-            // ----- Pre-declare bracket BEFORE entry (v2.2 pattern, kept) -----
+            // ----- Pre-declare bracket BEFORE entry (same as v2.3) -----
             double expectedFillPrice = calculatedLimitPrice;
             double targetPrice = Instrument.MasterInstrument.RoundToTickSize(expectedFillPrice + ProfitTargetPoints);
             double initialStop = Instrument.MasterInstrument.RoundToTickSize(expectedFillPrice - HardStopPoints);
@@ -405,17 +389,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // ----- State BEFORE EnterLongLimit so handlers see correct state -----
             entryOrderPlacedTime = DateTime.Now;
             currentState = TradeState.WaitingForFill;
 
             entryOrder = EnterLongLimit(0, true, Quantity, calculatedLimitPrice, EntrySignalName);
-            Print(string.Format("[STEP1] Buy limit submitted. State now: {0}", currentState));
+            Print(string.Format("[STEP1] Buy limit submitted at {0}. State now: {1}", calculatedLimitPrice, currentState));
         }
 
-        // =====================================================================
-        // CalculateEmaBarSize: EMA of recent 1-min bar ranges.
-        // =====================================================================
         private double CalculateEmaBarSize()
         {
             if (BarsArray.Length <= MinuteBarsIndex) return 0;
@@ -435,9 +415,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             return ema;
         }
 
-        // =====================================================================
-        // GetCurrentLastPrice: most recent close on primary chart series.
-        // =====================================================================
         private double GetCurrentLastPrice()
         {
             if (Closes[0].Count > 0)
@@ -445,9 +422,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             return 0;
         }
 
-        // =====================================================================
-        // DoTrailingCheck: ratchet the stop UP as price moves favorably.
-        // =====================================================================
         private void DoTrailingCheck()
         {
             try
@@ -507,16 +481,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // =====================================================================
-        // CleanupRemainingBrackets (NEW IN v2.3): explicitly cancel any
-        // working stop/target orders for this strategy. Belt-and-suspenders
-        // protection against orphan orders.
-        //
-        // Implementation: iterate the account's orders and cancel any that
-        // are working AND match our instrument AND have names that look like
-        // bracket exits (Stop loss, Profit target). Also cancel via direct
-        // reference if we captured the order objects.
-        // =====================================================================
         private void CleanupRemainingBrackets()
         {
             try
@@ -525,7 +489,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 int cancelled = 0;
 
-                // Method 1: cancel by direct reference if we captured them.
                 if (stopLossOrder != null && IsOrderActive(stopLossOrder))
                 {
                     Print(string.Format("[CLEANUP]   Cancelling tracked stop loss order"));
@@ -545,8 +508,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     cancelled++;
                 }
 
-                // Method 2: scan account orders for any leftover working
-                // bracket orders that we may have missed.
                 if (Account != null)
                 {
                     List<Order> toCancel = new List<Order>();
@@ -581,7 +542,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // Helper: is an order in an "active" (still working) state?
         private bool IsOrderActive(Order o)
         {
             if (o == null) return false;
@@ -590,9 +550,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 || o.OrderState == OrderState.Submitted;
         }
 
-        // =====================================================================
-        // DisableStrategy: schedule strategy to terminate.
-        // =====================================================================
         private void DisableStrategy()
         {
             Print(string.Format("[DISABLE] DisableStrategy called at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
@@ -612,9 +569,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // =====================================================================
-        // OnOrderUpdate: track our entry order, capture bracket orders by name.
-        // =====================================================================
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice,
             int quantity, int filled, double averageFillPrice, OrderState orderState,
             DateTime time, ErrorCode error, string nativeError)
@@ -627,8 +581,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 DateTime.Now.ToString("HH:mm:ss.fff"),
                 oname, orderState, filled, quantity));
 
-            // Capture bracket order references when they appear, by name match.
-            // These are the names NT auto-assigns to managed bracket orders.
             if (oname.Contains("Stop loss") || oname == "Stop loss")
             {
                 if (stopLossOrder == null) Print("[ORDER]   Captured stop loss order reference.");
@@ -640,7 +592,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 profitTargetOrder = order;
             }
 
-            // Track our entry order.
             if (entryOrder != null && order.OrderId == entryOrder.OrderId)
             {
                 if ((orderState == OrderState.Cancelled || orderState == OrderState.Rejected)
@@ -648,8 +599,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     Print(string.Format("[ORDER]   Entry order ended without fill: {0}", orderState));
                     WriteAuditLog("ENTRY_NOT_FILLED_" + orderState.ToString(), 0, 0, 0);
-                    // Still call cleanup in case any pre-declared brackets
-                    // ended up working somehow.
                     CleanupRemainingBrackets();
                     currentState = TradeState.Done;
                     DisableStrategy();
@@ -657,9 +606,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // =====================================================================
-        // OnExecutionUpdate: handle entry fills and exit fills.
-        // =====================================================================
         protected override void OnExecutionUpdate(Execution execution, string executionId,
             double price, int quantity, MarketPosition marketPosition, string orderId, DateTime time)
         {
@@ -682,7 +628,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(string.Format("[EXEC]   currentState={0}, Position={1} qty={2}",
                     currentState, Position.MarketPosition, Position.Quantity));
 
-                // ---- ENTRY FILL DETECTED ----
                 bool isEntryFill = false;
                 if (execOrder != null && entryOrder != null && execOrderId == entryOrder.OrderId
                     && execState == OrderState.Filled)
@@ -715,7 +660,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Print(string.Format("[EXEC]   State now: {0}.", currentState));
                 }
 
-                // ---- POSITION CLOSED DETECTED ----
                 if (Position.MarketPosition == MarketPosition.Flat
                     && currentState == TradeState.InPosition)
                 {
@@ -738,11 +682,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Print(string.Format("[EXEC]   *** POSITION CLOSED at {0} ({1}). PnL = {2:F2} pts ***",
                         finalExitPrice, finalExitReason, finalPnLPoints));
 
-                    // First-pass cleanup right at the close moment.
                     CleanupRemainingBrackets();
 
-                    // Move into ClosingDelay. OnBarUpdate will run final cleanup
-                    // and audit/disable after DisableDelaySeconds elapse.
                     closingDelayStartTime = DateTime.Now;
                     currentState = TradeState.ClosingDelay;
                     Print(string.Format("[EXEC]   State now: {0}. Waiting {1}s for OCO finalization.",
@@ -756,9 +697,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // =====================================================================
-        // OnPositionUpdate: visibility logging.
-        // =====================================================================
         protected override void OnPositionUpdate(Position position, double averagePrice,
             int quantity, MarketPosition marketPosition)
         {
@@ -773,9 +711,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // =====================================================================
-        // ResetTradeState: clear all per-cycle state on DataLoaded.
-        // =====================================================================
         private void ResetTradeState()
         {
             currentState           = TradeState.Idle;
@@ -794,7 +729,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // WriteAuditLog: append one CSV row to the audit log.
+        // WriteAuditLog: now also records LimitMode column.
         // =====================================================================
         private void WriteAuditLog(string outcome, double fillPrice, double exitPrice, double pnlPoints)
         {
@@ -811,12 +746,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (!fileExists)
                     {
                         sw.WriteLine("Timestamp,Instrument,Outcome,EnableTime,FillTime,ExitTime,"
-                            + "LastPriceAtEnable,AvgBarSize,EntryOffsetMultiplier,LimitPrice,FillPrice,"
+                            + "LastPriceAtEnable,AvgBarSize,EntryOffsetMultiplier,LimitMode,LimitPrice,FillPrice,"
                             + "ExitPrice,PnLPoints,OrderLifeSeconds,MonitorIntervalSeconds,"
                             + "ProfitTargetPoints,HardStopPoints,PullbackTolerancePoints,TrailDistancePoints");
                     }
 
-                    sw.WriteLine(string.Format("{0},{1},{2},{3},{4},{5},{6},{7:F2},{8:F2},{9},{10},{11},{12:F2},{13},{14},{15},{16},{17},{18}",
+                    sw.WriteLine(string.Format("{0},{1},{2},{3},{4},{5},{6},{7:F2},{8:F2},{9},{10},{11},{12},{13:F2},{14},{15},{16},{17},{18},{19}",
                         DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
                         Instrument.FullName,
                         outcome,
@@ -826,6 +761,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         entryLastTradedPrice,
                         avgBarSizeAtEntry,
                         EntryOffsetMultiplier,
+                        LimitMode,
                         calculatedLimitPrice,
                         fillPrice,
                         exitPrice,
@@ -852,57 +788,81 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name="Quantity", Description="Number of contracts per trade.", Order=1, GroupName="Trade Size")]
         public int Quantity { get; set; }
 
+        // ---------------------------------------------------------------------
+        // [v2.4 NEW] LimitMode dropdown.
+        // ---------------------------------------------------------------------
         [NinjaScriptProperty]
-        [Range(0.01, 1.0)]
-        [Display(Name="EntryOffsetMultiplier", Description="Limit = lastPrice - (this x avgBarSize). Default 0.10.", Order=2, GroupName="Entry")]
+        [Display(Name="LimitMode",
+            Description="How to compute the buy limit price. OffsetFromLastPrice (default) = lastPrice - (EntryOffsetMultiplier * avgBarSize). FixedPrice = use the FixedLimitPrice value below.",
+            Order=2, GroupName="Entry")]
+        public EntryLimitMode LimitMode { get; set; }
+
+        // ---------------------------------------------------------------------
+        // [v2.4 NEW] FixedLimitPrice (only used when LimitMode = FixedPrice).
+        // ---------------------------------------------------------------------
+        [NinjaScriptProperty]
+        [Range(0.0, double.MaxValue)]
+        [Display(Name="FixedLimitPrice",
+            Description="The exact limit price to use when LimitMode = FixedPrice. Ignored if LimitMode = OffsetFromLastPrice. Set this much lower than current price (e.g. 1000 points) to bait deep dips. Remember to also raise OrderLifeSeconds.",
+            Order=3, GroupName="Entry")]
+        public double FixedLimitPrice { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.01, 10.0)]
+        [Display(Name="EntryOffsetMultiplier", Description="Limit = lastPrice - (this x avgBarSize). Used only in OffsetFromLastPrice mode. Default 0.10 or 10%. Max 10, means 10 times of avg bar size", Order=4, GroupName="Entry")]
         public double EntryOffsetMultiplier { get; set; }
 
         [NinjaScriptProperty]
         [Range(2, 100)]
-        [Display(Name="BarSizeAveragePeriod", Description="Number of recent 1-min bars used in EMA volatility calc. Default 10.", Order=3, GroupName="Entry")]
+        [Display(Name="BarSizeAveragePeriod", Description="Number of recent 1-min bars used in EMA volatility calc. Default 10.", Order=5, GroupName="Entry")]
         public int BarSizeAveragePeriod { get; set; }
 
+        // ---------------------------------------------------------------------
+        // [v2.4 CHANGED] Range max raised from 3600 to 86400 (24 hours).
+        // ---------------------------------------------------------------------
         [NinjaScriptProperty]
-        [Range(1, 3600)]
-        [Display(Name="OrderLifeSeconds", Description="Cancel buy limit if not filled within this many seconds. Default 5.", Order=4, GroupName="Entry")]
+        [Range(1, 86400)]
+        [Display(Name="OrderLifeSeconds",
+            Description="Cancel buy limit if not filled within this many seconds. Default 5 (fast scalp). For FixedPrice mode set this large: 3600=1hr, 36000=10hr, 86400=24hr.",
+            Order=6, GroupName="Entry")]
         public int OrderLifeSeconds { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 1000)]
-        [Display(Name="ProfitTargetPoints", Description="Profit target = expectedFill + this many points. Default 10.", Order=5, GroupName="Exit")]
+        [Display(Name="ProfitTargetPoints", Description="Profit target = expectedFill + this many points. Default 10.", Order=7, GroupName="Exit")]
         public int ProfitTargetPoints { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 200)]
-        [Display(Name="HardStopPoints", Description="INITIAL stop = expectedFill - this many points. Default 20.", Order=6, GroupName="Exit")]
+        [Display(Name="HardStopPoints", Description="INITIAL stop = expectedFill - this many points. Default 20.", Order=8, GroupName="Exit")]
         public int HardStopPoints { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 3600)]
-        [Display(Name="MonitorIntervalSeconds", Description="How often the trailing check runs. Default 3.", Order=7, GroupName="Trailing")]
+        [Display(Name="MonitorIntervalSeconds", Description="How often the trailing check runs. Default 3.", Order=9, GroupName="Trailing")]
         public int MonitorIntervalSeconds { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 50)]
-        [Display(Name="PullbackTolerancePoints", Description="Tolerated pullback before considering a real reversal. Default 2.", Order=8, GroupName="Trailing")]
+        [Display(Name="PullbackTolerancePoints", Description="Tolerated pullback before considering a real reversal. Default 2.", Order=10, GroupName="Trailing")]
         public int PullbackTolerancePoints { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 200)]
-        [Display(Name="TrailDistancePoints", Description="Trailed stop sits this many points below current price. Default 8.", Order=9, GroupName="Trailing")]
+        [Display(Name="TrailDistancePoints", Description="Trailed stop sits this many points below current price. Default 8.", Order=11, GroupName="Trailing")]
         public int TrailDistancePoints { get; set; }
 
         [NinjaScriptProperty]
         [Range(0.0, 10.0)]
-        [Display(Name="DisableDelaySeconds", Description="Delay between position close and strategy disable. Default 1.5.", Order=10, GroupName="Cleanup")]
+        [Display(Name="DisableDelaySeconds", Description="Delay between position close and strategy disable. Default 1.5.", Order=12, GroupName="Cleanup")]
         public double DisableDelaySeconds { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name="EnableSoundOnFill", Description="Play sound when entry fills.", Order=11, GroupName="Notifications")]
+        [Display(Name="EnableSoundOnFill", Description="Play sound when entry fills.", Order=13, GroupName="Notifications")]
         public bool EnableSoundOnFill { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name="AuditLogPath", Description="Folder for audit log CSV. Auto-created if missing. Default C:\\temp.", Order=12, GroupName="Logging")]
+        [Display(Name="AuditLogPath", Description="Folder for audit log CSV. Auto-created if missing. Default C:\\temp.", Order=14, GroupName="Logging")]
         public string AuditLogPath { get; set; }
 
         #endregion
