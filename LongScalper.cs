@@ -24,64 +24,218 @@ using NinjaTrader.NinjaScript.DrawingTools;
 #endregion
 
 // =============================================================================
-//  STRATEGY:    LongScalper v2.4
+//  STRATEGY:    LongScalper v2.5
 //  AUTHOR:      Drafted with help from Claude
-//  VERSION:     2.4 - FIXED LIMIT PRICE OPTION
+//  VERSION:     2.5 - ATR-BASED ADAPTIVE STOPS
 // =============================================================================
 //
-//  v2.4 CHANGES vs v2.3
+//  v2.5 CHANGES vs v2.4
 //  --------------------
-//  Two small changes, all other logic unchanged.
+//  Adaptive stop loss using ATR (Average True Range).
 //
-//  CHANGE 1: New "Limit Mode" dropdown for entry price.
+// =============================================================================
+//  HOW TO USE THIS STRATEGY
+// =============================================================================
 //
-//    Two options:
-//      (a) OffsetFromLastPrice - the existing behavior. Limit price is
-//          computed as: lastPrice - (EntryOffsetMultiplier x avgBarSize).
-//          Use this for fast scalping near current price. (DEFAULT)
+//  CHART SETUP
+//  -----------
+//  Chart bar size does NOT matter for the strategy logic. The strategy
+//  internally adds its own 1-min data series (via AddDataSeries) and uses
+//  that for ALL calculations: avgBarSize for entry offset, ATR for stops,
+//  trailing checks, etc. The chart bar size only affects what YOU see.
 //
-//      (b) FixedPrice - the user types a specific price. Limit price is
-//          set directly to whatever they typed. Use this when you want
-//          to set a deep limit (e.g. 1000 points below current price)
-//          and let the order sit waiting.
+//  Recommended: 1-min chart. Why?
+//    - Visually matches what the strategy is doing internally.
+//    - Output Window timestamps line up with bars you can see.
+//    - Easier to debug or audit what happened.
 //
-//    The dropdown is a parameter called `LimitMode`. The price for fixed
-//    mode is a parameter called `FixedLimitPrice`.
+//  Other sizes (5-min, 15-min, 30-min) work fine but you lose visual
+//  alignment with the strategy's actual decisions. Tick charts also work.
 //
-//    When using FixedPrice mode, you also probably want to raise
-//    OrderLifeSeconds to something larger than 5 -- otherwise the deep
-//    limit will get cancelled before it has a chance to fill.
+//  PRELOADED DATA
+//  --------------
+//  When you enable the strategy, NT has already loaded historical bars
+//  on your chart. BarsRequiredToTrade = 20 is satisfied immediately as
+//  long as your chart shows at least 20 bars of history (almost always
+//  true). The strategy is ready to trade at the moment of enable.
 //
-//  CHANGE 2: OrderLifeSeconds maximum raised from 3600 (1 hour) to
-//    86400 (24 hours). This lets you set very long-life orders for the
-//    fixed-price mode.
+//  ENABLING - STEP BY STEP
+//  -----------------------
+//  1. Compile in NinjaScript Editor (F5). Confirm "Compile succeeded."
+//  2. Right-click chart -> Strategies -> Add LongScalper.
+//  3. In the strategy parameters dialog:
+//       - Group "1. Trade Size":     set Quantity (default 1)
+//       - Group "2. Entry":          choose LimitMode
+//                                      OffsetFromLastPrice (default) for fast scalp
+//                                      FixedPrice for deep-limit bait
+//                                    if FixedPrice, set FixedLimitPrice
+//                                    set OrderLifeSeconds large for FixedPrice
+//                                      (e.g. 3600 = 1 hr, 86400 = 24 hr)
+//       - Group "3. Profit Target":  ProfitTargetPoints (default 10)
+//       - Group "4. Stop Loss":      StopMode = AtrBased (default, recommended)
+//                                    AtrPeriod (default 14)
+//                                    AtrInitialStopMultiplier (default 2.5)
+//                                    AtrTrailMultiplier (default 1.0)
+//                                    HardStopPoints/TrailDistancePoints
+//                                      only used if StopMode = FixedPoints
+//       - Group "5. Trailing":       MonitorIntervalSeconds (default 3)
+//                                    PullbackTolerancePoints (default 2)
+//       - Group "6. Cleanup":        DisableDelaySeconds (default 1.5)
+//       - Group "7. Notifications":  EnableSoundOnFill (default true)
+//       - Group "8. Logging":        AuditLogPath (default C:\temp)
+//  4. Set "Stop behavior" = "Close position".
+//  5. Verify Positions and Orders tabs are empty.
+//  6. Enable. The strategy will execute ONE trade then disable itself.
 //
-//    Useful values:
-//      5      = 5 seconds (fast scalp)
-//      60     = 1 minute
-//      3600   = 1 hour
-//      36000  = 10 hours
-//      86400  = 24 hours
+//  TYPICAL USE CASES
+//  -----------------
+//  CASE A - Fast scalp during active trading:
+//    LimitMode = OffsetFromLastPrice
+//    EntryOffsetMultiplier = 0.10 (small offset, fills quickly)
+//    OrderLifeSeconds = 5
+//    StopMode = AtrBased
+//    Use this when you see a setup live and want to react fast.
 //
-//  Everything else (entry sequence, brackets, trailing stop, exit, audit,
-//  cleanup) is identical to v2.3.
+//  CASE B - Deep-limit bait order (run during work, sleep, etc):
+//    LimitMode = FixedPrice
+//    FixedLimitPrice = (number well below current price)
+//    OrderLifeSeconds = 86400 (24 hours)
+//    StopMode = AtrBased
+//    For multiple bait orders at different prices, add the strategy
+//    multiple times via NT Control Center. Each runs independently.
 //
-//  AUDIT LOG: One new column `LimitMode` was added so you can later
-//  filter by which mode was used.
+//  RUNNING MULTIPLE COPIES
+//  -----------------------
+//  Each strategy instance is independent. You can run several at once
+//  with different parameters (e.g., 3 different fixed-price baits at
+//  different levels). The audit log appends rows from all instances
+//  to the same LongScalper.csv file.
+//
+//  LIMITATIONS
+//  -----------
+//  1. ONE TRADE PER ENABLE. After fill -> exit -> the strategy DISABLES
+//     itself. To trade again you must re-enable it manually. This is
+//     intentional: removes "what just happened" confusion and prevents
+//     runaway behavior. If you want continuous trading, this strategy
+//     is the wrong tool.
+//
+//  2. LONG ONLY. This file places only buy limits. For shorts, use
+//     ShortScalper (a mirror version). Don't try to short-bait by
+//     entering a fixed price above current market - it will reject the
+//     order or behave unexpectedly.
+//
+//  3. POSITION SIZE FIXED AT ENABLE. Quantity is set when you enable.
+//     The strategy doesn't scale in or pyramid. One fill, one position.
+//
+//  4. NT MANAGED ORDER METHODS. Uses NT's built-in SetProfitTarget /
+//     SetStopLoss for the bracket. This is the simplest, most reliable
+//     pattern for retail use, but means we don't have full control over
+//     how brackets are submitted to the exchange. The cleanup function
+//     handles the rare cases where OCO doesn't auto-cancel cleanly.
+//
+//  5. WALL-CLOCK TIMERS. OrderLifeSeconds and MonitorIntervalSeconds
+//     use real wall-clock time (DateTime.Now). In market replay, replay
+//     speed compresses time, so a "5 second" order life might cancel
+//     after just 1 replay-second. Use moderate replay speeds (5-10x).
+//
+//  6. NOT VALIDATED FOR ALL INSTRUMENTS. Defaults are tuned for MNQ on
+//     1-min bars. Other instruments need parameter tuning, especially:
+//       - ProfitTargetPoints (different markets move different amounts)
+//       - HardStopPoints (different volatility scales)
+//       - PullbackTolerancePoints (smaller-tick instruments need less)
+//
+//  7. NO RE-ENTRY AFTER LOSS. If a trade hits stop, strategy disables.
+//     There's no "automatic try again" - by design, you re-evaluate
+//     before re-enabling.
+//
+//  WHAT TO WATCH IN OUTPUT WINDOW
+//  ------------------------------
+//  [INIT]    - strategy started, parameter summary
+//  [STEP1]   - entry order placement, with calculated prices
+//  [ORDER]   - order state changes (Working, Filled, Cancelled)
+//  [EXEC]    - fill events (entry fill, position close)
+//  [MONITOR] - trailing stop checks (every MonitorIntervalSeconds)
+//  [CLEANUP] - bracket order cancellations after exit
+//  [DISABLE] - strategy shutting down
+//  [AUDIT]   - row written to LongScalper.csv
+//  [TIMEOUT] - entry order lifetime expired before fill
+//  [POSITION]- position update (informational)
+//
+// =============================================================================
+//  MOTIVATION
+//  ----------
+//  Fixed-point stops (HardStopPoints=20, TrailDistancePoints=8) work in
+//  average conditions but are wrong when volatility shifts:
+//    - Quiet day: 20-point stop is too far. Trade ties up capital
+//      sitting through tiny noise that doesn't matter.
+//    - Volatile day: 20-point stop is too tight. Normal market noise
+//      stops you out before the trade has a chance to run.
+//
+//  ATR-based stops adapt automatically. ATR(14) measures average bar
+//  size over the last 14 bars. Multiply by a chosen factor to get a
+//  stop distance proportional to current volatility.
+//
+//  THE NEW PARAMETERS
+//  ------------------
+//  StopMode (dropdown, default = AtrBased):
+//    - AtrBased   : compute stops as ATR x multiplier
+//    - FixedPoints: use HardStopPoints / TrailDistancePoints (v2.4 way)
+//
+//  AtrPeriod (default 14):
+//    Lookback period for ATR calculation. 14 is the standard.
+//    Smaller (7-10) reacts faster, larger (20+) is smoother.
+//
+//  AtrInitialStopMultiplier (default 2.5):
+//    Initial stop distance = ATR x this. Set wider (2-3x) so the trade
+//    has room to breathe right after entry. With ATR=8, this gives a
+//    20-point stop; with ATR=15 it gives a 37.5-point stop.
+//
+//  AtrTrailMultiplier (default 1.0):
+//    Trailing stop distance = ATR x this. Set tighter (0.8-1.5) since
+//    the trade is already running and we want to lock in gains.
+//
+//  WHY TWO MULTIPLIERS?
+//  --------------------
+//  The current code (v2.4) uses HardStopPoints=20 (initial) and
+//  TrailDistancePoints=8 (trail). The 2.5x ratio is intentional: give
+//  room at entry, tighten up once profitable. v2.5 preserves this
+//  philosophy with two separate ATR multipliers.
+//
+//  WHAT STAYS UNCHANGED
+//  --------------------
+//  - HardStopPoints and TrailDistancePoints still exist. They are used
+//    when StopMode = FixedPoints (you can switch back any time).
+//  - PullbackTolerancePoints stays as fixed points (it's a different
+//    concept - detecting "is price reversing?" - and ATR-ifying it
+//    would make tuning unnecessarily complex).
+//  - All other logic (entry, brackets, exit, cleanup, audit) unchanged.
+//
+//  AUDIT LOG: Three new columns: StopMode, AtrAtEntry, InitialStopDistance.
+//  Lets you compare how stops behaved across different volatility regimes.
+//
+//  DEFAULTS PHILOSOPHY
+//  -------------------
+//  Defaults are tuned so that under typical MNQ volatility (ATR ~ 8 pts),
+//  the ATR-based stops produce roughly the same distances as v2.4's
+//  fixed defaults (20 and 8). So the upgrade should feel similar in
+//  quiet markets, but auto-widen in volatile ones.
 //
 // =============================================================================
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
-    // -------------------------------------------------------------------------
-    // [v2.4 NEW] Enum defining the two limit-price modes.
-    // Placed at namespace level (not inside the class) so NinjaTrader's
-    // property dialog can render it as a dropdown.
-    // -------------------------------------------------------------------------
+    // [v2.4] Limit-price mode for entry.
     public enum EntryLimitMode
     {
         OffsetFromLastPrice,
         FixedPrice
+    }
+
+    // [v2.5 NEW] Stop-loss mode.
+    public enum StopLossMode
+    {
+        AtrBased,
+        FixedPoints
     }
 
     public class LongScalper : Strategy
@@ -117,6 +271,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double finalPnLPoints       = 0;
         private string finalExitReason      = "UNKNOWN";
 
+        // [v2.5 NEW] ATR tracking for audit log.
+        private double atrAtEntry            = 0;
+        private double initialStopDistance   = 0;
+
+        // [v2.5 NEW] ATR indicator on the 1-min series.
+        private ATR atrIndicator;
+
         private const int MinuteBarsIndex = 1;
         private const string EntrySignalName = "LongScalperEntry";
 
@@ -126,7 +287,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Description                                 = "Long-only scalper with trailing stop, orphan-order cleanup, and fixed-limit-price option.";
+                Description                                 = "Long-only scalper with trailing stop, fixed-limit-price option, and ATR-based adaptive stops.";
                 Name                                        = "LongScalper";
                 Calculate                                   = Calculate.OnEachTick;
                 EntriesPerDirection                         = 1;
@@ -148,7 +309,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // ---- Defaults ----
                 Quantity                = 1;
 
-                // [v2.4 NEW] Default to existing behavior so old configs work unchanged.
                 LimitMode               = EntryLimitMode.OffsetFromLastPrice;
                 FixedLimitPrice         = 0;
 
@@ -156,10 +316,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                 BarSizeAveragePeriod    = 10;
                 OrderLifeSeconds        = 5;
                 ProfitTargetPoints      = 10;
+
+                // [v2.5 NEW] ATR-based stop defaults.
+                StopMode                 = StopLossMode.AtrBased;
+                AtrPeriod                = 14;
+                AtrInitialStopMultiplier = 2.5;
+                AtrTrailMultiplier       = 1.0;
+
+                // Fixed-points stops (used only when StopMode = FixedPoints).
                 HardStopPoints          = 20;
+                TrailDistancePoints     = 8;
+
                 MonitorIntervalSeconds  = 3;
                 PullbackTolerancePoints = 2;
-                TrailDistancePoints     = 8;
                 DisableDelaySeconds     = 1.5;
                 EnableSoundOnFill       = true;
                 AuditLogPath            = @"C:\temp";
@@ -170,17 +339,30 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.DataLoaded)
             {
+                // [v2.5 NEW] Initialize ATR on the 1-min series.
+                atrIndicator = ATR(BarsArray[MinuteBarsIndex], AtrPeriod);
                 ResetTradeState();
             }
             else if (State == State.Realtime)
             {
                 Print("================================================================");
-                Print(string.Format("[INIT] LongScalper v2.4 armed at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
+                Print(string.Format("[INIT] LongScalper v2.5 armed at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
                 Print(string.Format("[INIT] LimitMode={0}, FixedLimitPrice={1}",
                     LimitMode, FixedLimitPrice));
-                Print(string.Format("[INIT] Parameters: OrderLife={0}s, Monitor={1}s, Target={2}pts, InitStop={3}pts, Trail={4}pts, Tolerance={5}pts, DisableDelay={6}s",
+                Print(string.Format("[INIT] StopMode={0}", StopMode));
+                if (StopMode == StopLossMode.AtrBased)
+                {
+                    Print(string.Format("[INIT]   AtrPeriod={0}, InitialStopMult={1}, TrailMult={2}",
+                        AtrPeriod, AtrInitialStopMultiplier, AtrTrailMultiplier));
+                }
+                else
+                {
+                    Print(string.Format("[INIT]   HardStop={0}pts, Trail={1}pts",
+                        HardStopPoints, TrailDistancePoints));
+                }
+                Print(string.Format("[INIT] Other: OrderLife={0}s, Monitor={1}s, Target={2}pts, Tolerance={3}pts, DisableDelay={4}s",
                     OrderLifeSeconds, MonitorIntervalSeconds, ProfitTargetPoints,
-                    HardStopPoints, TrailDistancePoints, PullbackTolerancePoints, DisableDelaySeconds));
+                    PullbackTolerancePoints, DisableDelaySeconds));
                 Print(string.Format("[INIT] AuditLogPath: {0}", AuditLogPath));
                 Print(string.Format("[INIT] Pre-check Position: {0} qty={1}", Position.MarketPosition, Position.Quantity));
             }
@@ -194,7 +376,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         protected override void OnBarUpdate()
         {
             if (CurrentBars[0] < BarsRequiredToTrade) return;
-            if (BarsArray.Length > MinuteBarsIndex && CurrentBars[MinuteBarsIndex] < BarSizeAveragePeriod) return;
+            if (BarsArray.Length > MinuteBarsIndex && CurrentBars[MinuteBarsIndex] < Math.Max(BarSizeAveragePeriod, AtrPeriod)) return;
             if (State != State.Realtime) return;
 
             switch (currentState)
@@ -242,7 +424,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Print("================================================================");
             Print(string.Format("[STEP1] PlaceEntryOrder called at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
             Print(string.Format("[STEP1] Position: {0} qty={1}", Position.MarketPosition, Position.Quantity));
-            Print(string.Format("[STEP1] LimitMode={0}", LimitMode));
+            Print(string.Format("[STEP1] LimitMode={0}, StopMode={1}", LimitMode, StopMode));
 
             // ----- SAFETY CHECK 1: Strategy's own position must be flat -----
             if (Position.MarketPosition != MarketPosition.Flat)
@@ -312,7 +494,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(string.Format("[STEP1] WARN: Working orders check failed: {0}", ex.Message));
             }
 
-            // ----- Read current price (always useful for logging/audit) -----
             entryLastTradedPrice = GetCurrentLastPrice();
             if (entryLastTradedPrice <= 0)
             {
@@ -323,13 +504,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // -----------------------------------------------------------------
-            // [v2.4 NEW] Branch on LimitMode to compute the limit price.
+            // [v2.4] Branch on LimitMode to compute the limit price.
             // -----------------------------------------------------------------
             if (LimitMode == EntryLimitMode.FixedPrice)
             {
-                // ---- Fixed price mode: use whatever the user typed. ----
-
-                // Sanity check: must be a positive price.
                 if (FixedLimitPrice <= 0)
                 {
                     Print(string.Format("[STEP1] *** BLOCKED *** FixedLimitPrice is {0} (must be > 0).",
@@ -340,10 +518,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return;
                 }
 
-                // We still compute avgBarSize for audit logging.
                 avgBarSizeAtEntry = CalculateEmaBarSize();
-
-                // Round the user's price to the instrument's tick size.
                 calculatedLimitPrice = Instrument.MasterInstrument.RoundToTickSize(FixedLimitPrice);
 
                 Print(string.Format("[STEP1] FixedPrice mode: lastPrice={0}, userTyped={1}, rounded limitPrice={2}",
@@ -351,8 +526,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else
             {
-                // ---- OffsetFromLastPrice mode: original v2.3 behavior. ----
-
                 avgBarSizeAtEntry = CalculateEmaBarSize();
                 if (avgBarSizeAtEntry <= 0)
                 {
@@ -369,10 +542,38 @@ namespace NinjaTrader.NinjaScript.Strategies
                     entryLastTradedPrice, avgBarSizeAtEntry, offset, calculatedLimitPrice));
             }
 
-            // ----- Pre-declare bracket BEFORE entry (same as v2.3) -----
+            // -----------------------------------------------------------------
+            // Compute target and initial stop based on StopMode.
+            // -----------------------------------------------------------------
             double expectedFillPrice = calculatedLimitPrice;
             double targetPrice = Instrument.MasterInstrument.RoundToTickSize(expectedFillPrice + ProfitTargetPoints);
-            double initialStop = Instrument.MasterInstrument.RoundToTickSize(expectedFillPrice - HardStopPoints);
+
+            // [v2.5 NEW] Initial stop calculation - branch on StopMode.
+            double initialStop;
+            if (StopMode == StopLossMode.AtrBased)
+            {
+                atrAtEntry = atrIndicator[0];
+                if (atrAtEntry <= 0)
+                {
+                    Print("[STEP1] WARN: ATR is 0, falling back to fixed-points stop.");
+                    initialStopDistance = HardStopPoints;
+                }
+                else
+                {
+                    initialStopDistance = atrAtEntry * AtrInitialStopMultiplier;
+                }
+                initialStop = Instrument.MasterInstrument.RoundToTickSize(expectedFillPrice - initialStopDistance);
+                Print(string.Format("[STEP1] ATR-based stop: ATR={0:F2}, multiplier={1}, distance={2:F2}, stopPrice={3}",
+                    atrAtEntry, AtrInitialStopMultiplier, initialStopDistance, initialStop));
+            }
+            else
+            {
+                atrAtEntry = atrIndicator[0];   // record for audit even if not used
+                initialStopDistance = HardStopPoints;
+                initialStop = Instrument.MasterInstrument.RoundToTickSize(expectedFillPrice - HardStopPoints);
+                Print(string.Format("[STEP1] FixedPoints stop: distance={0}pts, stopPrice={1}",
+                    HardStopPoints, initialStop));
+            }
 
             try
             {
@@ -422,6 +623,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             return 0;
         }
 
+        // =====================================================================
+        // [v2.5] DoTrailingCheck: trail distance is now ATR-based when
+        // StopMode = AtrBased. PullbackTolerance still uses fixed points.
+        // =====================================================================
         private void DoTrailingCheck()
         {
             try
@@ -435,9 +640,28 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 double threshold = referencePrice - PullbackTolerancePoints;
 
-                Print(string.Format("[MONITOR] Check at {0}, currentPrice={1}, ref={2}, threshold={3}",
+                // [v2.5 NEW] Compute trail distance based on StopMode.
+                double trailDistance;
+                if (StopMode == StopLossMode.AtrBased)
+                {
+                    double currentAtr = atrIndicator[0];
+                    if (currentAtr <= 0)
+                    {
+                        trailDistance = TrailDistancePoints;  // safety fallback
+                    }
+                    else
+                    {
+                        trailDistance = currentAtr * AtrTrailMultiplier;
+                    }
+                }
+                else
+                {
+                    trailDistance = TrailDistancePoints;
+                }
+
+                Print(string.Format("[MONITOR] Check at {0}, currentPrice={1}, ref={2}, threshold={3}, trailDist={4:F2}",
                     DateTime.Now.ToString("HH:mm:ss.fff"),
-                    currentPrice, referencePrice, threshold));
+                    currentPrice, referencePrice, threshold, trailDistance));
 
                 if (currentPrice < threshold)
                 {
@@ -449,7 +673,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 else
                 {
                     double proposedStop = Instrument.MasterInstrument.RoundToTickSize(
-                        currentPrice - TrailDistancePoints);
+                        currentPrice - trailDistance);
 
                     if (proposedStop > currentStopPrice)
                     {
@@ -726,10 +950,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             finalExitPrice         = 0;
             finalPnLPoints         = 0;
             finalExitReason        = "UNKNOWN";
+            atrAtEntry             = 0;
+            initialStopDistance    = 0;
         }
 
         // =====================================================================
-        // WriteAuditLog: now also records LimitMode column.
+        // WriteAuditLog: now also records StopMode, AtrAtEntry, InitialStopDistance.
         // =====================================================================
         private void WriteAuditLog(string outcome, double fillPrice, double exitPrice, double pnlPoints)
         {
@@ -748,10 +974,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                         sw.WriteLine("Timestamp,Instrument,Outcome,EnableTime,FillTime,ExitTime,"
                             + "LastPriceAtEnable,AvgBarSize,EntryOffsetMultiplier,LimitMode,LimitPrice,FillPrice,"
                             + "ExitPrice,PnLPoints,OrderLifeSeconds,MonitorIntervalSeconds,"
-                            + "ProfitTargetPoints,HardStopPoints,PullbackTolerancePoints,TrailDistancePoints");
+                            + "ProfitTargetPoints,HardStopPoints,PullbackTolerancePoints,TrailDistancePoints,"
+                            + "StopMode,AtrAtEntry,InitialStopDistance");
                     }
 
-                    sw.WriteLine(string.Format("{0},{1},{2},{3},{4},{5},{6},{7:F2},{8:F2},{9},{10},{11},{12},{13:F2},{14},{15},{16},{17},{18},{19}",
+                    sw.WriteLine(string.Format("{0},{1},{2},{3},{4},{5},{6},{7:F2},{8:F2},{9},{10},{11},{12},{13:F2},{14},{15},{16},{17},{18},{19},{20},{21:F2},{22:F2}",
                         DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
                         Instrument.FullName,
                         outcome,
@@ -771,7 +998,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                         ProfitTargetPoints,
                         HardStopPoints,
                         PullbackTolerancePoints,
-                        TrailDistancePoints));
+                        TrailDistancePoints,
+                        StopMode,
+                        atrAtEntry,
+                        initialStopDistance));
                 }
                 Print(string.Format("[AUDIT] Wrote outcome '{0}' to log", outcome));
             }
@@ -785,84 +1015,109 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
-        [Display(Name="Quantity", Description="Number of contracts per trade.", Order=1, GroupName="Trade Size")]
+        [Display(Name="Quantity", Description="Number of contracts per trade.", Order=1, GroupName="1. Trade Size")]
         public int Quantity { get; set; }
 
-        // ---------------------------------------------------------------------
-        // [v2.4 NEW] LimitMode dropdown.
-        // ---------------------------------------------------------------------
+        // ---- Entry ----
         [NinjaScriptProperty]
         [Display(Name="LimitMode",
             Description="How to compute the buy limit price. OffsetFromLastPrice (default) = lastPrice - (EntryOffsetMultiplier * avgBarSize). FixedPrice = use the FixedLimitPrice value below.",
-            Order=2, GroupName="Entry")]
+            Order=2, GroupName="2. Entry")]
         public EntryLimitMode LimitMode { get; set; }
 
-        // ---------------------------------------------------------------------
-        // [v2.4 NEW] FixedLimitPrice (only used when LimitMode = FixedPrice).
-        // ---------------------------------------------------------------------
         [NinjaScriptProperty]
         [Range(0.0, double.MaxValue)]
         [Display(Name="FixedLimitPrice",
             Description="The exact limit price to use when LimitMode = FixedPrice. Ignored if LimitMode = OffsetFromLastPrice. Set this much lower than current price (e.g. 1000 points) to bait deep dips. Remember to also raise OrderLifeSeconds.",
-            Order=3, GroupName="Entry")]
+            Order=3, GroupName="2. Entry")]
         public double FixedLimitPrice { get; set; }
 
         [NinjaScriptProperty]
         [Range(0.01, 10.0)]
-        [Display(Name="EntryOffsetMultiplier", Description="Limit = lastPrice - (this x avgBarSize). Used only in OffsetFromLastPrice mode. Default 0.10 or 10%. Max 10, means 10 times of avg bar size", Order=4, GroupName="Entry")]
+        [Display(Name="EntryOffsetMultiplier", Description="Limit = lastPrice - (this x avgBarSize). Used only in OffsetFromLastPrice mode. Default 0.10 (10% of avg bar). Max 10.0 (10x avg bar size).", Order=4, GroupName="2. Entry")]
         public double EntryOffsetMultiplier { get; set; }
 
         [NinjaScriptProperty]
         [Range(2, 100)]
-        [Display(Name="BarSizeAveragePeriod", Description="Number of recent 1-min bars used in EMA volatility calc. Default 10.", Order=5, GroupName="Entry")]
+        [Display(Name="BarSizeAveragePeriod", Description="Number of recent 1-min bars used in EMA volatility calc for entry. Default 10.", Order=5, GroupName="2. Entry")]
         public int BarSizeAveragePeriod { get; set; }
 
-        // ---------------------------------------------------------------------
-        // [v2.4 CHANGED] Range max raised from 3600 to 86400 (24 hours).
-        // ---------------------------------------------------------------------
         [NinjaScriptProperty]
         [Range(1, 86400)]
         [Display(Name="OrderLifeSeconds",
             Description="Cancel buy limit if not filled within this many seconds. Default 5 (fast scalp). For FixedPrice mode set this large: 3600=1hr, 36000=10hr, 86400=24hr.",
-            Order=6, GroupName="Entry")]
+            Order=6, GroupName="2. Entry")]
         public int OrderLifeSeconds { get; set; }
 
+        // ---- Profit Target ----
         [NinjaScriptProperty]
         [Range(1, 1000)]
-        [Display(Name="ProfitTargetPoints", Description="Profit target = expectedFill + this many points. Default 10.", Order=7, GroupName="Exit")]
+        [Display(Name="ProfitTargetPoints", Description="Profit target = expectedFill + this many points. Default 10.", Order=7, GroupName="3. Profit Target")]
         public int ProfitTargetPoints { get; set; }
+
+        // ---- Stop Loss ----
+        [NinjaScriptProperty]
+        [Display(Name="StopMode",
+            Description="How to compute stop distances. AtrBased (default) = adaptive, uses ATR x multiplier. FixedPoints = use HardStopPoints / TrailDistancePoints.",
+            Order=8, GroupName="4. Stop Loss")]
+        public StopLossMode StopMode { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(2, 100)]
+        [Display(Name="AtrPeriod",
+            Description="ATR lookback period (in 1-min bars). Default 14 (standard). Used only in AtrBased mode.",
+            Order=9, GroupName="4. Stop Loss")]
+        public int AtrPeriod { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.5, 10.0)]
+        [Display(Name="AtrInitialStopMultiplier",
+            Description="Initial stop distance = ATR x this. Default 2.5. Used only in AtrBased mode. Wider gives the trade room to breathe at entry.",
+            Order=10, GroupName="4. Stop Loss")]
+        public double AtrInitialStopMultiplier { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.5, 10.0)]
+        [Display(Name="AtrTrailMultiplier",
+            Description="Trailing stop distance = ATR x this. Default 1.0. Used only in AtrBased mode. Tighter than initial since trade is already running.",
+            Order=11, GroupName="4. Stop Loss")]
+        public double AtrTrailMultiplier { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 200)]
-        [Display(Name="HardStopPoints", Description="INITIAL stop = expectedFill - this many points. Default 20.", Order=8, GroupName="Exit")]
+        [Display(Name="HardStopPoints", Description="INITIAL stop = expectedFill - this many points. Used only in FixedPoints mode. Default 20.", Order=12, GroupName="4. Stop Loss")]
         public int HardStopPoints { get; set; }
 
         [NinjaScriptProperty]
+        [Range(1, 200)]
+        [Display(Name="TrailDistancePoints", Description="Trailed stop sits this many points below current price. Used only in FixedPoints mode. Default 8.", Order=13, GroupName="4. Stop Loss")]
+        public int TrailDistancePoints { get; set; }
+
+        // ---- Trailing ----
+        [NinjaScriptProperty]
         [Range(1, 3600)]
-        [Display(Name="MonitorIntervalSeconds", Description="How often the trailing check runs. Default 3.", Order=9, GroupName="Trailing")]
+        [Display(Name="MonitorIntervalSeconds", Description="How often the trailing check runs. Default 3.", Order=14, GroupName="5. Trailing")]
         public int MonitorIntervalSeconds { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 50)]
-        [Display(Name="PullbackTolerancePoints", Description="Tolerated pullback before considering a real reversal. Default 2.", Order=10, GroupName="Trailing")]
+        [Display(Name="PullbackTolerancePoints", Description="Tolerated pullback before considering a real reversal. Default 2.", Order=15, GroupName="5. Trailing")]
         public int PullbackTolerancePoints { get; set; }
 
-        [NinjaScriptProperty]
-        [Range(1, 200)]
-        [Display(Name="TrailDistancePoints", Description="Trailed stop sits this many points below current price. Default 8.", Order=11, GroupName="Trailing")]
-        public int TrailDistancePoints { get; set; }
-
+        // ---- Cleanup ----
         [NinjaScriptProperty]
         [Range(0.0, 10.0)]
-        [Display(Name="DisableDelaySeconds", Description="Delay between position close and strategy disable. Default 1.5.", Order=12, GroupName="Cleanup")]
+        [Display(Name="DisableDelaySeconds", Description="Delay between position close and strategy disable. Default 1.5.", Order=16, GroupName="6. Cleanup")]
         public double DisableDelaySeconds { get; set; }
 
+        // ---- Notifications ----
         [NinjaScriptProperty]
-        [Display(Name="EnableSoundOnFill", Description="Play sound when entry fills.", Order=13, GroupName="Notifications")]
+        [Display(Name="EnableSoundOnFill", Description="Play sound when entry fills.", Order=17, GroupName="7. Notifications")]
         public bool EnableSoundOnFill { get; set; }
 
+        // ---- Logging ----
         [NinjaScriptProperty]
-        [Display(Name="AuditLogPath", Description="Folder for audit log CSV. Auto-created if missing. Default C:\\temp.", Order=14, GroupName="Logging")]
+        [Display(Name="AuditLogPath", Description="Folder for audit log CSV. Auto-created if missing. Default C:\\temp.", Order=18, GroupName="8. Logging")]
         public string AuditLogPath { get; set; }
 
         #endregion
