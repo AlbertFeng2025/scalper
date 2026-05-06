@@ -24,159 +24,61 @@ using NinjaTrader.NinjaScript.DrawingTools;
 #endregion
 
 // =============================================================================
-//  STRATEGY:    ShortScalper v2.5
+//  STRATEGY:    ShortScalper v2.6
 //  AUTHOR:      Drafted with help from Claude
-//  VERSION:     2.5 - ATR-BASED ADAPTIVE STOPS
+//  REPLACES:    ShortScalper v2.5
 // =============================================================================
 //
-//  Mirror of LongScalper v2.5 for shorts. Same orphan-order cleanup, same
-//  trailing logic, same state machine, same ATR-based stops. Only the
-//  directional math is flipped.
+//  Mirror of LongScalper v2.6 for shorts. Same defensive cleanup, same
+//  bar-size-based adaptive stops. Only the directional math is flipped.
+//
+//  v2.6 CHANGES vs v2.5
+//  --------------------
+//
+//  CHANGE 1: DEFENSIVE ORPHAN-BRACKET CLEANUP
+//  ------------------------------------------
+//  Real-world incident discovered the following dangerous sequence:
+//    1. Strategy fills entry, attaches stop loss + profit target
+//    2. User manually places a buy order to exit the short position
+//    3. Manual buy fills, account is now FLAT
+//    4. BUT the strategy's stop loss and profit target are STILL ALIVE
+//       on the order book (NT's OCO doesn't auto-cancel because position
+//       was closed by an unrelated order)
+//    5. User clicks "Close" on chart - does nothing because already flat
+//    6. Later, market reaches one of those orphan orders -> fills
+//       -> creates a NEW UNINTENDED POSITION (long instead of flat)
+//    7. The other orphan can also fire -> long doubles
+//
+//  v2.6 adds CheckForOrphanedState() at the top of every OnBarUpdate.
+//  If account is flat but strategy state is WaitingForFill or InPosition,
+//  force CleanupRemainingBrackets() and disable the strategy.
+//
+//  CHANGE 2: STOP LOSS REPLACED ATR -> OFFSET FROM FILLED PRICE
+//  ------------------------------------------------------------
+//  v2.5 used ATR(14) for stop distances. v2.6 unifies on the SAME concept
+//  used for entry: avgBarSize (EMA of recent 1-min bar high-low ranges).
+//
+//  Old (v2.5):
+//    Initial stop = ATR x AtrInitialStopMultiplier (default 2.5)
+//    Trail        = ATR x AtrTrailMultiplier        (default 1.0)
+//
+//  New (v2.6):
+//    Initial stop = avgBarSize x StopOffsetMultiplier   (default 2.0)
+//    Trail        = avgBarSize x TrailOffsetMultiplier  (default 0.8)
+//
+//  SHORT-SPECIFIC: stop is ABOVE fill, distance is added (not subtracted).
+//
+//  Removed parameters: AtrPeriod, AtrInitialStopMultiplier, AtrTrailMultiplier
+//  Added parameters:   StopOffsetMultiplier, TrailOffsetMultiplier
+//  Kept:               HardStopPoints, TrailDistancePoints (FixedPoints mode)
+//
+//  Enum renamed:
+//    ShortStopLossMode.AtrBased -> ShortStopLossMode.OffsetFromFilledPrice
 //
 // =============================================================================
-//  HOW TO USE THIS STRATEGY
+//  KEY DIRECTIONAL LOGIC (UNCHANGED FROM v2.5)
 // =============================================================================
 //
-//  CHART SETUP
-//  -----------
-//  Chart bar size does NOT matter for the strategy logic. The strategy
-//  internally adds its own 1-min data series (via AddDataSeries) and uses
-//  that for ALL calculations: avgBarSize for entry offset, ATR for stops,
-//  trailing checks, etc. The chart bar size only affects what YOU see.
-//
-//  Recommended: 1-min chart. Why?
-//    - Visually matches what the strategy is doing internally.
-//    - Output Window timestamps line up with bars you can see.
-//    - Easier to debug or audit what happened.
-//
-//  Other sizes (5-min, 15-min, 30-min) work fine but you lose visual
-//  alignment with the strategy's actual decisions. Tick charts also work.
-//
-//  PRELOADED DATA
-//  --------------
-//  When you enable the strategy, NT has already loaded historical bars
-//  on your chart. BarsRequiredToTrade = 20 is satisfied immediately as
-//  long as your chart shows at least 20 bars of history (almost always
-//  true). The strategy is ready to trade at the moment of enable.
-//
-//  ENABLING - STEP BY STEP
-//  -----------------------
-//  1. Compile in NinjaScript Editor (F5). Confirm "Compile succeeded."
-//  2. Right-click chart -> Strategies -> Add ShortScalper.
-//  3. In the strategy parameters dialog:
-//       - Group "1. Trade Size":     set Quantity (default 1)
-//       - Group "2. Entry":          choose LimitMode
-//                                      OffsetFromLastPrice (default) for fast scalp
-//                                      FixedPrice for high-limit bait
-//                                    if FixedPrice, set FixedLimitPrice
-//                                      ABOVE current price (sell-the-rip)
-//                                    set OrderLifeSeconds large for FixedPrice
-//                                      (e.g. 3600 = 1 hr, 86400 = 24 hr)
-//       - Group "3. Profit Target":  ProfitTargetPoints (default 10)
-//       - Group "4. Stop Loss":      StopMode = AtrBased (default, recommended)
-//                                    AtrPeriod (default 14)
-//                                    AtrInitialStopMultiplier (default 2.5)
-//                                    AtrTrailMultiplier (default 1.0)
-//                                    HardStopPoints/TrailDistancePoints
-//                                      only used if StopMode = FixedPoints
-//       - Group "5. Trailing":       MonitorIntervalSeconds (default 3)
-//                                    PullbackTolerancePoints (default 2)
-//       - Group "6. Cleanup":        DisableDelaySeconds (default 1.5)
-//       - Group "7. Notifications":  EnableSoundOnFill (default true)
-//       - Group "8. Logging":        AuditLogPath (default C:\temp)
-//  4. Set "Stop behavior" = "Close position".
-//  5. Verify Positions and Orders tabs are empty.
-//  6. Enable. The strategy will execute ONE trade then disable itself.
-//
-//  TYPICAL USE CASES
-//  -----------------
-//  CASE A - Fast scalp during active trading:
-//    LimitMode = OffsetFromLastPrice
-//    EntryOffsetMultiplier = 0.10 (small offset, fills quickly)
-//    OrderLifeSeconds = 5
-//    StopMode = AtrBased
-//    Use this when you see a SHORT setup live and want to react fast.
-//
-//  CASE B - High-limit bait order (sell-the-rip during work or sleep):
-//    LimitMode = FixedPrice
-//    FixedLimitPrice = (number well ABOVE current price)
-//    OrderLifeSeconds = 86400 (24 hours)
-//    StopMode = AtrBased
-//    For multiple bait orders at different prices, add the strategy
-//    multiple times via NT Control Center. Each runs independently.
-//
-//    REMEMBER: For shorts, FixedLimitPrice is ABOVE current price
-//    (you want to sell on a spike up). For longs, it's BELOW.
-//
-//  RUNNING MULTIPLE COPIES
-//  -----------------------
-//  Each strategy instance is independent. You can run several at once
-//  with different parameters. The audit log appends rows from all
-//  instances to the same ShortScalper.csv file.
-//
-//  LIMITATIONS
-//  -----------
-//  1. ONE TRADE PER ENABLE. After fill -> exit -> the strategy DISABLES
-//     itself. To trade again you must re-enable it manually. This is
-//     intentional: removes "what just happened" confusion and prevents
-//     runaway behavior. If you want continuous trading, this strategy
-//     is the wrong tool.
-//
-//  2. SHORT ONLY. This file places only sell limits. For longs, use
-//     LongScalper. Don't try to long-bait by entering a fixed price
-//     below current market - it will reject the order or behave
-//     unexpectedly.
-//
-//  3. POSITION SIZE FIXED AT ENABLE. Quantity is set when you enable.
-//     The strategy doesn't scale in or pyramid. One fill, one position.
-//
-//  4. NT MANAGED ORDER METHODS. Uses NT's built-in SetProfitTarget /
-//     SetStopLoss for the bracket. Simplest, most reliable pattern for
-//     retail use. The cleanup function handles the rare cases where
-//     OCO doesn't auto-cancel cleanly.
-//
-//  5. WALL-CLOCK TIMERS. OrderLifeSeconds and MonitorIntervalSeconds
-//     use real wall-clock time (DateTime.Now). In market replay, replay
-//     speed compresses time, so a "5 second" order life might cancel
-//     after just 1 replay-second. Use moderate replay speeds (5-10x).
-//
-//  6. NOT VALIDATED FOR ALL INSTRUMENTS. Defaults are tuned for MNQ on
-//     1-min bars. Other instruments need parameter tuning.
-//
-//  7. NO RE-ENTRY AFTER LOSS. If a trade hits stop, strategy disables.
-//     There's no "automatic try again" - by design, you re-evaluate
-//     before re-enabling.
-//
-//  WHAT TO WATCH IN OUTPUT WINDOW
-//  ------------------------------
-//  [INIT]    - strategy started, parameter summary
-//  [STEP1]   - entry order placement, with calculated prices
-//  [ORDER]   - order state changes (Working, Filled, Cancelled)
-//  [EXEC]    - fill events (entry fill, position close)
-//  [MONITOR] - trailing stop checks (every MonitorIntervalSeconds)
-//  [CLEANUP] - bracket order cancellations after exit
-//  [DISABLE] - strategy shutting down
-//  [AUDIT]   - row written to ShortScalper.csv
-//  [TIMEOUT] - entry order lifetime expired before fill
-//  [POSITION]- position update (informational)
-//
-// =============================================================================
-//  v2.5 CHANGES vs v2.4
-// =============================================================================
-//  Adaptive stop loss using ATR (Average True Range), same as LongScalper v2.5.
-//
-//  THE NEW PARAMETERS
-//  ------------------
-//  StopMode (dropdown, default = AtrBased):
-//    - AtrBased   : compute stops as ATR x multiplier (adapts to volatility)
-//    - FixedPoints: use HardStopPoints / TrailDistancePoints (v2.4 way)
-//
-//  AtrPeriod (default 14):                Lookback period for ATR.
-//  AtrInitialStopMultiplier (default 2.5): Initial stop = ATR x this. Wider.
-//  AtrTrailMultiplier (default 1.0):       Trail stop = ATR x this. Tighter.
-//
-//  KEY DIRECTIONAL LOGIC (UNCHANGED)
-//  ---------------------------------
 //  - Entry limit:    lastPrice + offset (sell limit ABOVE market)
 //  - Profit target:  expectedFill - ProfitTargetPoints (BELOW fill)
 //  - Initial stop:   expectedFill + stopDistance (ABOVE fill)
@@ -185,25 +87,47 @@ using NinjaTrader.NinjaScript.DrawingTools;
 //  - PnL:            actualFillPrice - exitPrice (positive when price fell)
 //  - Stop only ever moves DOWN, never up.
 //
-//  AUDIT LOG: Three new columns: StopMode, AtrAtEntry, InitialStopDistance.
+// =============================================================================
+//  HOW TO USE
+// =============================================================================
+//
+//  Same as v2.5. Compile, add to chart, set parameters, enable.
+//  The new defensive cleanup runs automatically.
+//  The new stop calculation runs automatically when StopMode = OffsetFromFilledPrice.
+//
+//  KEY PARAMETER DEFAULTS (v2.6)
+//  -----------------------------
+//    Quantity                      1
+//    LimitMode                     OffsetFromLastPrice
+//    EntryOffsetMultiplier         0.10
+//    BarSizeAveragePeriod          10
+//    OrderLifeSeconds              5
+//    ProfitTargetPoints            10
+//    StopMode                      OffsetFromFilledPrice    <-- NEW DEFAULT
+//    StopOffsetMultiplier          2.0                       <-- NEW
+//    TrailOffsetMultiplier         0.8                       <-- NEW
+//    HardStopPoints                20  (FixedPoints mode only)
+//    TrailDistancePoints           8   (FixedPoints mode only)
+//    MonitorIntervalSeconds        3
+//    PullbackTolerancePoints       2
+//    DisableDelaySeconds           1.5
 //
 // =============================================================================
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
-    // [v2.4] Limit-price mode for short entry.
     public enum ShortEntryLimitMode
     {
         OffsetFromLastPrice,
         FixedPrice
     }
 
-    // [v2.5 NEW] Stop-loss mode for shorts.
-    // Named ShortStopLossMode so it does NOT collide with LongScalper's
-    // StopLossMode enum if both strategies are compiled together.
+    // [v2.6] Renamed from AtrBased -> OffsetFromFilledPrice.
+    // Kept as ShortStopLossMode (separate enum) so this strategy and
+    // LongScalper can compile in the same project without enum collisions.
     public enum ShortStopLossMode
     {
-        AtrBased,
+        OffsetFromFilledPrice,
         FixedPoints
     }
 
@@ -240,12 +164,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double finalPnLPoints       = 0;
         private string finalExitReason      = "UNKNOWN";
 
-        // [v2.5 NEW] ATR tracking for audit log.
-        private double atrAtEntry            = 0;
+        // [v2.6] Replaces atrAtEntry; serves the same audit purpose
         private double initialStopDistance   = 0;
-
-        // [v2.5 NEW] ATR indicator on the 1-min series.
-        private ATR atrIndicator;
 
         private const int MinuteBarsIndex = 1;
         private const string EntrySignalName = "ShortScalperEntry";
@@ -256,7 +176,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Description                                 = "Short-only scalper with trailing stop, fixed-limit-price option, and ATR-based adaptive stops.";
+                Description                                 = "Short-only scalper with trailing stop, fixed-limit-price option, and bar-size-based adaptive stops (v2.6).";
                 Name                                        = "ShortScalper";
                 Calculate                                   = Calculate.OnEachTick;
                 EntriesPerDirection                         = 1;
@@ -286,11 +206,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 OrderLifeSeconds        = 5;
                 ProfitTargetPoints      = 10;
 
-                // [v2.5 NEW] ATR-based stop defaults.
-                StopMode                 = ShortStopLossMode.AtrBased;
-                AtrPeriod                = 14;
-                AtrInitialStopMultiplier = 2.5;
-                AtrTrailMultiplier       = 1.0;
+                // [v2.6] Stop loss defaults - replaces ATR-based with bar-size-based
+                StopMode                = ShortStopLossMode.OffsetFromFilledPrice;
+                StopOffsetMultiplier    = 2.0;
+                TrailOffsetMultiplier   = 0.8;
 
                 // Fixed-points stops (used only when StopMode = FixedPoints).
                 HardStopPoints          = 20;
@@ -308,21 +227,19 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.DataLoaded)
             {
-                // [v2.5 NEW] Initialize ATR on the 1-min series.
-                atrIndicator = ATR(BarsArray[MinuteBarsIndex], AtrPeriod);
                 ResetTradeState();
             }
             else if (State == State.Realtime)
             {
                 Print("================================================================");
-                Print(string.Format("[INIT] ShortScalper v2.5 armed at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
+                Print(string.Format("[INIT] ShortScalper v2.6 armed at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
                 Print(string.Format("[INIT] LimitMode={0}, FixedLimitPrice={1}",
                     LimitMode, FixedLimitPrice));
                 Print(string.Format("[INIT] StopMode={0}", StopMode));
-                if (StopMode == ShortStopLossMode.AtrBased)
+                if (StopMode == ShortStopLossMode.OffsetFromFilledPrice)
                 {
-                    Print(string.Format("[INIT]   AtrPeriod={0}, InitialStopMult={1}, TrailMult={2}",
-                        AtrPeriod, AtrInitialStopMultiplier, AtrTrailMultiplier));
+                    Print(string.Format("[INIT]   StopOffsetMult={0}, TrailOffsetMult={1} (x avgBarSize)",
+                        StopOffsetMultiplier, TrailOffsetMultiplier));
                 }
                 else
                 {
@@ -332,6 +249,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(string.Format("[INIT] Other: OrderLife={0}s, Monitor={1}s, Target={2}pts, Tolerance={3}pts, DisableDelay={4}s",
                     OrderLifeSeconds, MonitorIntervalSeconds, ProfitTargetPoints,
                     PullbackTolerancePoints, DisableDelaySeconds));
+                Print("[INIT] Defensive cleanup: ENABLED (auto-disable if account flattens unexpectedly)");
                 Print(string.Format("[INIT] AuditLogPath: {0}", AuditLogPath));
                 Print(string.Format("[INIT] Pre-check Position: {0} qty={1}", Position.MarketPosition, Position.Quantity));
             }
@@ -345,8 +263,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         protected override void OnBarUpdate()
         {
             if (CurrentBars[0] < BarsRequiredToTrade) return;
-            if (BarsArray.Length > MinuteBarsIndex && CurrentBars[MinuteBarsIndex] < Math.Max(BarSizeAveragePeriod, AtrPeriod)) return;
+            if (BarsArray.Length > MinuteBarsIndex && CurrentBars[MinuteBarsIndex] < BarSizeAveragePeriod) return;
             if (State != State.Realtime) return;
+
+            // -----------------------------------------------------------------
+            // [v2.6 NEW] DEFENSIVE CLEANUP CHECK
+            // -----------------------------------------------------------------
+            CheckForOrphanedState();
 
             switch (currentState)
             {
@@ -375,7 +298,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 case TradeState.ClosingDelay:
                     if ((DateTime.Now - closingDelayStartTime).TotalSeconds >= DisableDelaySeconds)
                     {
-                        Print(string.Format("[CLOSE] Delay elapsed. Writing audit and disabling."));
+                        Print("[CLOSE] Delay elapsed. Writing audit and disabling.");
                         CleanupRemainingBrackets();
                         WriteAuditLog(finalExitReason, actualFillPrice, finalExitPrice, finalPnLPoints);
                         currentState = TradeState.Done;
@@ -385,6 +308,93 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 case TradeState.Done:
                     break;
+            }
+        }
+
+        // =====================================================================
+        // [v2.6 NEW] CheckForOrphanedState
+        //
+        // Detects desync: account flat but strategy thinks it's still trading.
+        // SHORT-SPECIFIC: PnL = actualFillPrice - exitPrice (positive when
+        // price dropped after our short).
+        // =====================================================================
+        private void CheckForOrphanedState()
+        {
+            if (currentState != TradeState.InPosition && currentState != TradeState.WaitingForFill)
+                return;
+
+            try
+            {
+                if (Account == null) return;
+
+                Position acctPos = Account.Positions.FirstOrDefault(p => p.Instrument == Instrument);
+                bool acctIsFlat = (acctPos == null || acctPos.MarketPosition == MarketPosition.Flat);
+
+                if (!acctIsFlat) return;
+
+                if (currentState == TradeState.InPosition)
+                {
+                    Print("================================================================");
+                    Print(string.Format("[ORPHAN] *** ACCOUNT FLATTENED UNEXPECTEDLY at {0} ***",
+                        DateTime.Now.ToString("HH:mm:ss.fff")));
+                    Print("[ORPHAN] Strategy state was InPosition but account shows flat.");
+                    Print("[ORPHAN] Likely cause: manual close, broker action, or external trade.");
+                    Print("[ORPHAN] Forcing cleanup of any orphan bracket orders and disabling strategy.");
+
+                    finalExitReason = "ORPHAN_EXTERNAL_CLOSE";
+                    finalExitPrice  = GetCurrentLastPrice();
+                    // SHORT PnL: fillPrice - exitPrice
+                    finalPnLPoints  = (finalExitPrice > 0 && actualFillPrice > 0) ? (actualFillPrice - finalExitPrice) : 0;
+
+                    CleanupRemainingBrackets();
+                    WriteAuditLog(finalExitReason, actualFillPrice, finalExitPrice, finalPnLPoints);
+                    currentState = TradeState.Done;
+                    DisableStrategy();
+                }
+                else if (currentState == TradeState.WaitingForFill)
+                {
+                    bool entryStillWorking = entryOrder != null
+                        && (entryOrder.OrderState == OrderState.Working
+                            || entryOrder.OrderState == OrderState.Accepted
+                            || entryOrder.OrderState == OrderState.Submitted);
+
+                    if (!entryStillWorking)
+                    {
+                        bool foundOrphans = false;
+                        lock (Account.Orders)
+                        {
+                            foreach (var ord in Account.Orders)
+                            {
+                                if (ord.Instrument == Instrument && IsOrderActive(ord))
+                                {
+                                    string name = ord.Name ?? "";
+                                    if (name.Contains("Stop") || name.Contains("Profit")
+                                        || name.Contains("Target") || name == EntrySignalName)
+                                    {
+                                        foundOrphans = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (foundOrphans)
+                        {
+                            Print("================================================================");
+                            Print(string.Format("[ORPHAN] *** Found orphan orders while WaitingForFill at {0} ***",
+                                DateTime.Now.ToString("HH:mm:ss.fff")));
+                            Print("[ORPHAN] Cleaning up and disabling.");
+                            CleanupRemainingBrackets();
+                            WriteAuditLog("ORPHAN_PRE_FILL", 0, 0, 0);
+                            currentState = TradeState.Done;
+                            DisableStrategy();
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[ORPHAN] ERROR in defensive check: {0}", ex.Message));
             }
         }
 
@@ -473,9 +483,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // -----------------------------------------------------------------
-            // [v2.4] Branch on LimitMode to compute the limit price.
+            // Compute the limit price based on LimitMode.
             // SHORT-SPECIFIC: limit is ABOVE current price.
             // -----------------------------------------------------------------
+            avgBarSizeAtEntry = CalculateEmaBarSize();
+            if (avgBarSizeAtEntry <= 0)
+            {
+                Print("[STEP1] ERROR: Could not calculate bar size. Disabling.");
+                currentState = TradeState.Done;
+                DisableStrategy();
+                return;
+            }
+
             if (LimitMode == ShortEntryLimitMode.FixedPrice)
             {
                 if (FixedLimitPrice <= 0)
@@ -488,23 +507,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return;
                 }
 
-                avgBarSizeAtEntry = CalculateEmaBarSize();
                 calculatedLimitPrice = Instrument.MasterInstrument.RoundToTickSize(FixedLimitPrice);
 
-                Print(string.Format("[STEP1] FixedPrice mode: lastPrice={0}, userTyped={1}, rounded limitPrice={2}",
-                    entryLastTradedPrice, FixedLimitPrice, calculatedLimitPrice));
+                Print(string.Format("[STEP1] FixedPrice mode: lastPrice={0}, userTyped={1}, rounded limitPrice={2}, avgBarSize={3:F2}",
+                    entryLastTradedPrice, FixedLimitPrice, calculatedLimitPrice, avgBarSizeAtEntry));
             }
             else
             {
-                avgBarSizeAtEntry = CalculateEmaBarSize();
-                if (avgBarSizeAtEntry <= 0)
-                {
-                    Print("[STEP1] ERROR: Could not calculate bar size. Disabling.");
-                    currentState = TradeState.Done;
-                    DisableStrategy();
-                    return;
-                }
-
                 double offset = EntryOffsetMultiplier * avgBarSizeAtEntry;
                 // SHORT: limit price is ABOVE current price.
                 calculatedLimitPrice = Instrument.MasterInstrument.RoundToTickSize(entryLastTradedPrice + offset);
@@ -520,28 +529,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             double expectedFillPrice = calculatedLimitPrice;
             double targetPrice = Instrument.MasterInstrument.RoundToTickSize(expectedFillPrice - ProfitTargetPoints);
 
-            // [v2.5 NEW] Initial stop calculation - branch on StopMode.
+            // [v2.6] Initial stop calculation - branch on StopMode.
             double initialStop;
-            if (StopMode == ShortStopLossMode.AtrBased)
+            if (StopMode == ShortStopLossMode.OffsetFromFilledPrice)
             {
-                atrAtEntry = atrIndicator[0];
-                if (atrAtEntry <= 0)
-                {
-                    Print("[STEP1] WARN: ATR is 0, falling back to fixed-points stop.");
-                    initialStopDistance = HardStopPoints;
-                }
-                else
-                {
-                    initialStopDistance = atrAtEntry * AtrInitialStopMultiplier;
-                }
+                initialStopDistance = avgBarSizeAtEntry * StopOffsetMultiplier;
                 // SHORT: stop is ABOVE fill.
                 initialStop = Instrument.MasterInstrument.RoundToTickSize(expectedFillPrice + initialStopDistance);
-                Print(string.Format("[STEP1] ATR-based stop: ATR={0:F2}, multiplier={1}, distance={2:F2}, stopPrice={3} (above)",
-                    atrAtEntry, AtrInitialStopMultiplier, initialStopDistance, initialStop));
+                Print(string.Format("[STEP1] OffsetFromFilledPrice stop: avgBarSize={0:F2}, mult={1}, distance={2:F2}, stopPrice={3} (above)",
+                    avgBarSizeAtEntry, StopOffsetMultiplier, initialStopDistance, initialStop));
             }
             else
             {
-                atrAtEntry = atrIndicator[0];   // record for audit even if not used
                 initialStopDistance = HardStopPoints;
                 initialStop = Instrument.MasterInstrument.RoundToTickSize(expectedFillPrice + HardStopPoints);
                 Print(string.Format("[STEP1] FixedPoints stop: distance={0}pts, stopPrice={1} (above)",
@@ -598,8 +597,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // [v2.5] DoTrailingCheck: trail distance is now ATR-based when
-        // StopMode = AtrBased. PullbackTolerance still uses fixed points.
+        // [v2.6] DoTrailingCheck: trail distance is now avgBarSize x TrailOffsetMultiplier.
         // SHORT-SPECIFIC: stop ratchets DOWN as price falls.
         // =====================================================================
         private void DoTrailingCheck()
@@ -616,19 +614,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // SHORT-SPECIFIC: pullback threshold is ABOVE reference (price rallied).
                 double threshold = referencePrice + PullbackTolerancePoints;
 
-                // [v2.5 NEW] Compute trail distance based on StopMode.
+                // [v2.6] Compute trail distance based on StopMode.
                 double trailDistance;
-                if (StopMode == ShortStopLossMode.AtrBased)
+                if (StopMode == ShortStopLossMode.OffsetFromFilledPrice)
                 {
-                    double currentAtr = atrIndicator[0];
-                    if (currentAtr <= 0)
-                    {
-                        trailDistance = TrailDistancePoints;  // safety fallback
-                    }
-                    else
-                    {
-                        trailDistance = currentAtr * AtrTrailMultiplier;
-                    }
+                    trailDistance = avgBarSizeAtEntry * TrailOffsetMultiplier;
                 }
                 else
                 {
@@ -693,19 +683,19 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (stopLossOrder != null && IsOrderActive(stopLossOrder))
                 {
-                    Print(string.Format("[CLEANUP]   Cancelling tracked stop loss order"));
+                    Print("[CLEANUP]   Cancelling tracked stop loss order");
                     CancelOrder(stopLossOrder);
                     cancelled++;
                 }
                 if (profitTargetOrder != null && IsOrderActive(profitTargetOrder))
                 {
-                    Print(string.Format("[CLEANUP]   Cancelling tracked profit target order"));
+                    Print("[CLEANUP]   Cancelling tracked profit target order");
                     CancelOrder(profitTargetOrder);
                     cancelled++;
                 }
                 if (entryOrder != null && IsOrderActive(entryOrder))
                 {
-                    Print(string.Format("[CLEANUP]   Cancelling tracked entry order"));
+                    Print("[CLEANUP]   Cancelling tracked entry order");
                     CancelOrder(entryOrder);
                     cancelled++;
                 }
@@ -929,12 +919,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             finalExitPrice         = 0;
             finalPnLPoints         = 0;
             finalExitReason        = "UNKNOWN";
-            atrAtEntry             = 0;
             initialStopDistance    = 0;
         }
 
         // =====================================================================
-        // WriteAuditLog: writes to ShortScalper.csv with v2.5 columns.
+        // WriteAuditLog: writes to ShortScalper.csv with v2.6 columns.
         // =====================================================================
         private void WriteAuditLog(string outcome, double fillPrice, double exitPrice, double pnlPoints)
         {
@@ -954,10 +943,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                             + "LastPriceAtEnable,AvgBarSize,EntryOffsetMultiplier,LimitMode,LimitPrice,FillPrice,"
                             + "ExitPrice,PnLPoints,OrderLifeSeconds,MonitorIntervalSeconds,"
                             + "ProfitTargetPoints,HardStopPoints,PullbackTolerancePoints,TrailDistancePoints,"
-                            + "StopMode,AtrAtEntry,InitialStopDistance");
+                            + "StopMode,StopOffsetMultiplier,TrailOffsetMultiplier,InitialStopDistance");
                     }
 
-                    sw.WriteLine(string.Format("{0},{1},{2},{3},{4},{5},{6},{7:F2},{8:F2},{9},{10},{11},{12},{13:F2},{14},{15},{16},{17},{18},{19},{20},{21:F2},{22:F2}",
+                    sw.WriteLine(string.Format("{0},{1},{2},{3},{4},{5},{6},{7:F2},{8:F2},{9},{10},{11},{12},{13:F2},{14},{15},{16},{17},{18},{19},{20},{21:F2},{22:F2},{23:F2}",
                         DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
                         Instrument.FullName,
                         outcome,
@@ -979,7 +968,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                         PullbackTolerancePoints,
                         TrailDistancePoints,
                         StopMode,
-                        atrAtEntry,
+                        StopOffsetMultiplier,
+                        TrailOffsetMultiplier,
                         initialStopDistance));
                 }
                 Print(string.Format("[AUDIT] Wrote outcome '{0}' to log", outcome));
@@ -1013,18 +1003,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Range(0.01, 10.0)]
-        [Display(Name="EntryOffsetMultiplier", Description="Limit = lastPrice + (this x avgBarSize). Used only in OffsetFromLastPrice mode. Default 0.10 (10% of avg bar). Max 10.0 (10x avg bar size).", Order=4, GroupName="2. Entry")]
+        [Display(Name="EntryOffsetMultiplier", Description="Limit = lastPrice + (this x avgBarSize). Used only in OffsetFromLastPrice mode. Default 0.10.", Order=4, GroupName="2. Entry")]
         public double EntryOffsetMultiplier { get; set; }
 
         [NinjaScriptProperty]
         [Range(2, 100)]
-        [Display(Name="BarSizeAveragePeriod", Description="Number of recent 1-min bars used in EMA volatility calc for entry. Default 10.", Order=5, GroupName="2. Entry")]
+        [Display(Name="BarSizeAveragePeriod", Description="Number of recent 1-min bars used in EMA volatility calc. Default 10. Used for entry AND for stops in OffsetFromFilledPrice mode.", Order=5, GroupName="2. Entry")]
         public int BarSizeAveragePeriod { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 86400)]
         [Display(Name="OrderLifeSeconds",
-            Description="Cancel sell limit if not filled within this many seconds. Default 5 (fast scalp). For FixedPrice mode set this large: 3600=1hr, 36000=10hr, 86400=24hr.",
+            Description="Cancel sell limit if not filled within this many seconds. Default 5.",
             Order=6, GroupName="2. Entry")]
         public int OrderLifeSeconds { get; set; }
 
@@ -1037,66 +1027,59 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ---- Stop Loss ----
         [NinjaScriptProperty]
         [Display(Name="StopMode",
-            Description="How to compute stop distances. AtrBased (default) = adaptive, uses ATR x multiplier. FixedPoints = use HardStopPoints / TrailDistancePoints.",
+            Description="How to compute stop distances. OffsetFromFilledPrice (default, v2.6) = avgBarSize x multiplier (same concept as entry). FixedPoints = use HardStopPoints/TrailDistancePoints.",
             Order=8, GroupName="4. Stop Loss")]
         public ShortStopLossMode StopMode { get; set; }
 
         [NinjaScriptProperty]
-        [Range(2, 100)]
-        [Display(Name="AtrPeriod",
-            Description="ATR lookback period (in 1-min bars). Default 14 (standard). Used only in AtrBased mode.",
+        [Range(0.1, 20.0)]
+        [Display(Name="StopOffsetMultiplier",
+            Description="[v2.6 NEW] Initial stop = fillPrice + (avgBarSize x this). Default 2.0. Used only in OffsetFromFilledPrice mode. SHORT: stop is ABOVE fill.",
             Order=9, GroupName="4. Stop Loss")]
-        public int AtrPeriod { get; set; }
+        public double StopOffsetMultiplier { get; set; }
 
         [NinjaScriptProperty]
-        [Range(0.5, 10.0)]
-        [Display(Name="AtrInitialStopMultiplier",
-            Description="Initial stop distance = ATR x this. Default 2.5. Used only in AtrBased mode. Wider gives the trade room to breathe at entry.",
+        [Range(0.1, 20.0)]
+        [Display(Name="TrailOffsetMultiplier",
+            Description="[v2.6 NEW] Trailing stop distance = avgBarSize x this. Default 0.8. Used only in OffsetFromFilledPrice mode. Tighter than initial stop.",
             Order=10, GroupName="4. Stop Loss")]
-        public double AtrInitialStopMultiplier { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0.5, 10.0)]
-        [Display(Name="AtrTrailMultiplier",
-            Description="Trailing stop distance = ATR x this. Default 1.0. Used only in AtrBased mode. Tighter than initial since trade is already running.",
-            Order=11, GroupName="4. Stop Loss")]
-        public double AtrTrailMultiplier { get; set; }
+        public double TrailOffsetMultiplier { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 200)]
-        [Display(Name="HardStopPoints", Description="INITIAL stop = expectedFill + this many points. Used only in FixedPoints mode. Default 20.", Order=12, GroupName="4. Stop Loss")]
+        [Display(Name="HardStopPoints", Description="INITIAL stop = expectedFill + this many points. Used only in FixedPoints mode. Default 20.", Order=11, GroupName="4. Stop Loss")]
         public int HardStopPoints { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 200)]
-        [Display(Name="TrailDistancePoints", Description="Trailed stop sits this many points ABOVE current price. Used only in FixedPoints mode. Default 8.", Order=13, GroupName="4. Stop Loss")]
+        [Display(Name="TrailDistancePoints", Description="Trailed stop sits this many points ABOVE current price. Used only in FixedPoints mode. Default 8.", Order=12, GroupName="4. Stop Loss")]
         public int TrailDistancePoints { get; set; }
 
         // ---- Trailing ----
         [NinjaScriptProperty]
         [Range(1, 3600)]
-        [Display(Name="MonitorIntervalSeconds", Description="How often the trailing check runs. Default 3.", Order=14, GroupName="5. Trailing")]
+        [Display(Name="MonitorIntervalSeconds", Description="How often the trailing check runs. Default 3.", Order=13, GroupName="5. Trailing")]
         public int MonitorIntervalSeconds { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 50)]
-        [Display(Name="PullbackTolerancePoints", Description="Tolerated rally before considering a real reversal. Default 2.", Order=15, GroupName="5. Trailing")]
+        [Display(Name="PullbackTolerancePoints", Description="Tolerated rally before considering a real reversal. Default 2.", Order=14, GroupName="5. Trailing")]
         public int PullbackTolerancePoints { get; set; }
 
         // ---- Cleanup ----
         [NinjaScriptProperty]
         [Range(0.0, 10.0)]
-        [Display(Name="DisableDelaySeconds", Description="Delay between position close and strategy disable. Default 1.5.", Order=16, GroupName="6. Cleanup")]
+        [Display(Name="DisableDelaySeconds", Description="Delay between position close and strategy disable. Default 1.5.", Order=15, GroupName="6. Cleanup")]
         public double DisableDelaySeconds { get; set; }
 
         // ---- Notifications ----
         [NinjaScriptProperty]
-        [Display(Name="EnableSoundOnFill", Description="Play sound when entry fills.", Order=17, GroupName="7. Notifications")]
+        [Display(Name="EnableSoundOnFill", Description="Play sound when entry fills.", Order=16, GroupName="7. Notifications")]
         public bool EnableSoundOnFill { get; set; }
 
         // ---- Logging ----
         [NinjaScriptProperty]
-        [Display(Name="AuditLogPath", Description="Folder for audit log CSV. Auto-created if missing. Default C:\\temp.", Order=18, GroupName="8. Logging")]
+        [Display(Name="AuditLogPath", Description="Folder for audit log CSV. Auto-created if missing. Default C:\\temp.", Order=17, GroupName="8. Logging")]
         public string AuditLogPath { get; set; }
 
         #endregion
