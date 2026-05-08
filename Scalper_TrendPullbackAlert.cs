@@ -18,182 +18,99 @@ using NinjaTrader.NinjaScript.DrawingTools;
 
 // =============================================================================
 //=============================================================================
-//  TODO / FUTURE WORK NOTES (added 2026-05-05)
+// TODO / FUTURE WORK NOTES (updated 2026-05-07)
 // =============================================================================
 //
-//  CURRENT STATUS
-//  --------------
-//  v3.9 logic is final for now. The alerter is a NOTIFICATION TOOL, not an
-//  auto-trader. When a beep fires, the human decides whether to enter (via
-//  LongScalper or otherwise). LongScalper handles its own bracket and
-//  trailing stop, which we can tune later independently.
+// CURRENT STATUS
+// --------------
+// This is a modified version of scalper_TrendPullbackAlert_beta v3.9.
+// The alerter is a NOTIFICATION TOOL, not an auto-trader. When a beep fires,
+// the human decides whether to enter (via LongScalper or otherwise). 
+// LongScalper handles its own bracket and trailing stop.
 //
-//  KNOWN WEAKNESS: FLASH-CRASH FALSE POSITIVES
-//  -------------------------------------------
-//  Backtest on MNQ 4/30 - 5/1 showed that the strategy can fire alerts
-//  during violent market crashes that are NOT normal pullback recoveries.
-//  Example: 4/30 13:45 alert with range = 277 pts (price crashed in
-//  minutes, then briefly bounced). The recovery looked valid by all 3
-//  gates, but it was a dead-cat bounce that lost -20 instantly.
+// **IMPORTANT**: This alert system is primarily designed and optimized for 
+// 1-MINUTE bars. Performance on other timeframes (especially higher ones) 
+// may vary significantly.
 //
-//  Two FILTER IDEAS to consider for future versions:
+// KNOWN WEAKNESS: FLASH-CRASH FALSE POSITIVES
+// -------------------------------------------
+// Backtest on MNQ showed that the strategy can fire alerts during violent 
+// market crashes that are NOT normal pullback recoveries. 
+// Example: large range dead-cat bounces.
 //
-//    FILTER A: MaxRangePoints
-//      Skip alert if range (H - L) > some threshold (e.g., 200 pts on MNQ).
-//      A pullback bigger than this is more likely a crash than a normal dip.
-//      Easy to add: one extra condition in the SIZE gate.
+// Two FILTER IDEAS to consider for future versions:
 //
-//    FILTER B: Volume confirmation at the L bar
-//      Skip alert if Volume[lBarsAgo] > AvgVolume * Multiplier (default 1.5
-//      or 2.0). Massive volume at the L means panic selling, often followed
-//      by more selling. Real pullback recoveries usually happen on normal
-//      volume.
-//      Requires: rolling volume average, comparison at L bar.
+// FILTER A: MaxRangePoints
+// Skip alert if range (H - L) > some threshold (e.g., 200-250 pts on MNQ).
 //
-//    Could combine: trigger filter only if EITHER is too extreme.
+// FILTER B: Volume confirmation at the L bar
+// Skip alert if Volume[lBarsAgo] > AvgVolume * Multiplier.
 //
-//  WHEN TO REVISIT
-//  ---------------
-//  After running v3.9 for a week of live (or replay) data, review the
-//  results CSV (scalper_TrendPullbackAlert_beta_Results.csv). Look at
-//  losing alerts and check whether they share these patterns:
-//    - Large Range column (suggests Filter A would help)
-//    - Volume spike at L_Time (suggests Filter B would help)
-//    - Other patterns we haven't thought of yet
+// WHEN TO REVISIT
+// ---------------
+// After running this version for a week of live (or replay) data on 1-minute 
+// chart, review the results CSV and analyze losing alerts.
 //
-//  RELATED: LONGSCALPER TUNING
-//  ---------------------------
-//  LongScalper currently uses ATR-based stops and a fixed profit target.
-//  Tuning of ProfitTargetPoints, AtrInitialStopMultiplier, and
-//  AtrTrailMultiplier is a SEPARATE concern from this alerter. The
-//  alerter just signals the moment; LongScalper handles the trade.
-//  Don't mix the two when analyzing performance.
+// RELATED: LONGSCALPER TUNING
+// ---------------------------
+// LongScalper tuning (PT, SL, trailing) is a SEPARATE concern from this alerter.
 //
 // =============================================================================
-//  STRATEGY:    scalper_TrendPullbackAlert_beta v3.9
-//  AUTHOR:      Albert Feng / Drafted with help from Claude
-//  REPLACES:    scalper_TrendPullbackAlert_beta v3.8
+// STRATEGY: scalper_TrendPullbackAlert_beta v3.9 (Modified)
+// AUTHOR: Albert Feng / Drafted with help from Claude
+// REPLACES: scalper_TrendPullbackAlert_beta v3.9 (original)
 // =============================================================================
 //
-//  PURPOSE
-//  -------
-//  Order-aware trend + pullback + recovery alerter. Places NO orders.
-//  Signals "buy-the-dip" opportunities for human reaction.
-//
-//  In real-world use, the human hears the beep, walks to the computer,
-//  and enables LongScalper which immediately attaches PT=10/SL=20 bracket.
-//  The bracket does the heavy lifting on exit. The alerter just needs to
-//  signal a good entry MOMENT, not predict the perfect outcome.
+// PURPOSE
+// -------
+// Order-aware trend + pullback + recovery alerter. Places NO orders.
+// Signals "buy-the-dip" opportunities for human reaction on 1-minute charts.
 //
 // =============================================================================
-//  v3.9 CHANGES vs v3.8
+// PARAMETER DEFAULTS (Current - Updated 2026-05-07)
 // =============================================================================
-//
-//  Three changes based on backtest analysis with bracket trading
-//  (PT=10/SL=20 instead of buy-and-hold-5-bars):
-//
-//  CHANGE A: AlertLowPct lowered from 0.35 to 0.25.
-//  -----------------------------------------------
-//  Buy-and-hold-5-bars analysis suggested 0.35 was the sweet spot. But
-//  with bracket trading (PT=10/SL=20), 0.25 dramatically outperforms:
-//
-//  Test on MNQ 5/4/2026 data:
-//     0.35 + PT/SL: 7 alerts, 3W/4L, total -36.0 pts
-//     0.25 + PT/SL: 7 alerts, 7W/0L, total +70.0 pts
-//
-//  Why 0.25 wins: firing earlier in the recovery means more upside left
-//  before reaching H. The PT=10 target is closer to entry. The SL=20 gives
-//  enough room for normal retests of L. With brackets, "earlier = better
-//  entry price" matters more than "wait for confirmation."
-//
-//  CHANGE B: Recovery gate changed from cross-up to close>prev close.
-//  -----------------------------------------------------------------
-//  v3.8 fired when recovery percent CROSSED UP through 0.35 (transition
-//  event between two bars). v3.9 fires when:
-//      recovery is in zone (0.25 - 0.70)
-//      AND close > previous close (this bar is green)
-//
-//  Why: simpler rule, matches human chart-reading intuition. When you see
-//  a green bar in the recovery zone, that's the moment to alert.
-//
-//  The truncated lookback already prevents repeat alerts on the same
-//  setup, so we don't need the cross-up rule for that purpose.
-//
-//  Backtest on MNQ:
-//      Option A (close > prev close):              7 alerts, 7W/0L
-//      Option B (close > prev close > 2-bars ago): 7 alerts, 6W/1L
-//  Option A won on this data. We chose A for simplicity and earlier entry.
-//
-//  CHANGE C: 5-bar HIGH and LOW now logged in results CSV.
-//  -------------------------------------------------------
-//  v3.8 logged only the 5-bar close-delta. This was misleading because
-//  many alerts hit a meaningful HIGH within 5 bars but gave it back by
-//  bar 5. With brackets, the high is what matters (PT might be hit before
-//  the 5-bar mark).
-//
-//  v3.9 logs:
-//    - Future5BarsClose: close at bar+5 (same as before)
-//    - Future5BarsHigh:  highest high in bars 1..5 (best possible exit)
-//    - Future5BarsLow:   lowest low in bars 1..5 (worst drawdown)
-//    - DeltaClose:       Future5BarsClose - BeepClose (was DeltaPoints)
-//    - DeltaHigh:        Future5BarsHigh - BeepClose (max gain)
-//    - DeltaLow:         Future5BarsLow - BeepClose (max drawdown)
-//
-//  This lets you analyze: "of my 50 alerts, how many had a +10 high
-//  within 5 bars?" That's relevant for PT=10 trading.
+// TrendMaPeriod          = 30
+// LookbackBars           = 50
+// MinPullbackPoints      = 100
+// CloseUpMaPeriod        = 3          // New: SMA for momentum confirmation
+// AlertLowPct            = 0.25
+// AlertHighPct           = 0.50       // Tightened from 0.70
+// MinBarsBetweenAlerts   = 10
+// CooldownMinutes        = 5
+// ResultEvalBars         = 5
+// ActiveStartTime        = 0
+// ActiveEndTime          = 235959
+// AlertSoundCount        = 3
+// AlertReminderSecs      = 1
+// EnableChartMarkers     = true
+// EnableAuditLog         = false
+// AuditLogPath           = @"C:\temp"
 //
 // =============================================================================
-//  WHAT'S UNCHANGED FROM v3.8
+// THE 3 GATES (Current Version)
 // =============================================================================
 //
-//  - Truncated lookback (H/L only from bars after last alert)
-//  - Trend rule: Close at H bar > SMA at H bar (note: was High in v3.8 prose
-//    but actually used Close in code; v3.9 is explicit about using Close)
-//  - SIZE gate: range >= MinPullbackPoints (80 default)
-//  - MinBarsBetweenAlerts (default 20)
-//  - Daily session reset
-//  - 5-min cooldown safety net
-//  - Beep sequence (3 beeps, 1 sec apart)
-//  - Chart markers
+// Gate 1 — TREND
+// Close at H bar > SMA(TrendMaPeriod) at H bar
+// Translation: "When the peak was made, was the closing price above
+// the SMA trend line?" → Confirms real uptrend pullback.
+//
+// Gate 2 — SIZE
+// range = H - L >= MinPullbackPoints (100 pts default)
+// Translation: "Was the dip meaningful, or just noise?"
+//
+// Gate 3 — RECOVERY + MOMENTUM
+// AlertLowPct (0.25) <= recovery <= AlertHighPct (0.50)
+// AND Close[0] > SMA(CloseUpMaPeriod)[0]
+// Translation: "Are we in the sweet spot of the recovery (25%-50%) 
+// AND is price currently trading above its short-term 3-period SMA?"
 //
 // =============================================================================
-//  PARAMETER DEFAULTS (v3.9)
-// =============================================================================
-//    TrendMaPeriod          80
-//    LookbackBars           80
-//    MinPullbackPoints      80
-//    AlertLowPct            0.25   <-- LOWERED from 0.35
-//    AlertHighPct           0.70
-//    MinBarsBetweenAlerts   20
-//    CooldownMinutes        5
-//    ResultEvalBars         5
-//    ActiveStartTime        0
-//    ActiveEndTime          235959
-//    AlertSoundCount        3
-//    AlertReminderSecs      1
-//    EnableChartMarkers     true
-//    EnableAuditLog         false
-//    AuditLogPath           C:\temp
-//
-// =============================================================================
-//  THE 3 GATES IN v3.9
-// =============================================================================
-//
-//  Gate 1 — TREND
-//    Close at H bar > SMA at H bar
-//    Translation: "When the peak was made, was the closing price above
-//    the SMA trend line?" If yes, this is a real uptrend pullback.
-//
-//  Gate 2 — SIZE
-//    range = H - L >= MinPullbackPoints (80 pts default)
-//    Translation: "Was the dip meaningful, or just noise?"
-//
-//  Gate 3 — RECOVERY
-//    AlertLowPct (0.25) <= recovery <= AlertHighPct (0.70)
-//    AND Close[0] > Close[1] (this bar is green)
-//    Translation: "Are we in the alert zone AND is this bar going up?"
-//
-// =============================================================================
+
+// The following contents is based on experience, no update from time to time
+// if down dominated ,  let pull back min point larger such as 100 or even 150, and recovey >0.3 to confirm the buying power come back
+// choppy day, 80 points should be fine
+// super up day, then 50 points 
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
@@ -202,6 +119,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         #region Variables
 
         private SMA trendMa;
+		private SMA closeUpMa;
 
         // Beep sequence (wall-clock cadence between beeps)
         private DateTime lastBeepWallClock;
@@ -266,12 +184,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 BarsRequiredToTrade                       = 80;
                 IsInstantiatedOnEachOptimizationIteration = true;
 
-                TrendMaPeriod        = 80;
-                LookbackBars         = 80;
-                MinPullbackPoints    = 80;
+                TrendMaPeriod        = 30;
+                LookbackBars         = 50;
+                MinPullbackPoints    = 100;
+				CloseUpMaPeriod      = 3;
                 AlertLowPct          = 0.25;     // [v3.9] lowered from 0.35
-                AlertHighPct         = 0.70;
-                MinBarsBetweenAlerts = 20;
+                AlertHighPct         = 0.50;
+                MinBarsBetweenAlerts = 10;
                 CooldownMinutes      = 5;
                 ResultEvalBars       = 5;
                 ActiveStartTime      = 0;
@@ -285,6 +204,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.DataLoaded)
             {
                 trendMa = SMA(TrendMaPeriod);
+				closeUpMa = SMA(CloseUpMaPeriod);
                 ResetState();
             }
             else if (State == State.Realtime)
@@ -296,8 +216,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     TrendMaPeriod));
                 Print(string.Format("[INIT] Pullback: lookback up to {0} bars, min size {1} pts (TRUNCATED at last alert)",
                     LookbackBars, MinPullbackPoints));
-                Print(string.Format("[INIT] Zone: recovery {0:P0}-{1:P0} AND Close[0] > Close[1]",
-                    AlertLowPct, AlertHighPct));
+                Print(string.Format("[INIT] Zone: recovery {0:P0}-{1:P0} AND Close > SMA({2})",
+    				AlertLowPct, AlertHighPct, CloseUpMaPeriod));
                 Print(string.Format("[INIT] Min bars between alerts: {0}",
                     MinBarsBetweenAlerts));
                 Print(string.Format("[INIT] Cooldown: {0} bar-minutes (backup safety net)",
@@ -319,7 +239,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // =====================================================================
         protected override void OnBarUpdate()
         {
-            if (CurrentBar < Math.Max(TrendMaPeriod, LookbackBars) + 1) return;
+            if (CurrentBar < Math.Max(Math.Max(TrendMaPeriod, LookbackBars), CloseUpMaPeriod) + 5) return;
 
             // -----------------------------------------------------------------
             // Session boundary - reset alert state daily
@@ -444,7 +364,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Gate 3: RECOVERY (zone) AND CLOSE-UP
             // [v3.9] Replaced cross-up rule with simpler "close > prev close"
             bool condZone   = recovery >= AlertLowPct && recovery <= AlertHighPct;
-            bool condCloseUp = (CurrentBar >= 1) && (Close[0] > Close[1]);
+            bool condCloseUp = (Close[0] > closeUpMa[0]);
 
             bool inCooldown = (lastAlertBarTime != DateTime.MinValue)
                 && ((Time[0] - lastAlertBarTime).TotalMinutes < CooldownMinutes);
@@ -505,8 +425,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     H, hTime.ToString("HH:mm"),
                     L, lTime.ToString("HH:mm"),
                     range, effectiveLookback));
-                Print(string.Format("[ALERT]   Pullback={0:F2} pts, Recovery={1:P1} (zone {2:P0}-{3:P0}), CloseUp: {4:F2} > {5:F2}",
-                    pullbackPts, recovery, AlertLowPct, AlertHighPct, Close[0], Close[1]));
+                Print(string.Format("[ALERT] Pullback={0:F2} pts, Recovery={1:P1} (zone {2:P0}-{3:P0}), CloseUp: {4:F2} > SMA({5})={6:F2}",
+				    pullbackPts, recovery, AlertLowPct, AlertHighPct, 
+				    Close[0], CloseUpMaPeriod, closeUpMa[0]));
 
                 PlaySound(NinjaTrader.Core.Globals.InstallDir + @"\sounds\Alert1.wav");
                 lastBeepWallClock = DateTime.Now;
@@ -798,72 +719,79 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description="Upper edge of alert zone. Default 0.70.",
             Order=5, GroupName="3. Trigger Zone")]
         public double AlertHighPct { get; set; }
+		
+		[NinjaScriptProperty]
+		[Range(1, 50)]
+		[Display(Name="CloseUpMaPeriod",
+		    Description="SMA period used for Close-Up filter. Current Close must be above this SMA. Default 3.",
+		    Order=6, GroupName="3. Trigger Zone")]
+		public int CloseUpMaPeriod { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 240)]
         [Display(Name="MinBarsBetweenAlerts",
             Description="Minimum bars between any 2 alerts. Default 20. Prevents chop-trap alerts.",
-            Order=6, GroupName="4. Alert Spacing")]
+            Order=7, GroupName="4. Alert Spacing")]
         public int MinBarsBetweenAlerts { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 60)]
         [Display(Name="CooldownMinutes",
             Description="Bar-time minutes after a beep before another beep is allowed. Backup safety net. Default 5.",
-            Order=7, GroupName="5. Cooldown")]
+            Order=8, GroupName="5. Cooldown")]
         public int CooldownMinutes { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 60)]
         [Display(Name="ResultEvalBars",
             Description="Bars after each beep to wait before measuring forward performance. Default 5. v3.9 also tracks 5-bar HIGH/LOW.",
-            Order=8, GroupName="6. Result Tracking")]
+            Order=9, GroupName="6. Result Tracking")]
         public int ResultEvalBars { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 235959)]
         [Display(Name="ActiveStartTime",
             Description="Time to start watching (HHMMSS). 0 = midnight.",
-            Order=9, GroupName="7. Time Window")]
+            Order=10, GroupName="7. Time Window")]
         public int ActiveStartTime { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 235959)]
         [Display(Name="ActiveEndTime",
             Description="Time to stop watching (HHMMSS). 235959 = 1 sec before midnight.",
-            Order=10, GroupName="7. Time Window")]
+            Order=11, GroupName="7. Time Window")]
         public int ActiveEndTime { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 10)]
         [Display(Name="AlertSoundCount",
             Description="Total number of beeps per alert. Default 3.",
-            Order=11, GroupName="8. Beep Sequence")]
+            Order=12, GroupName="8. Beep Sequence")]
         public int AlertSoundCount { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 60)]
         [Display(Name="AlertReminderSecs",
             Description="Wall-clock seconds between beeps. Default 1.",
-            Order=12, GroupName="8. Beep Sequence")]
+            Order=13, GroupName="8. Beep Sequence")]
         public int AlertReminderSecs { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name="EnableChartMarkers",
             Description="Draw green up-arrow at L and text label when alert fires.",
-            Order=13, GroupName="9. Visuals")]
+            Order=14, GroupName="9. Visuals")]
         public bool EnableChartMarkers { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name="EnableAuditLog",
             Description="Write CSV row every minute (and on every alert). Useful for debugging. Off for live use.",
-            Order=14, GroupName="10. Audit Log")]
+            Order=15, GroupName="10. Audit Log")]
         public bool EnableAuditLog { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name="AuditLogPath",
             Description="Folder for audit log AND results log. Auto-created. Default C:\\temp.",
-            Order=15, GroupName="10. Audit Log")]
+            Order=16, GroupName="10. Audit Log")]
         public string AuditLogPath { get; set; }
 
         #endregion
