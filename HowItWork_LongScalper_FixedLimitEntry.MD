@@ -1,136 +1,63 @@
-# LongScalper_FixedLimitEntry v2.6 - How It Works
+User Guide: LongScalper (Fixed Limit Entry)
+This guide explains how the LongScalper automated strategy operates on NinjaTrader 8. This strategy is designed to enter "Long" positions by placing a limit order at a strategic distance from the market price, managed by real-time volatility.
+LongScalper_FixedLimitEntry is a long-only scalping strategy that places a limit buy order and manages the full trade with profit target, stop loss, and trailing stop.
+Main Purpose
+•	Enter long at a favorable price during pullback recoveries.
+•	Automatically attach profit target and stop loss brackets upon fill.
+•	Trail the stop loss to lock in profits.
+•	Provide strong defensive protection against orphaned orders.
 
-## Overview
+________________________________________
+🚀 How the Strategy Works
+The LongScalper doesn't just "buy at the market." It waits for a specific price point based on how the market is currently moving.
+1.	Volatility Tracking: The bot constantly calculates the Average Bar Size (the height of recent candles). This tells the bot if the market is "fast" or "slow."
+2.	The "Dip" Entry: When the strategy starts, it places a Limit Order slightly below the current price. It is essentially betting that the price will "dip" for a split second to fill your order before moving higher.
+3.	Active Management: Once you are in a trade, the bot immediately places a Profit Target and a Trailing Stop Loss to protect your capital.
+________________________________________
+⚙️ Parameter Definitions
+1. Entry Settings (Getting In)
+These parameters determine where and when your buy order is placed.
+•	Limit Mode:
+o	OffsetFromLastPrice: The bot follows the current price and places an order $X$ amount below it.
+o	FixedPrice: You specify one exact price (e.g., 18500.25) and the bot stays there.
+•	Entry Offset Multiplier:
+o	Usage: Only used in OffsetFromLastPrice mode.
+o	Logic: It takes the Average Bar Size and multiplies it by this number.
+o	Example: If the average candle is 10 points and your multiplier is 0.2, the bot will place your buy order 2 points below the current price.
+•	Order Life (Seconds):
+o	How long the bot waits for the "dip" to hit your price. If the market moves away and you aren't filled within this time, the order is cancelled and replaced at a new, better price.
+2. Exit Settings (Getting Out)
+These parameters manage your money once the trade is active.
+•	Profit Target Points:
+o	The fixed amount of profit you want to take. If set to 15, the bot will exit as soon as the trade is up 15 points.
+•	Stop Loss Mode:
+o	OffsetFromFilledPrice: Highly recommended. It sets your stop loss based on recent volatility.
+o	FixedPoints: A static stop (e.g., always 20 points).
+•	Stop Offset Multiplier:
+o	How much "breathing room" the trade has. A value of 2.0 means your stop loss is twice the size of an average candle.
+•	Trail Offset Multiplier:
+o	Controls the Trailing Stop. As the price moves up, the stop loss "walks" up behind it. A smaller number (like 0.5) follows the price very tightly; a larger number (like 1.5) gives the trade more room to swing.
+3. Strategy Logic (The "Brain")
+•	Bar Size Average Period:
+o	How many previous candles the bot looks at to determine "average volatility." Default is 10. Increase this for a steadier, slower-reacting bot.
+•	Monitor Interval (Seconds):
+o	How often the bot "checks" the market to move your trailing stop. Usually set to 2 or 3 seconds.
+________________________________________
+🛡️ Safety & Account Protection
+This strategy includes a Full-Sync Safety Module. This is crucial for non-programmers to understand:
+1.	Ghost Order Prevention: Every few seconds, the bot compares your NinjaTrader Account to its Internal Logic.
+2.	Auto-Cleanup: If you manually close a position on your phone or in another chart, the bot will detect that you are "Flat." It will immediately cancel any "orphaned" Limit Orders or Stop Losses that were left behind.
+3.	Fail-Safe: If the bot detects a mismatch it cannot resolve, it will sound an alert and shut itself down to prevent "accidental trading."
+________________________________________
+💡 Pro-Tips for Tuning
+•	Volatile Markets (Nasdaq/MNQ): Use a larger Stop Offset Multiplier (e.g., 2.5) to avoid being stopped out by "noise."
+•	Quiet Markets (S&P 500/MES): Use a smaller Entry Offset Multiplier (e.g., 0.05) because the price doesn't dip as far, and you want to make sure you get filled.
+•	Scalping: If you want quick "in-and-out" trades, set your Profit Target low and your Trail Offset very tight (0.4).
+________________________________________
+How to Start
+1.	Right-click your NinjaTrader Chart.
+2.	Select Strategies.
+3.	Choose LongScalper_FixedLimitEntry.
+4.	Adjust the parameters in the right-hand panel using the guide above.
+5.	Check the Enabled box and click OK.
 
-**LongScalper_FixedLimitEntry** is a **long-only scalping strategy** that places a limit buy order and manages the full trade with profit target, stop loss, and trailing stop.
-
-It is the **simpler, non-tracking** version of the LongScalper family. While `LongScalper_TrackingLimitEntry` continuously adjusts the limit price, this version uses a **fixed** (static) limit order.
-
-It is designed to work together with the companion alert strategy `scalper_TrendPullbackAlert_beta`.
-
----
-
-## Main Purpose
-
-- Enter long at a favorable price during pullback recoveries.
-- Automatically attach profit target and stop loss brackets upon fill.
-- Trail the stop loss to lock in profits.
-- Provide strong defensive protection against orphaned orders.
-
----
-
-## How It Works (Simple Version)
-
-1. When enabled → submits a **Buy Limit** order at a calculated price below the market.
-2. Upon fill → immediately attaches PT and SL brackets.
-3. Monitors the position and trails the stop loss upward.
-4. After the trade ends (PT, SL, or manual exit), the strategy cleans up and disables itself.
-
----
-
-## Detailed Operation
-
-### 1. Entry Logic
-
-The strategy offers two entry modes (`LimitMode`):
-
-- **OffsetFromLastPrice** (Default & Recommended):
-  - Calculates `avgBarSize` = EMA of recent 1-minute bar ranges (High - Low).
-  - Places Buy Limit at: `Current Price - (EntryOffsetMultiplier × avgBarSize)`.
-
-- **FixedPrice**:
-  - Uses the exact price you enter in `FixedLimitPrice`.
-
-The order is cancelled if not filled within `OrderLifeSeconds`.
-
-### 2. Exit Logic
-
-- **Profit Target**: Fixed points above the actual fill price.
-- **Stop Loss**: Two modes available (see parameters).
-- **Trailing Stop**: Automatically moves the stop loss higher as price moves in your favor (with pullback tolerance).
-
-### 3. Safety & Defensive Features (v2.6)
-
-- Thorough pre-entry checks (strategy flat + account flat + no working orders).
-- **Orphan Protection**: If the account becomes flat while the strategy thinks it has a position, it automatically cleans up all brackets and disables itself.
-- This protects against manual closes, external fills, or broker actions.
-
----
-
-## Important Usage Notes
-
-**This strategy is primarily designed and optimized for MNQ on 1-minute charts.**
-
-- For other instruments or timeframes, **adjust parameters carefully** (especially multipliers and point values).
-- Best used after receiving an alert from `scalper_TrendPullbackAlert_beta`.
-
-### Critical Rules After Entry
-
-- Once the strategy has opened a position and attached brackets, **do not** add manual orders on top of it.
-- If price goes strongly against you:
-  - Let the stop loss handle the exit, **or**
-  - Manually flatten the position + cancel all orders, then **disable and re-enable** the strategy for the next setup.
-- Adding manual orders while the strategy is managing brackets can cause conflicts and unexpected behavior.
-
----
-
-## Parameter Guide
-
-### 1. Trade Size
-- **Quantity**: Number of contracts (default 1).
-
-### 2. Entry
-- **LimitMode**:
-  - `OffsetFromLastPrice` (default): Dynamic offset from current price.
-  - `FixedPrice`: Uses exact price set in `FixedLimitPrice`.
-- **EntryOffsetMultiplier** (0.10): Distance below current price (used in Offset mode).
-- **BarSizeAveragePeriod** (10): Lookback period for volatility calculation.
-- **FixedLimitPrice**: Target price when using FixedPrice mode.
-- **OrderLifeSeconds** (5): Maximum time the limit order stays active.
-
-### 3. Profit Target
-- **ProfitTargetPoints** (10): Take-profit in points above fill price.
-
-### 4. Stop Loss & Trailing
-- **StopMode**:
-  - `OffsetFromFilledPrice` (recommended): Adaptive using `avgBarSize × multiplier`.
-  - `FixedPoints`: Static point values.
-- **StopOffsetMultiplier** (2.0): Initial stop distance.
-- **TrailOffsetMultiplier** (0.8): Trailing stop distance (tighter).
-- **HardStopPoints** (20): Used only in FixedPoints mode.
-- **TrailDistancePoints** (8): Used only in FixedPoints mode.
-
-### 5. Trailing Behavior
-- **MonitorIntervalSeconds** (3): How often trailing logic runs.
-- **PullbackTolerancePoints** (2): Allowed pullback before considering reversal.
-
-### 6. Others
-- **DisableDelaySeconds** (1.5): Delay before auto-disable after trade ends.
-- **EnableSoundOnFill**: Play alert sound on entry fill.
-- **AuditLogPath**: Folder for trade result CSV.
-
----
-
-## Recommended Workflow
-
-1. Run `scalper_TrendPullbackAlert_beta` on MNQ 1-minute chart.
-2. Wait for the alert beep.
-3. Quickly enable `LongScalper_FixedLimitEntry`.
-4. Strategy places the limit order.
-5. If filled → brackets are managed automatically.
-6. After trade completes → strategy disables itself automatically.
-7. Wait for next alert and repeat.
-
----
-
-## Version History Highlights
-
-- **v2.6**: Added strong orphaned bracket protection + switched to bar-size-based adaptive stops (no more ATR).
-
-**Author**: Albert Feng (with help from Claude)  
-**Version**: 2.6  
-**Primary Instrument**: MNQ (1-minute chart)
-
----
-
-*Use with proper risk management. Always monitor your positions.*
