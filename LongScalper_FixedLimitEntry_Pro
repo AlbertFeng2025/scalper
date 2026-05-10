@@ -1,0 +1,1399 @@
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.IO;
+using System.Linq;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Threading;
+using NinjaTrader.Cbi;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.Indicators;
+#endregion
+
+// =============================================================================
+//  STRATEGY:    LongScalper_FixedLimitEntry_Pro v1.0
+//  AUTHOR:      Drafted with help from Claude
+//  RELATIONSHIP TO LongScalper v2.6:
+//      - This is a SEPARATE strategy. It does NOT modify LongScalper v2.6.
+//      - It reuses v2.6's proven trading logic patterns (entry, brackets,
+//        trailing stop, orphan check, audit log) but with one key difference:
+//        v2.6 fires automatically on enable (one-shot auto-fire).
+//        THIS strategy fires only when the FIRE button is clicked
+//        (or in the future, when an external signal source calls FireOrder()).
+//
+//  WHY A NEW STRATEGY:
+//      - User wants a manual / signal-driven launcher with a visible control panel.
+//      - Today: human sees a J9 signal -> clicks FIRE -> one bracketed trade runs.
+//      - Future: external API/file feed calls FireOrder() -> same execution path.
+//      - The button is a manual stand-in for the future signal feed.
+//
+//  HOW IT WORKS:
+//      1. Add this strategy to a chart (NQ recommended), enable it.
+//      2. A WPF control panel pops out.
+//      3. Set parameters in the standard NT properties dialog (qty, target,
+//         stops, multipliers, FixedLimitPrice if using FixedPrice mode).
+//      4. Click FIRE LONG to place ONE bracketed buy.
+//      5. Strategy manages the trade to exit (target / stop / trailing / manual).
+//      6. After exit, strategy disables itself - same one-shot model as v2.6.
+//      7. To trade again, re-enable the strategy.
+//
+//  THREADING NOTES (THIS IS WHERE THE FILE-1 ATTEMPT FAILED):
+//      - WPF window is created on the UI dispatcher, NOT the strategy thread.
+//      - All panel updates from strategy thread go through Dispatcher.BeginInvoke.
+//      - Button clicks (UI thread) set volatile flags read by OnBarUpdate.
+//        Order placement happens on the strategy thread, never from button handlers.
+//      - Window is closed in State.Terminated via Dispatcher.Invoke, reference nulled.
+//      - Window's Closing event tracked so a user-X'd panel doesn't leave a dead ref.
+//
+// =============================================================================
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public enum ProEntryLimitMode
+    {
+        OffsetFromLastPrice,
+        FixedPrice
+    }
+
+    public enum ProStopLossMode
+    {
+        OffsetFromFilledPrice,
+        FixedPoints
+    }
+
+    public class LongScalper_FixedLimitEntry_Pro : Strategy
+    {
+        #region Variables
+
+        private enum TradeState
+        {
+            Idle,           // armed but FIRE not yet clicked
+            WaitingForFill, // entry order working
+            InPosition,     // filled, managing exit
+            ClosingDelay,   // exit fill received, waiting for OCO finalization
+            Done            // strategy is shutting down
+        }
+        private TradeState currentState = TradeState.Idle;
+
+        private Order entryOrder        = null;
+        private Order stopLossOrder     = null;
+        private Order profitTargetOrder = null;
+
+        private DateTime entryOrderPlacedTime;
+        private DateTime fillTime;
+        private DateTime lastMonitorCheckTime;
+        private DateTime closingDelayStartTime;
+
+        private double entryLastTradedPrice = 0;
+        private double calculatedLimitPrice = 0;
+        private double actualFillPrice      = 0;
+        private double avgBarSizeAtEntry    = 0;
+        private double previousCheckPrice   = 0;
+        private double currentStopPrice     = 0;
+        private double currentTargetPrice   = 0;
+        private double finalExitPrice       = 0;
+        private double finalPnLPoints       = 0;
+        private string finalExitReason      = "UNKNOWN";
+        private double initialStopDistance  = 0;
+
+        private const int MinuteBarsIndex = 1;
+        private const string EntrySignalName = "LongProEntry";
+
+        // ---- Cross-thread flags (UI -> strategy) ----
+        // Volatile because they're written by the UI dispatcher thread
+        // and read by the strategy thread in OnBarUpdate.
+        private volatile bool fireRequested        = false;
+        private volatile bool forceCloseRequested  = false;
+
+        // ---- Control panel ----
+        private ControlPanel panel = null;
+
+        #endregion
+
+        #region NinjaScript State Machine
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Description                                 = "Long-only manual/signal-driven launcher with WPF control panel. Reuses LongScalper v2.6 trading logic but waits for FIRE button (or future API call) instead of auto-firing on enable.";
+                Name                                        = "LongScalper_FixedLimitEntry_Pro";
+                Calculate                                   = Calculate.OnEachTick;
+                EntriesPerDirection                         = 1;
+                EntryHandling                               = EntryHandling.AllEntries;
+                IsExitOnSessionCloseStrategy                = true;
+                ExitOnSessionCloseSeconds                   = 30;
+                IsFillLimitOnTouch                          = false;
+                MaximumBarsLookBack                         = MaximumBarsLookBack.TwoHundredFiftySix;
+                OrderFillResolution                         = OrderFillResolution.Standard;
+                Slippage                                    = 0;
+                StartBehavior                               = StartBehavior.WaitUntilFlat;
+                TimeInForce                                 = TimeInForce.Day;
+                TraceOrders                                 = false;
+                RealtimeErrorHandling                       = RealtimeErrorHandling.StopCancelClose;
+                StopTargetHandling                          = StopTargetHandling.PerEntryExecution;
+                BarsRequiredToTrade                         = 20;
+                IsInstantiatedOnEachOptimizationIteration   = true;
+
+                // ---- Defaults ----
+                Quantity                = 1;
+
+                LimitMode               = ProEntryLimitMode.OffsetFromLastPrice;
+                FixedLimitPrice         = 0;
+
+                EntryOffsetMultiplier   = 0.10;
+                BarSizeAveragePeriod    = 10;
+                OrderLifeSeconds        = 5;
+                ProfitTargetPoints      = 10;
+
+                StopMode                = ProStopLossMode.OffsetFromFilledPrice;
+                StopOffsetMultiplier    = 2.0;
+                TrailOffsetMultiplier   = 0.8;
+
+                HardStopPoints          = 20;
+                TrailDistancePoints     = 8;
+
+                MonitorIntervalSeconds  = 3;
+                PullbackTolerancePoints = 2;
+                DisableDelaySeconds     = 1.5;
+                EnableSoundOnFill       = true;
+                AuditLogPath            = @"C:\temp";
+            }
+            else if (State == State.Configure)
+            {
+                AddDataSeries(BarsPeriodType.Minute, 1);
+            }
+            else if (State == State.DataLoaded)
+            {
+                ResetTradeState();
+            }
+            else if (State == State.Realtime)
+            {
+                Print("================================================================");
+                Print(string.Format("[INIT] LongScalper_Pro v1.0 armed at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
+                Print(string.Format("[INIT] LimitMode={0}, FixedLimitPrice={1}", LimitMode, FixedLimitPrice));
+                Print(string.Format("[INIT] StopMode={0}", StopMode));
+                if (StopMode == ProStopLossMode.OffsetFromFilledPrice)
+                    Print(string.Format("[INIT]   StopOffsetMult={0}, TrailOffsetMult={1} (x avgBarSize)",
+                        StopOffsetMultiplier, TrailOffsetMultiplier));
+                else
+                    Print(string.Format("[INIT]   HardStop={0}pts, Trail={1}pts", HardStopPoints, TrailDistancePoints));
+                Print(string.Format("[INIT] AuditLogPath: {0}", AuditLogPath));
+                Print("[INIT] Waiting for FIRE button click...");
+
+                // Open the control panel only once we're realtime - safer than DataLoaded
+                // because the strategy is fully wired up by now.
+                OpenControlPanel();
+            }
+            else if (State == State.Terminated)
+            {
+                Print(string.Format("[TERM] Strategy terminated at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
+                try { CleanupRemainingBrackets(); } catch { }
+                CloseControlPanel();
+            }
+        }
+
+        #endregion
+
+        #region OnBarUpdate - main loop
+
+        protected override void OnBarUpdate()
+        {
+            if (CurrentBars[0] < BarsRequiredToTrade) return;
+            if (BarsArray.Length > MinuteBarsIndex && CurrentBars[MinuteBarsIndex] < BarSizeAveragePeriod) return;
+            if (State != State.Realtime) return;
+
+            // Defensive: detect account-flat-but-strategy-thinks-otherwise
+            CheckForOrphanedState();
+
+            // Cross-thread requests from the panel ----------------------------
+
+            if (forceCloseRequested)
+            {
+                forceCloseRequested = false;
+                HandleForceCloseRequest();
+            }
+
+            if (fireRequested)
+            {
+                fireRequested = false;
+                if (currentState == TradeState.Idle)
+                {
+                    Print("[FIRE] FIRE button clicked. Placing entry order.");
+                    PlaceEntryOrder();
+                }
+                else
+                {
+                    Print(string.Format("[FIRE] Ignored - currentState is {0}, not Idle.", currentState));
+                    UpdatePanelLog(string.Format("FIRE ignored - state is {0}", currentState));
+                }
+            }
+
+            // Standard lifecycle ----------------------------------------------
+
+            switch (currentState)
+            {
+                case TradeState.Idle:
+                    // Just wait. Panel button or future API drives the entry.
+                    break;
+
+                case TradeState.WaitingForFill:
+                    if ((DateTime.Now - entryOrderPlacedTime).TotalSeconds >= OrderLifeSeconds)
+                    {
+                        if (entryOrder != null && entryOrder.OrderState == OrderState.Working)
+                        {
+                            Print(string.Format("[TIMEOUT] Order life expired ({0}s). Cancelling.", OrderLifeSeconds));
+                            CancelOrder(entryOrder);
+                        }
+                    }
+                    break;
+
+                case TradeState.InPosition:
+                    if ((DateTime.Now - lastMonitorCheckTime).TotalSeconds >= MonitorIntervalSeconds)
+                        DoTrailingCheck();
+                    break;
+
+                case TradeState.ClosingDelay:
+                    if ((DateTime.Now - closingDelayStartTime).TotalSeconds >= DisableDelaySeconds)
+                    {
+                        Print("[CLOSE] Delay elapsed. Writing audit and disabling.");
+                        CleanupRemainingBrackets();
+                        WriteAuditLog(finalExitReason, actualFillPrice, finalExitPrice, finalPnLPoints);
+                        currentState = TradeState.Done;
+                        DisableStrategy();
+                    }
+                    break;
+
+                case TradeState.Done:
+                    break;
+            }
+
+            // Panel status refresh - cheap, do it every tick
+            RefreshPanelStatus();
+        }
+
+        #endregion
+
+        #region Public method for future signal integration
+
+        /// <summary>
+        /// Public entry point that an external signal source (REST API, file feed,
+        /// J9 hook, etc.) can call to request a fire. Sets the same flag that the
+        /// FIRE button sets. Thread-safe.
+        ///
+        /// Future use:
+        ///   var strat = ... (find this strategy via Account.Strategies)
+        ///   strat.RequestFire();
+        /// </summary>
+        public void RequestFire()
+        {
+            fireRequested = true;
+        }
+
+        #endregion
+
+        #region Entry order placement (mirrors v2.6 logic)
+
+        private void PlaceEntryOrder()
+        {
+            Print("================================================================");
+            Print(string.Format("[STEP1] PlaceEntryOrder called at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
+            Print(string.Format("[STEP1] Position: {0} qty={1}", Position.MarketPosition, Position.Quantity));
+            Print(string.Format("[STEP1] LimitMode={0}, StopMode={1}", LimitMode, StopMode));
+
+            // ----- SAFETY 1: strategy position must be flat -----
+            if (Position.MarketPosition != MarketPosition.Flat)
+            {
+                Print(string.Format("[STEP1] *** BLOCKED *** Strategy position is {0} qty={1}.",
+                    Position.MarketPosition, Position.Quantity));
+                WriteAuditLog("BLOCKED_NOT_FLAT", 0, 0, 0);
+                currentState = TradeState.Done;
+                DisableStrategy();
+                return;
+            }
+
+            // ----- SAFETY 2: account must also be flat -----
+            try
+            {
+                if (Account != null)
+                {
+                    Position acctPos = Account.Positions.FirstOrDefault(p => p.Instrument == Instrument);
+                    if (acctPos != null && acctPos.MarketPosition != MarketPosition.Flat)
+                    {
+                        Print(string.Format("[STEP1] *** BLOCKED *** ACCOUNT position is {0} qty={1}.",
+                            acctPos.MarketPosition, acctPos.Quantity));
+                        WriteAuditLog("BLOCKED_ACCOUNT_NOT_FLAT", 0, 0, 0);
+                        currentState = TradeState.Done;
+                        DisableStrategy();
+                        return;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[STEP1] WARN: Account position check failed: {0}", ex.Message));
+            }
+
+            // ----- SAFETY 3: no working orders for this instrument -----
+            try
+            {
+                if (Account != null)
+                {
+                    int workingCount = 0;
+                    lock (Account.Orders)
+                    {
+                        foreach (var ord in Account.Orders)
+                        {
+                            if (ord.Instrument == Instrument
+                                && (ord.OrderState == OrderState.Working
+                                    || ord.OrderState == OrderState.Accepted
+                                    || ord.OrderState == OrderState.Submitted))
+                            {
+                                workingCount++;
+                            }
+                        }
+                    }
+                    if (workingCount > 0)
+                    {
+                        Print(string.Format("[STEP1] *** BLOCKED *** Found {0} working order(s).", workingCount));
+                        WriteAuditLog("BLOCKED_WORKING_ORDERS", 0, 0, 0);
+                        currentState = TradeState.Done;
+                        DisableStrategy();
+                        return;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[STEP1] WARN: Working orders check failed: {0}", ex.Message));
+            }
+
+            entryLastTradedPrice = GetCurrentLastPrice();
+            if (entryLastTradedPrice <= 0)
+            {
+                Print("[STEP1] ERROR: Could not get current price. Disabling.");
+                currentState = TradeState.Done;
+                DisableStrategy();
+                return;
+            }
+
+            avgBarSizeAtEntry = CalculateEmaBarSize();
+            if (avgBarSizeAtEntry <= 0)
+            {
+                Print("[STEP1] ERROR: Could not calculate bar size. Disabling.");
+                currentState = TradeState.Done;
+                DisableStrategy();
+                return;
+            }
+
+            // Compute limit price
+            if (LimitMode == ProEntryLimitMode.FixedPrice)
+            {
+                if (FixedLimitPrice <= 0)
+                {
+                    Print(string.Format("[STEP1] *** BLOCKED *** FixedLimitPrice is {0} (must be > 0).", FixedLimitPrice));
+                    WriteAuditLog("BLOCKED_INVALID_FIXED_PRICE", 0, 0, 0);
+                    currentState = TradeState.Done;
+                    DisableStrategy();
+                    return;
+                }
+                calculatedLimitPrice = Instrument.MasterInstrument.RoundToTickSize(FixedLimitPrice);
+                Print(string.Format("[STEP1] FixedPrice mode: lastPrice={0}, userTyped={1}, rounded limitPrice={2}, avgBarSize={3:F2}",
+                    entryLastTradedPrice, FixedLimitPrice, calculatedLimitPrice, avgBarSizeAtEntry));
+            }
+            else
+            {
+                double offset = EntryOffsetMultiplier * avgBarSizeAtEntry;
+                calculatedLimitPrice = Instrument.MasterInstrument.RoundToTickSize(entryLastTradedPrice - offset);
+                Print(string.Format("[STEP1] Offset mode: lastPrice={0}, avgBarSize={1:F2}, offset={2:F2}, limitPrice={3}",
+                    entryLastTradedPrice, avgBarSizeAtEntry, offset, calculatedLimitPrice));
+            }
+
+            // Compute target and initial stop
+            double expectedFillPrice = calculatedLimitPrice;
+            double targetPrice = Instrument.MasterInstrument.RoundToTickSize(expectedFillPrice + ProfitTargetPoints);
+
+            double initialStop;
+            if (StopMode == ProStopLossMode.OffsetFromFilledPrice)
+            {
+                initialStopDistance = avgBarSizeAtEntry * StopOffsetMultiplier;
+                initialStop = Instrument.MasterInstrument.RoundToTickSize(expectedFillPrice - initialStopDistance);
+                Print(string.Format("[STEP1] OffsetFromFilledPrice stop: avgBarSize={0:F2}, multiplier={1}, distance={2:F2}, stopPrice={3}",
+                    avgBarSizeAtEntry, StopOffsetMultiplier, initialStopDistance, initialStop));
+            }
+            else
+            {
+                initialStopDistance = HardStopPoints;
+                initialStop = Instrument.MasterInstrument.RoundToTickSize(expectedFillPrice - HardStopPoints);
+                Print(string.Format("[STEP1] FixedPoints stop: distance={0}pts, stopPrice={1}", HardStopPoints, initialStop));
+            }
+
+            try
+            {
+                SetProfitTarget(EntrySignalName, CalculationMode.Price, targetPrice);
+                SetStopLoss(EntrySignalName, CalculationMode.Price, initialStop, false);
+                currentStopPrice   = initialStop;
+                currentTargetPrice = targetPrice;
+                Print(string.Format("[STEP1] Pre-declared brackets: target={0}, stop={1}", targetPrice, initialStop));
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[STEP1] ERROR setting brackets: {0}. Disabling.", ex.Message));
+                currentState = TradeState.Done;
+                DisableStrategy();
+                return;
+            }
+
+            entryOrderPlacedTime = DateTime.Now;
+            currentState = TradeState.WaitingForFill;
+
+            entryOrder = EnterLongLimit(0, true, Quantity, calculatedLimitPrice, EntrySignalName);
+            Print(string.Format("[STEP1] Buy limit submitted at {0}. State now: {1}", calculatedLimitPrice, currentState));
+            UpdatePanelLog(string.Format("FIRED: limit {0}, target {1}, stop {2}",
+                calculatedLimitPrice, targetPrice, initialStop));
+        }
+
+        private double CalculateEmaBarSize()
+        {
+            if (BarsArray.Length <= MinuteBarsIndex) return 0;
+            if (CurrentBars[MinuteBarsIndex] < BarSizeAveragePeriod) return 0;
+
+            double alpha = 2.0 / (BarSizeAveragePeriod + 1.0);
+            double ema = 0;
+
+            for (int i = BarSizeAveragePeriod - 1; i >= 0; i--)
+            {
+                double barSize = Highs[MinuteBarsIndex][i] - Lows[MinuteBarsIndex][i];
+                if (i == BarSizeAveragePeriod - 1)
+                    ema = barSize;
+                else
+                    ema = alpha * barSize + (1 - alpha) * ema;
+            }
+            return ema;
+        }
+
+        private double GetCurrentLastPrice()
+        {
+            if (Closes[0].Count > 0) return Close[0];
+            return 0;
+        }
+
+        #endregion
+
+        #region Trailing stop, orphan check, force close
+
+        private void DoTrailingCheck()
+        {
+            try
+            {
+                double currentPrice = GetCurrentLastPrice();
+                if (currentPrice <= 0) return;
+
+                double referencePrice = previousCheckPrice;
+                if (referencePrice == 0) referencePrice = actualFillPrice;
+
+                double threshold = referencePrice - PullbackTolerancePoints;
+
+                double trailDistance = (StopMode == ProStopLossMode.OffsetFromFilledPrice)
+                    ? avgBarSizeAtEntry * TrailOffsetMultiplier
+                    : (double)TrailDistancePoints;
+
+                Print(string.Format("[MONITOR] Check at {0}, currentPrice={1}, ref={2}, threshold={3}, trailDist={4:F2}",
+                    DateTime.Now.ToString("HH:mm:ss.fff"), currentPrice, referencePrice, threshold, trailDistance));
+
+                if (currentPrice < threshold)
+                {
+                    Print(string.Format("[MONITOR]   Pullback detected. Letting NT stop {0} handle exit.", currentStopPrice));
+                    previousCheckPrice = currentPrice;
+                    lastMonitorCheckTime = DateTime.Now;
+                }
+                else
+                {
+                    double proposedStop = Instrument.MasterInstrument.RoundToTickSize(currentPrice - trailDistance);
+
+                    if (proposedStop > currentStopPrice)
+                    {
+                        Print(string.Format("[MONITOR]   Trailing stop UP from {0} to {1}", currentStopPrice, proposedStop));
+                        try
+                        {
+                            SetStopLoss(EntrySignalName, CalculationMode.Price, proposedStop, false);
+                            currentStopPrice = proposedStop;
+                        }
+                        catch (Exception ex)
+                        {
+                            Print(string.Format("[MONITOR]   ERROR updating stop: {0}", ex.Message));
+                        }
+                    }
+                    else
+                    {
+                        Print(string.Format("[MONITOR]   Stop stays at {0} (proposed {1} not higher)",
+                            currentStopPrice, proposedStop));
+                    }
+
+                    previousCheckPrice = currentPrice;
+                    lastMonitorCheckTime = DateTime.Now;
+                }
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[MONITOR] UNEXPECTED ERROR: {0}", ex.Message));
+            }
+        }
+
+        private void CheckForOrphanedState()
+        {
+            if (currentState != TradeState.InPosition && currentState != TradeState.WaitingForFill)
+                return;
+
+            try
+            {
+                if (Account == null) return;
+
+                Position acctPos = Account.Positions.FirstOrDefault(p => p.Instrument == Instrument);
+                bool acctIsFlat = (acctPos == null || acctPos.MarketPosition == MarketPosition.Flat);
+                if (!acctIsFlat) return;
+
+                if (currentState == TradeState.InPosition)
+                {
+                    Print("================================================================");
+                    Print(string.Format("[ORPHAN] *** ACCOUNT FLATTENED UNEXPECTEDLY at {0} ***",
+                        DateTime.Now.ToString("HH:mm:ss.fff")));
+
+                    finalExitReason = "ORPHAN_EXTERNAL_CLOSE";
+                    finalExitPrice  = GetCurrentLastPrice();
+                    finalPnLPoints  = (finalExitPrice > 0 && actualFillPrice > 0) ? (finalExitPrice - actualFillPrice) : 0;
+
+                    CleanupRemainingBrackets();
+                    WriteAuditLog(finalExitReason, actualFillPrice, finalExitPrice, finalPnLPoints);
+                    currentState = TradeState.Done;
+                    DisableStrategy();
+                }
+                else if (currentState == TradeState.WaitingForFill)
+                {
+                    bool entryStillWorking = entryOrder != null
+                        && (entryOrder.OrderState == OrderState.Working
+                            || entryOrder.OrderState == OrderState.Accepted
+                            || entryOrder.OrderState == OrderState.Submitted);
+
+                    if (!entryStillWorking)
+                    {
+                        bool foundOrphans = false;
+                        lock (Account.Orders)
+                        {
+                            foreach (var ord in Account.Orders)
+                            {
+                                if (ord.Instrument == Instrument && IsOrderActive(ord))
+                                {
+                                    string name = ord.Name ?? "";
+                                    if (name.Contains("Stop") || name.Contains("Profit")
+                                        || name.Contains("Target") || name == EntrySignalName)
+                                    {
+                                        foundOrphans = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (foundOrphans)
+                        {
+                            Print("================================================================");
+                            Print(string.Format("[ORPHAN] *** Found orphan orders while WaitingForFill at {0} ***",
+                                DateTime.Now.ToString("HH:mm:ss.fff")));
+                            CleanupRemainingBrackets();
+                            WriteAuditLog("ORPHAN_PRE_FILL", 0, 0, 0);
+                            currentState = TradeState.Done;
+                            DisableStrategy();
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[ORPHAN] ERROR in defensive check: {0}", ex.Message));
+            }
+        }
+
+        private void HandleForceCloseRequest()
+        {
+            try
+            {
+                Print(string.Format("[FORCE] Force close requested at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
+
+                if (currentState == TradeState.WaitingForFill && entryOrder != null && IsOrderActive(entryOrder))
+                {
+                    Print("[FORCE]   Cancelling unfilled entry order.");
+                    CancelOrder(entryOrder);
+                    UpdatePanelLog("Force-cancelled entry order.");
+                    return;
+                }
+
+                if (currentState == TradeState.InPosition && Position.MarketPosition == MarketPosition.Long)
+                {
+                    Print("[FORCE]   Submitting market exit for long position.");
+                    ExitLong(Position.Quantity, "ForceClose", EntrySignalName);
+                    UpdatePanelLog("Force-close market exit submitted.");
+                    return;
+                }
+
+                Print(string.Format("[FORCE]   Nothing to close. State={0}, Position={1}",
+                    currentState, Position.MarketPosition));
+                UpdatePanelLog("Force-close: nothing to close.");
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[FORCE] ERROR: {0}", ex.Message));
+            }
+        }
+
+        private void CleanupRemainingBrackets()
+        {
+            try
+            {
+                Print(string.Format("[CLEANUP] Running cleanup at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
+                int cancelled = 0;
+
+                if (stopLossOrder != null && IsOrderActive(stopLossOrder))
+                {
+                    CancelOrder(stopLossOrder);
+                    cancelled++;
+                }
+                if (profitTargetOrder != null && IsOrderActive(profitTargetOrder))
+                {
+                    CancelOrder(profitTargetOrder);
+                    cancelled++;
+                }
+                if (entryOrder != null && IsOrderActive(entryOrder))
+                {
+                    CancelOrder(entryOrder);
+                    cancelled++;
+                }
+
+                if (Account != null)
+                {
+                    List<Order> toCancel = new List<Order>();
+                    lock (Account.Orders)
+                    {
+                        foreach (var ord in Account.Orders)
+                        {
+                            if (ord.Instrument == Instrument && IsOrderActive(ord))
+                            {
+                                string name = ord.Name ?? "";
+                                if (name.Contains("Stop") || name.Contains("Profit") || name.Contains("Target")
+                                    || name == EntrySignalName)
+                                {
+                                    toCancel.Add(ord);
+                                }
+                            }
+                        }
+                    }
+                    foreach (var ord in toCancel)
+                    {
+                        try { CancelOrder(ord); cancelled++; } catch { }
+                    }
+                }
+
+                Print(string.Format("[CLEANUP] Done. Cancelled {0} order(s).", cancelled));
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[CLEANUP] ERROR: {0}", ex.Message));
+            }
+        }
+
+        private bool IsOrderActive(Order o)
+        {
+            if (o == null) return false;
+            return o.OrderState == OrderState.Working
+                || o.OrderState == OrderState.Accepted
+                || o.OrderState == OrderState.Submitted;
+        }
+
+        private void DisableStrategy()
+        {
+            Print(string.Format("[DISABLE] DisableStrategy called at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
+            try
+            {
+                TriggerCustomEvent(o => { SetState(State.Finalized); }, null);
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[DISABLE] ERROR: {0}", ex.Message));
+            }
+        }
+
+        #endregion
+
+        #region Order/execution callbacks
+
+        protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice,
+            int quantity, int filled, double averageFillPrice, OrderState orderState,
+            DateTime time, ErrorCode error, string nativeError)
+        {
+            if (order == null) return;
+
+            string oname = order.Name ?? "";
+            Print(string.Format("[ORDER] OnOrderUpdate: name='{0}', state={1}, filled={2}/{3}",
+                oname, orderState, filled, quantity));
+
+            if (oname.Contains("Stop loss") || oname == "Stop loss")
+                stopLossOrder = order;
+            else if (oname.Contains("Profit target") || oname == "Profit target")
+                profitTargetOrder = order;
+
+            if (entryOrder != null && order.OrderId == entryOrder.OrderId)
+            {
+                if ((orderState == OrderState.Cancelled || orderState == OrderState.Rejected)
+                    && currentState == TradeState.WaitingForFill)
+                {
+                    Print(string.Format("[ORDER]   Entry order ended without fill: {0}", orderState));
+                    WriteAuditLog("ENTRY_NOT_FILLED_" + orderState.ToString(), 0, 0, 0);
+                    CleanupRemainingBrackets();
+                    currentState = TradeState.Done;
+                    DisableStrategy();
+                }
+            }
+        }
+
+        protected override void OnExecutionUpdate(Execution execution, string executionId,
+            double price, int quantity, MarketPosition marketPosition, string orderId, DateTime time)
+        {
+            try
+            {
+                if (execution == null) return;
+
+                Order execOrder = execution.Order;
+                string execOrderName = execOrder != null ? (execOrder.Name ?? "") : "";
+                string execOrderId   = execOrder != null ? execOrder.OrderId : "";
+                OrderState execState = execOrder != null ? execOrder.OrderState : OrderState.Unknown;
+
+                Print(string.Format("[EXEC] order='{0}', state={1}, price={2}, qty={3}",
+                    execOrderName, execState, price, quantity));
+
+                bool isEntryFill = false;
+                if (execOrder != null && entryOrder != null && execOrderId == entryOrder.OrderId
+                    && execState == OrderState.Filled)
+                {
+                    isEntryFill = true;
+                }
+                else if (execOrderName == EntrySignalName && execState == OrderState.Filled)
+                {
+                    isEntryFill = true;
+                }
+
+                if (isEntryFill && currentState == TradeState.WaitingForFill)
+                {
+                    actualFillPrice    = price;
+                    fillTime           = DateTime.Now;
+                    previousCheckPrice = 0;
+                    lastMonitorCheckTime = DateTime.Now;
+
+                    Print(string.Format("[EXEC]   *** ENTRY FILLED at {0} (limit was {1}) ***",
+                        actualFillPrice, calculatedLimitPrice));
+                    UpdatePanelLog(string.Format("FILLED at {0}", actualFillPrice));
+
+                    if (EnableSoundOnFill)
+                    {
+                        try { PlaySound(NinjaTrader.Core.Globals.InstallDir + @"\sounds\Alert1.wav"); } catch { }
+                    }
+
+                    currentState = TradeState.InPosition;
+                }
+
+                if (Position.MarketPosition == MarketPosition.Flat
+                    && currentState == TradeState.InPosition)
+                {
+                    finalExitPrice = price;
+                    finalPnLPoints = price - actualFillPrice;
+
+                    finalExitReason = "UNKNOWN";
+                    if (!string.IsNullOrEmpty(execOrderName))
+                    {
+                        if (execOrderName.Contains("Profit") || execOrderName.Contains("Target"))
+                            finalExitReason = "PROFIT_TARGET";
+                        else if (execOrderName.Contains("Stop"))
+                            finalExitReason = "STOP_HIT";
+                        else if (execOrderName.Contains("Close") || execOrderName.Contains("Exit")
+                                 || execOrderName.Contains("ForceClose"))
+                            finalExitReason = "MANUAL_OR_OTHER";
+                        else
+                            finalExitReason = execOrderName;
+                    }
+
+                    Print(string.Format("[EXEC]   *** POSITION CLOSED at {0} ({1}). PnL = {2:F2} pts ***",
+                        finalExitPrice, finalExitReason, finalPnLPoints));
+                    UpdatePanelLog(string.Format("EXIT {0} at {1} | PnL {2:F2}pts",
+                        finalExitReason, finalExitPrice, finalPnLPoints));
+
+                    CleanupRemainingBrackets();
+                    closingDelayStartTime = DateTime.Now;
+                    currentState = TradeState.ClosingDelay;
+                }
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[EXEC] UNEXPECTED ERROR: {0}", ex.Message));
+            }
+        }
+
+        #endregion
+
+        #region Audit log + reset
+
+        private void ResetTradeState()
+        {
+            currentState           = TradeState.Idle;
+            entryOrder             = null;
+            stopLossOrder          = null;
+            profitTargetOrder      = null;
+            entryLastTradedPrice   = 0;
+            calculatedLimitPrice   = 0;
+            actualFillPrice        = 0;
+            avgBarSizeAtEntry      = 0;
+            previousCheckPrice     = 0;
+            currentStopPrice       = 0;
+            currentTargetPrice     = 0;
+            finalExitPrice         = 0;
+            finalPnLPoints         = 0;
+            finalExitReason        = "UNKNOWN";
+            initialStopDistance    = 0;
+            fireRequested          = false;
+            forceCloseRequested    = false;
+        }
+
+        private void WriteAuditLog(string outcome, double fillPrice, double exitPrice, double pnlPoints)
+        {
+            try
+            {
+                if (!Directory.Exists(AuditLogPath))
+                    Directory.CreateDirectory(AuditLogPath);
+
+                string logFile = Path.Combine(AuditLogPath, "LongScalper_Pro.csv");
+                bool fileExists = File.Exists(logFile);
+
+                using (StreamWriter sw = new StreamWriter(logFile, true))
+                {
+                    if (!fileExists)
+                    {
+                        sw.WriteLine("Timestamp,Instrument,Outcome,FireTime,FillTime,ExitTime,"
+                            + "LastPriceAtFire,AvgBarSize,EntryOffsetMultiplier,LimitMode,LimitPrice,FillPrice,"
+                            + "ExitPrice,PnLPoints,OrderLifeSeconds,MonitorIntervalSeconds,"
+                            + "ProfitTargetPoints,HardStopPoints,PullbackTolerancePoints,TrailDistancePoints,"
+                            + "StopMode,StopOffsetMultiplier,TrailOffsetMultiplier,InitialStopDistance");
+                    }
+
+                    sw.WriteLine(string.Format(
+                        "{0},{1},{2},{3},{4},{5},{6},{7:F2},{8:F2},{9},{10},{11},{12},{13:F2},{14},{15},{16},{17},{18},{19},{20},{21:F2},{22:F2},{23:F2}",
+                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                        Instrument.FullName,
+                        outcome,
+                        entryOrderPlacedTime.ToString("HH:mm:ss"),
+                        (fillTime != default(DateTime)) ? fillTime.ToString("HH:mm:ss") : "",
+                        DateTime.Now.ToString("HH:mm:ss"),
+                        entryLastTradedPrice,
+                        avgBarSizeAtEntry,
+                        EntryOffsetMultiplier,
+                        LimitMode,
+                        calculatedLimitPrice,
+                        fillPrice,
+                        exitPrice,
+                        pnlPoints,
+                        OrderLifeSeconds,
+                        MonitorIntervalSeconds,
+                        ProfitTargetPoints,
+                        HardStopPoints,
+                        PullbackTolerancePoints,
+                        TrailDistancePoints,
+                        StopMode,
+                        StopOffsetMultiplier,
+                        TrailOffsetMultiplier,
+                        initialStopDistance));
+                }
+                Print(string.Format("[AUDIT] Wrote outcome '{0}' to log", outcome));
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[AUDIT] ERROR: {0}", ex.Message));
+            }
+        }
+
+        #endregion
+
+        #region Control panel - WPF window with proper threading
+
+        /// <summary>
+        /// Open the panel on the WPF UI thread. Safe to call from strategy thread.
+        /// </summary>
+        private void OpenControlPanel()
+        {
+            try
+            {
+                Application app = Application.Current;
+                if (app == null)
+                {
+                    Print("[PANEL] WARN: Application.Current is null. Cannot create panel.");
+                    return;
+                }
+
+                app.Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    try
+                    {
+                        if (panel != null) return; // already open
+                        panel = new ControlPanel(this);
+                        panel.Show();
+                        Print("[PANEL] Control panel opened.");
+                    }
+                    catch (Exception ex)
+                    {
+                        Print(string.Format("[PANEL] Open error: {0}", ex.Message));
+                    }
+                }));
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[PANEL] Dispatcher error: {0}", ex.Message));
+            }
+        }
+
+        /// <summary>
+        /// Close panel during strategy termination. Uses synchronous Invoke
+        /// to ensure cleanup completes before strategy is finalized.
+        /// </summary>
+        private void CloseControlPanel()
+        {
+            try
+            {
+                Application app = Application.Current;
+                if (app == null) return;
+
+                app.Dispatcher.Invoke(new Action(() =>
+                {
+                    try
+                    {
+                        if (panel != null)
+                        {
+                            panel.MarkClosingFromStrategy();
+                            panel.Close();
+                            panel = null;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Print(string.Format("[PANEL] Close error: {0}", ex.Message));
+                    }
+                }));
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[PANEL] Close dispatcher error: {0}", ex.Message));
+            }
+        }
+
+        /// <summary>
+        /// Refresh the live status block. Called every tick from OnBarUpdate.
+        /// All UI work marshalled via Dispatcher.BeginInvoke.
+        /// </summary>
+        private void RefreshPanelStatus()
+        {
+            if (panel == null) return;
+
+            try
+            {
+                double curPrice = GetCurrentLastPrice();
+                double unrealized = (currentState == TradeState.InPosition && actualFillPrice > 0 && curPrice > 0)
+                    ? curPrice - actualFillPrice
+                    : 0;
+
+                string state = currentState.ToString();
+                string posDesc = string.Format("{0} qty={1}", Position.MarketPosition, Position.Quantity);
+                string fillStr = (actualFillPrice > 0) ? actualFillPrice.ToString("F2") : "--";
+                string stopStr = (currentStopPrice > 0) ? currentStopPrice.ToString("F2") : "--";
+                string tgtStr  = (currentTargetPrice > 0) ? currentTargetPrice.ToString("F2") : "--";
+                string unrlStr = (currentState == TradeState.InPosition) ? string.Format("{0:F2} pts", unrealized) : "--";
+                bool canFire   = (currentState == TradeState.Idle);
+                bool canClose  = (currentState == TradeState.WaitingForFill || currentState == TradeState.InPosition);
+
+                panel.PostUpdate(state, posDesc, fillStr, stopStr, tgtStr, unrlStr, canFire, canClose);
+            }
+            catch
+            {
+                // panel may have been closed mid-update; swallow
+            }
+        }
+
+        private void UpdatePanelLog(string line)
+        {
+            if (panel == null) return;
+            try { panel.PostLogLine(line); } catch { }
+        }
+
+        /// <summary>
+        /// Called by the panel when the user X's the window. Strategy keeps running
+        /// but the panel reference is nulled so we don't try to update a dead window.
+        /// </summary>
+        internal void OnPanelClosedByUser()
+        {
+            panel = null;
+            Print("[PANEL] User closed panel. Strategy continues without UI.");
+        }
+
+        #endregion
+
+        #region ControlPanel nested class
+
+        /// <summary>
+        /// WPF window owned by the strategy. All UI work happens here.
+        /// Public methods (PostUpdate, PostLogLine) are called from the strategy thread
+        /// and internally marshal to the dispatcher.
+        /// </summary>
+        private class ControlPanel : Window
+        {
+            private readonly LongScalper_FixedLimitEntry_Pro owner;
+
+            private TextBlock txtState;
+            private TextBlock txtPosition;
+            private TextBlock txtFill;
+            private TextBlock txtStop;
+            private TextBlock txtTarget;
+            private TextBlock txtUnrealized;
+            private Button    btnFire;
+            private Button    btnForceClose;
+            private ListBox   lstLog;
+            private ObservableCollection<string> logItems;
+
+            private bool closingFromStrategy = false;
+
+            public ControlPanel(LongScalper_FixedLimitEntry_Pro owner)
+            {
+                this.owner = owner;
+
+                Title  = "LongScalper Pro";
+                Width  = 380;
+                Height = 540;
+                Background = new SolidColorBrush(Color.FromRgb(20, 20, 20));
+                Foreground = Brushes.White;
+                ShowInTaskbar = true;
+                WindowStartupLocation = WindowStartupLocation.Manual;
+                Left = 80;
+                Top  = 80;
+
+                BuildUi();
+
+                Closing += OnClosingHandler;
+            }
+
+            private void BuildUi()
+            {
+                var root = new StackPanel { Margin = new Thickness(12) };
+
+                root.Children.Add(new TextBlock
+                {
+                    Text = "LongScalper Pro",
+                    FontSize = 18,
+                    FontWeight = FontWeights.Bold,
+                    Foreground = Brushes.LimeGreen,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    Margin = new Thickness(0, 0, 0, 10)
+                });
+
+                // Status grid
+                var grid = new Grid { Margin = new Thickness(0, 4, 0, 8) };
+                grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(110) });
+                grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                for (int i = 0; i < 6; i++)
+                    grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+                AddRow(grid, 0, "State:",      out txtState);
+                AddRow(grid, 1, "Position:",   out txtPosition);
+                AddRow(grid, 2, "Fill:",       out txtFill);
+                AddRow(grid, 3, "Stop:",       out txtStop);
+                AddRow(grid, 4, "Target:",     out txtTarget);
+                AddRow(grid, 5, "Unrealized:", out txtUnrealized);
+
+                root.Children.Add(grid);
+
+                // Big FIRE button
+                btnFire = new Button
+                {
+                    Content    = "🔥  FIRE LONG  🔥",
+                    Height     = 60,
+                    FontSize   = 18,
+                    FontWeight = FontWeights.Bold,
+                    Background = new SolidColorBrush(Color.FromRgb(0, 110, 30)),
+                    Foreground = Brushes.White,
+                    Margin     = new Thickness(0, 8, 0, 6)
+                };
+                btnFire.Click += (s, e) =>
+                {
+                    owner.fireRequested = true;
+                    AddLogLine("FIRE clicked");
+                };
+                root.Children.Add(btnFire);
+
+                // Force close button
+                btnForceClose = new Button
+                {
+                    Content    = "Force Close Position",
+                    Height     = 36,
+                    FontSize   = 13,
+                    FontWeight = FontWeights.Bold,
+                    Background = new SolidColorBrush(Color.FromRgb(170, 80, 0)),
+                    Foreground = Brushes.White,
+                    Margin     = new Thickness(0, 0, 0, 8),
+                    IsEnabled  = false
+                };
+                btnForceClose.Click += (s, e) =>
+                {
+                    owner.forceCloseRequested = true;
+                    AddLogLine("Force-close clicked");
+                };
+                root.Children.Add(btnForceClose);
+
+                // Log
+                root.Children.Add(new TextBlock
+                {
+                    Text = "Log",
+                    FontSize = 12,
+                    Foreground = Brushes.LightGray,
+                    Margin = new Thickness(0, 4, 0, 2)
+                });
+
+                logItems = new ObservableCollection<string>();
+                lstLog = new ListBox
+                {
+                    Height = 180,
+                    Background = new SolidColorBrush(Color.FromRgb(10, 10, 10)),
+                    Foreground = Brushes.LightGray,
+                    FontFamily = new FontFamily("Consolas"),
+                    FontSize = 11,
+                    BorderBrush = Brushes.DimGray,
+                    ItemsSource = logItems
+                };
+                root.Children.Add(lstLog);
+
+                Content = root;
+            }
+
+            private static void AddRow(Grid g, int row, string label, out TextBlock value)
+            {
+                var lbl = new TextBlock
+                {
+                    Text = label,
+                    Foreground = Brushes.LightGray,
+                    FontSize = 13,
+                    Margin = new Thickness(0, 2, 0, 2)
+                };
+                Grid.SetRow(lbl, row);
+                Grid.SetColumn(lbl, 0);
+                g.Children.Add(lbl);
+
+                value = new TextBlock
+                {
+                    Text = "--",
+                    Foreground = Brushes.White,
+                    FontSize = 13,
+                    FontWeight = FontWeights.Bold,
+                    Margin = new Thickness(0, 2, 0, 2)
+                };
+                Grid.SetRow(value, row);
+                Grid.SetColumn(value, 1);
+                g.Children.Add(value);
+            }
+
+            // ---- Public API used by the strategy ----
+
+            public void PostUpdate(string state, string position, string fill, string stop,
+                                   string target, string unrealized, bool canFire, bool canClose)
+            {
+                if (!Dispatcher.CheckAccess())
+                {
+                    Dispatcher.BeginInvoke(new Action(() =>
+                        PostUpdate(state, position, fill, stop, target, unrealized, canFire, canClose)));
+                    return;
+                }
+                try
+                {
+                    txtState.Text      = state;
+                    txtPosition.Text   = position;
+                    txtFill.Text       = fill;
+                    txtStop.Text       = stop;
+                    txtTarget.Text     = target;
+                    txtUnrealized.Text = unrealized;
+                    btnFire.IsEnabled       = canFire;
+                    btnForceClose.IsEnabled = canClose;
+
+                    txtState.Foreground = (state == "InPosition") ? Brushes.LimeGreen
+                                        : (state == "WaitingForFill") ? Brushes.Yellow
+                                        : (state == "Done") ? Brushes.Gray
+                                        : Brushes.White;
+                }
+                catch { }
+            }
+
+            public void PostLogLine(string line)
+            {
+                if (!Dispatcher.CheckAccess())
+                {
+                    Dispatcher.BeginInvoke(new Action(() => PostLogLine(line)));
+                    return;
+                }
+                AddLogLine(line);
+            }
+
+            private void AddLogLine(string line)
+            {
+                try
+                {
+                    string stamped = string.Format("{0}  {1}", DateTime.Now.ToString("HH:mm:ss"), line);
+                    logItems.Add(stamped);
+                    while (logItems.Count > 200) logItems.RemoveAt(0);
+                    lstLog.ScrollIntoView(stamped);
+                }
+                catch { }
+            }
+
+            public void MarkClosingFromStrategy()
+            {
+                closingFromStrategy = true;
+            }
+
+            private void OnClosingHandler(object sender, CancelEventArgs e)
+            {
+                Closing -= OnClosingHandler;
+                if (!closingFromStrategy)
+                {
+                    // user clicked X
+                    try { owner.OnPanelClosedByUser(); } catch { }
+                }
+            }
+        }
+
+        #endregion
+
+        #region Properties
+
+        [NinjaScriptProperty]
+        [Range(1, int.MaxValue)]
+        [Display(Name="Quantity", Description="Number of contracts per trade.", Order=1, GroupName="1. Trade Size")]
+        public int Quantity { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="LimitMode",
+            Description="OffsetFromLastPrice = lastPrice - (EntryOffsetMultiplier * avgBarSize). FixedPrice = use FixedLimitPrice value.",
+            Order=2, GroupName="2. Entry")]
+        public ProEntryLimitMode LimitMode { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.0, double.MaxValue)]
+        [Display(Name="FixedLimitPrice",
+            Description="Exact limit price when LimitMode=FixedPrice. Ignored otherwise.",
+            Order=3, GroupName="2. Entry")]
+        public double FixedLimitPrice { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.01, 10.0)]
+        [Display(Name="EntryOffsetMultiplier",
+            Description="Limit = lastPrice - (this x avgBarSize). Default 0.10.",
+            Order=4, GroupName="2. Entry")]
+        public double EntryOffsetMultiplier { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(2, 100)]
+        [Display(Name="BarSizeAveragePeriod",
+            Description="Recent 1-min bars used in EMA volatility calc. Default 10.",
+            Order=5, GroupName="2. Entry")]
+        public int BarSizeAveragePeriod { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 86400)]
+        [Display(Name="OrderLifeSeconds",
+            Description="Cancel buy limit if not filled within this many seconds. Default 5.",
+            Order=6, GroupName="2. Entry")]
+        public int OrderLifeSeconds { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 1000)]
+        [Display(Name="ProfitTargetPoints",
+            Description="Target = expectedFill + this many points. Default 10.",
+            Order=7, GroupName="3. Profit Target")]
+        public int ProfitTargetPoints { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="StopMode",
+            Description="OffsetFromFilledPrice = avgBarSize x multiplier. FixedPoints = use HardStopPoints/TrailDistancePoints.",
+            Order=8, GroupName="4. Stop Loss")]
+        public ProStopLossMode StopMode { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.1, 20.0)]
+        [Display(Name="StopOffsetMultiplier",
+            Description="Initial stop = fillPrice - (avgBarSize x this). Default 2.0.",
+            Order=9, GroupName="4. Stop Loss")]
+        public double StopOffsetMultiplier { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.1, 20.0)]
+        [Display(Name="TrailOffsetMultiplier",
+            Description="Trailing distance = avgBarSize x this. Default 0.8.",
+            Order=10, GroupName="4. Stop Loss")]
+        public double TrailOffsetMultiplier { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 200)]
+        [Display(Name="HardStopPoints",
+            Description="Initial stop in FixedPoints mode. Default 20.",
+            Order=11, GroupName="4. Stop Loss")]
+        public int HardStopPoints { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 200)]
+        [Display(Name="TrailDistancePoints",
+            Description="Trail distance in FixedPoints mode. Default 8.",
+            Order=12, GroupName="4. Stop Loss")]
+        public int TrailDistancePoints { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 3600)]
+        [Display(Name="MonitorIntervalSeconds",
+            Description="How often the trailing check runs. Default 3.",
+            Order=13, GroupName="5. Trailing")]
+        public int MonitorIntervalSeconds { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 50)]
+        [Display(Name="PullbackTolerancePoints",
+            Description="Tolerated pullback before considering a real reversal. Default 2.",
+            Order=14, GroupName="5. Trailing")]
+        public int PullbackTolerancePoints { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.0, 10.0)]
+        [Display(Name="DisableDelaySeconds",
+            Description="Delay between position close and strategy disable. Default 1.5.",
+            Order=15, GroupName="6. Cleanup")]
+        public double DisableDelaySeconds { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="EnableSoundOnFill",
+            Description="Play sound when entry fills.",
+            Order=16, GroupName="7. Notifications")]
+        public bool EnableSoundOnFill { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="AuditLogPath",
+            Description="Folder for audit log CSV. Auto-created if missing.",
+            Order=17, GroupName="8. Logging")]
+        public string AuditLogPath { get; set; }
+
+        #endregion
+    }
+}
