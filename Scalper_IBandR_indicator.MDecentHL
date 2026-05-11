@@ -1,0 +1,353 @@
+# Scalper_IBandRecentHL — User Guide
+
+**Indicator:** `Scalper_IBandRecentHL`
+**Type:** NinjaTrader 8 Indicator (overlay on price panel)
+**Purpose:** Display Initial Balance (IB) and rolling Recent High/Low/Mid levels
+
+---
+
+## Table of Contents
+
+1. [What This Indicator Shows](#1-what-this-indicator-shows)
+2. [Key Concepts](#2-key-concepts)
+3. [Installation](#3-installation)
+4. [Adding to a Chart](#4-adding-to-a-chart)
+5. [Parameter Reference](#5-parameter-reference)
+6. [What You'll See During the Day](#6-what-youll-see-during-the-day)
+7. [Color Reference](#7-color-reference)
+8. [Common Questions](#8-common-questions)
+9. [Troubleshooting](#9-troubleshooting)
+
+---
+
+## 1. What This Indicator Shows
+
+The indicator draws **six horizontal reference lines** on your price chart:
+
+**Initial Balance (IB) — green lines**
+
+- **IB High** — the highest price during the first 60 minutes after the NY cash market open (9:30–10:30 ET)
+- **IB Low** — the lowest price during that same window
+- **IB Mid** — the midpoint between IB High and IB Low
+
+These lines **lock at 10:30 ET** and remain flat (unchanged) for the rest of the day, all the way through the overnight session, until the next morning's 9:30 ET when they reset and begin recomputing.
+
+**Recent High/Low — blue lines**
+
+- **Recent High** — highest price in the last 60 minutes (configurable)
+- **Recent Low** — lowest price in the last 60 minutes
+- **Recent Mid** — midpoint between Recent High and Recent Low
+
+These lines **update continuously** as the 60-minute rolling window slides forward. They are meaningful 24 hours a day.
+
+---
+
+## 2. Key Concepts
+
+### What is Initial Balance?
+
+Initial Balance (IB) is a Market Profile concept dating back to the 1980s. It represents **the price range established by traders during the first hour of regular trading hours (RTH)**. For NQ and other US index futures, RTH opens at **9:30 AM ET** and the IB completes at **10:30 AM ET**.
+
+The IB is significant because:
+
+- It reflects where institutional traders initially balanced the market
+- Price action throughout the day is often analyzed relative to IB (above, below, or inside)
+- The IB high or low is broken in a high percentage of sessions, signaling directional days
+
+### Why "first hour of NY morning" specifically?
+
+Even though NQ trades nearly 24 hours, "IB" by industry convention always refers to the first hour after the **NY cash market opens** — 9:30 AM Eastern Time. The overnight session does NOT have its own IB. This indicator enforces that convention.
+
+### What is Recent HL?
+
+A rolling-window high/low calculation that always reflects the last N minutes of price action (default 60). Unlike IB, Recent HL is **continuous** — it's meaningful any time of day, including overnight. Use it to gauge short-term price extremes regardless of session.
+
+---
+
+## 3. Installation
+
+### Step 1 — Open the NinjaScript Editor
+
+1. In NinjaTrader, click **New → NinjaScript Editor** (or press `F11`).
+
+### Step 2 — Add the indicator file
+
+1. Copy `Scalper_IBandRecentHL.cs` into:
+   ```
+   Documents\NinjaTrader 8\bin\Custom\Indicators\
+   ```
+2. Or in the NinjaScript Editor: right-click the **Indicators** folder → **Import** → select the file.
+
+### Step 3 — Compile
+
+1. Press **F5** in the NinjaScript Editor.
+2. Watch the output panel for `Compile succeeded`.
+3. If errors appear, address them and recompile.
+
+> **Important:** Only ONE copy of the indicator file should exist in the Indicators folder. If you have an older version, **delete it first** to avoid duplicate-class compile errors.
+
+---
+
+## 4. Adding to a Chart
+
+### Step 1 — Open a chart
+
+1. **New → Chart**
+2. Set instrument: **NQ** (or **MNQ** for micros, or any other futures contract you want)
+3. Set timeframe: any timeframe works. **1-minute** is recommended for accurate IB tracking (the indicator uses the bar period for time checks, so smaller bars give more precise IB start/end detection).
+
+### Step 2 — Add the indicator
+
+1. Right-click on the chart → **Indicators...**
+2. Find **Scalper_IBandRecentHL** in the list and double-click it (or click → **Add**).
+3. The parameter panel appears on the right.
+
+### Step 3 — Configure parameters
+
+See [Parameter Reference](#5-parameter-reference) below for details. The defaults are sensible — most users only need to change `Recent Minutes` if they want a longer or shorter rolling window.
+
+### Step 4 — Click OK
+
+The indicator immediately starts drawing on the chart.
+
+---
+
+## 5. Parameter Reference
+
+### Initial Balance
+
+| Parameter | Default | Description |
+|---|---|---|
+| **IB Minutes** | 60 | Length of the IB window in minutes after 9:30 ET. Default 60 means IB = 9:30–10:30 ET. Change to e.g. 30 for a shorter "half-IB" window, or 90 for a longer one. |
+
+> **Note:** The IB *start time* (9:30 AM ET) is hardcoded — it's the universal Market Profile convention. Only the *length* of the window is configurable.
+
+### Recent HL
+
+| Parameter | Default | Description |
+|---|---|---|
+| **Recent Minutes** | 60 | Rolling lookback window for Recent High/Low/Mid in minutes. Try 30 for a tighter scalp view or 120 for broader context. |
+
+### Visibility
+
+Each of these toggles whether the corresponding line is drawn. Default is all ON.
+
+| Parameter | Default | Line Drawn |
+|---|---|---|
+| **Show IB High** | true | The green high line |
+| **Show IB Low** | true | The green low line |
+| **Show IB Mid** | true | The green midpoint line (thinner) |
+| **Show Recent High** | true | The blue high line |
+| **Show Recent Low** | true | The blue low line |
+| **Show Recent Mid** | true | The blue midpoint line (thinner) |
+
+---
+
+## 6. What You'll See During the Day
+
+Here's a typical day's behavior on a chart:
+
+### Overnight (e.g., 2:00 AM ET)
+
+- **IB lines:** flat horizontal lines at yesterday's morning IB values (locked from yesterday 10:30 ET)
+- **Recent HL:** moving as the rolling window slides
+
+### Before market open (e.g., 8:00 AM ET)
+
+- **IB lines:** still showing yesterday's values (have not reset yet)
+- **Recent HL:** moving
+
+### Market opens (9:30 AM ET)
+
+- **IB lines:** the indicator **resets** and starts a fresh IB. You'll see a Print line in the Output Window:
+  ```
+  [IB] New IB window started on 2026-05-12 (NY 9:30)
+  ```
+- The IB High and IB Low values start updating with each tick — they widen as the morning prints new highs and lows.
+- **Recent HL:** moving as usual
+
+### During the IB window (9:30–10:30 ET)
+
+- **IB lines:** widening to encompass the morning's full range
+- **Recent HL:** moving
+
+### IB completes (10:30 AM ET)
+
+- **IB lines:** **lock**. They become straight horizontal lines and will not change again until tomorrow 9:30 ET. The Output Window logs:
+  ```
+  [IB] Locked at NY 10:30 on 2026-05-12: H=21100.00 L=20980.00
+  ```
+
+### Rest of the day + overnight
+
+- **IB lines:** completely flat at the locked values, all the way through overnight, until tomorrow 9:30 ET
+- **Recent HL:** continues moving with the rolling window
+
+---
+
+## 7. Color Reference
+
+| Line | Color | Width | Meaning |
+|---|---|---|---|
+| IB High | Lime Green | Thick (3) | Highest price 9:30–10:30 ET |
+| IB Low | Lime Green | Thick (3) | Lowest price 9:30–10:30 ET |
+| IB Mid | Lime Green | Thin (1) | Midpoint |
+| Recent High | Dodger Blue | Thick (3) | Highest in last N minutes |
+| Recent Low | Dodger Blue | Thick (3) | Lowest in last N minutes |
+| Recent Mid | Dodger Blue | Thin (1) | Midpoint |
+
+Colors are hardcoded in the source. To change them, edit the `AddPlot(new Stroke(...))` lines in `OnStateChange`.
+
+---
+
+## 8. Common Questions
+
+### Q: I don't see an IB line on my chart. Why?
+
+Most likely one of these:
+
+1. **It's before 9:30 ET on the first day you loaded the chart, and there's no prior session in the chart history.** Wait until 10:30 ET — once the IB locks for the first time, lines appear.
+2. **The IB value is outside the visible price range** (e.g., big overnight move pushed price far from yesterday's IB). NinjaTrader auto-scales to fit; if IB is way above or below the visible candles, the line is off-screen. **Zoom out** to find it, or read the value from the Data Box at the top of the chart.
+3. **`Show IB High` (etc.) is set to false** in the parameters.
+4. **Compilation issue** — open the NinjaScript Editor and check for any errors.
+
+### Q: At 2 AM, the IB line shows YESTERDAY's morning values. Is that right?
+
+Yes — that's intentional. IB is defined as the first hour of US morning RTH. Between 10:30 ET and the next morning's 10:30 ET, the IB stays locked at today's value. So overnight, you're seeing today's morning IB. Tomorrow morning at 9:30 ET it resets.
+
+### Q: The Recent HL lines barely move during quiet periods. Is the indicator broken?
+
+No. If price has been trading in a narrow range for the last 60 minutes (e.g., a low-volume midday lull), the Recent High and Recent Low simply don't change. They only move when a new high/low forms within the window, OR when an old extreme falls off the back of the window.
+
+### Q: Can I add this to multiple charts?
+
+Yes. The indicator is stateless across charts — each chart maintains its own IB calculation independently. Add it to as many charts as you want.
+
+### Q: Does this work for instruments other than NQ?
+
+It works for **any instrument**, but the IB concept (9:30–10:30 ET) is specifically tied to US equity market hours. For:
+
+- **US index futures** (ES, NQ, YM, RTY) — works as designed
+- **US individual stocks** — works as designed (9:30 ET is also the stock market open)
+- **Crude oil, gold, currencies** — the 9:30 ET IB is less meaningful since these have different liquidity profiles, but the indicator will still compute it
+- **European futures (DAX, etc.)** — IB convention is different (8:00 CET); this indicator would not reflect that
+
+### Q: What time zone do my chart bars need to be in?
+
+It doesn't matter — the indicator converts each bar's time to New York time internally using `TimeZoneInfo`. So whether your NinjaTrader is configured to display Eastern Time, Central Time, Pacific Time, or any other zone, the IB anchor stays correct at 9:30 ET. DST transitions (EST ↔ EDT) are also handled automatically.
+
+### Q: Can I read the IB values programmatically from a strategy?
+
+Yes. From your strategy:
+
+```csharp
+private Scalper_IBandRecentHL ib;
+
+protected override void OnStateChange()
+{
+    if (State == State.DataLoaded)
+    {
+        ib = Scalper_IBandRecentHL(60, 60, true, true, true, true, true, true);
+        AddChartIndicator(ib);
+    }
+}
+
+protected override void OnBarUpdate()
+{
+    double ibHighNow = ib.IBHigh[0];
+    double ibLowNow  = ib.IBLow[0];
+    double recHighNow = ib.RecentHigh[0];
+    // ... use them in your logic
+}
+```
+
+`AddChartIndicator(ib)` makes the lines visible on the chart that the strategy is running on.
+
+---
+
+## 9. Troubleshooting
+
+### Compile error: "already contains a definition for Scalper_IBandRecentHL"
+
+You have two copies of the file in the Indicators folder. Find and delete the duplicate. Close NinjaTrader first, then check:
+
+```
+Documents\NinjaTrader 8\bin\Custom\Indicators\
+```
+
+Look for any file containing `class Scalper_IBandRecentHL` and delete all but one. Reopen NinjaTrader and recompile (F5).
+
+### IB lines keep updating throughout the day instead of locking
+
+Make sure you're using the corrected version of the indicator. The older buggy version (which used `Bars.IsFirstBarOfSession`) would reset IB on the chart's session boundary — for ETH charts that's 6:00 PM ET, not 9:30 AM. The corrected version uses explicit NY-time gating.
+
+To verify which version you have, look at `OnBarUpdate` in the source. The corrected version contains:
+- A call to `TimeZoneInfo.ConvertTime`
+- A `barTimeNy` variable
+- Constants `IB_START` and `IB_END` based on `minuteOfDay`
+
+If you see those, you're on the corrected version. If you only see `Bars.IsFirstBarOfSession`, you're on the old version and need to update.
+
+### IB lines don't appear until tomorrow on a freshly loaded chart
+
+If you load a chart at 2 PM ET, the indicator may not have seen today's 9:30–10:30 window play out in real-time. In some implementations this means the IB is missing for today until tomorrow's reset.
+
+If the corrected version includes the **historical reconstruction** logic, this is automatically handled — it scans back through bars to rebuild today's IB from history. Look for `[IB] Reconstructed today's IB from history` in the Output Window.
+
+### Time looks off on the chart (one hour shift)
+
+This usually means you're seeing the chart in exchange time (CME = Chicago/Central) while expecting NY time (Eastern). The indicator handles the conversion internally — the *plot* lines will be correctly anchored regardless of how the time axis is displayed. If you want the chart's time axis to show NY time:
+
+- **Tools → Options → General → Time Zone:** set to **(GMT-05:00) Eastern Time**
+
+This is purely cosmetic — it doesn't affect the IB calculation.
+
+### How do I know exactly when IB locked?
+
+Watch the Output Window (**New → NinjaScript Output**). At 10:30 ET each day you'll see:
+
+```
+[IB] Locked at NY 10:30 on 2026-05-12: H=21100.00 L=20980.00
+```
+
+And at 9:30 ET the next morning:
+
+```
+[IB] New IB window started on 2026-05-13 (NY 9:30)
+```
+
+If you don't see these messages around the expected times, something is wrong — possibly a data gap, possibly a stale version of the indicator.
+
+---
+
+## Quick Reference Card
+
+```
+INSTALL:    Copy Scalper_IBandRecentHL.cs to
+            Documents\NinjaTrader 8\bin\Custom\Indicators\
+            Press F5 in NinjaScript Editor to compile.
+
+ADD:        Right-click chart → Indicators → Scalper_IBandRecentHL → Add.
+
+DEFAULTS:   IB Minutes = 60 (IB window length)
+            Recent Minutes = 60 (rolling window)
+            All Show* = true.
+
+IB ANCHOR:  Always 9:30–10:30 NY Eastern Time, DST-safe.
+            Locks at 10:30 ET. Persists until next 9:30 ET.
+
+RECENT HL:  Always updating. Rolling N-minute window.
+
+COLORS:     IB = green. Recent HL = blue.
+            High/Low = thick line. Mid = thin line.
+
+OUTPUT:     Watch NinjaScript Output for [IB] log messages
+            confirming each reset and lock.
+
+CSV:        This indicator does NOT write its own CSV.
+            (The alerter strategy that uses these levels does.)
+```
+
+---
+
+*End of guide.*
