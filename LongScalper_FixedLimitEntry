@@ -200,7 +200,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (State == State.SetDefaults)
             {
                 Description                                 = "Long-only scalper with trailing stop, fixed-limit-price option, and bar-size-based adaptive stops (v2.6).";
-                Name                                        = "LongScalper";
+                Name                                        = "LongScalper_FixedLimit";
                 Calculate                                   = Calculate.OnEachTick;
                 EntriesPerDirection                         = 1;
                 EntryHandling                               = EntryHandling.AllEntries;
