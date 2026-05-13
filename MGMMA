@@ -1,0 +1,328 @@
+//=============================================================================
+// Michelle_GMMA — Guppy Multiple Moving Average (GMMA)
+//=============================================================================
+// 
+// 12 EMAs plotted on the price panel, divided into two color groups:
+//   • P1–P6  (short-term / "traders" group)   — ORANGE  (#FF8D1E)
+//   • P7–P12 (long-term  / "investors" group) — CYAN    (#13FFFF)
+//
+// Default periods (standard Guppy GMMA values):
+//   P1=3,  P2=5,  P3=8,  P4=10, P5=12, P6=15
+//   P7=30, P8=35, P9=40, P10=45, P11=50, P12=60
+//
+// Default visibility: ALL ENABLED EXCEPT P7 and P9 (matches Michelle's chart style).
+// Users can toggle any EMA on/off and change any period in the indicator settings.
+//
+//-----------------------------------------------------------------------------
+// HOW TO CHANGE HARDCODED VALUES
+//-----------------------------------------------------------------------------
+//
+// 1) LINE THICKNESS (currently 1 = thin)
+//    In State.SetDefaults, find the 12 "AddPlot(new Stroke(...))" lines.
+//    Change the "1" in "new Stroke(brush, 1)" to 2, 3, etc. for thicker lines.
+//    Example: new Stroke(orange, 1)  →  new Stroke(orange, 2)
+//
+// 2) COLORS
+//    In State.SetDefaults, the two Brush variables at the top:
+//        Brush orange = ... ;  // currently #FF8D1E
+//        Brush cyan   = ... ;  // currently #13FFFF
+//    Change the hex codes inside Color.FromRgb(...) to use different colors.
+//    Or use any built-in brush like Brushes.Yellow, Brushes.Magenta, etc.
+//
+// 3) CALCULATION MODE (currently OnBarClose)
+//    In State.SetDefaults: Calculate = Calculate.OnBarClose;
+//    Change to Calculate.OnEachTick for real-time intraday updates,
+//    or Calculate.OnPriceChange for updates on every price change.
+//
+// 4) DEFAULT PERIOD VALUES
+//    Scroll to the Properties region at the bottom. Each property looks like:
+//        public int P1 { get; set; }
+//    The default value is set in State.SetDefaults (e.g. P1 = 3;).
+//    Change those numbers to use different default periods.
+//
+// 5) DEFAULT VISIBILITY (which EMAs are checked on by default)
+//    In State.SetDefaults, find the "Show_P1 = true;" lines.
+//    Change true ↔ false to flip the default checkbox state for each EMA.
+//
+// 6) PANEL (currently overlay on price panel)
+//    IsOverlay = true; means EMAs plot on the price chart.
+//    Change to false to put them in a separate sub-pane (unusual for GMMA).
+//
+//=============================================================================
+
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Xml.Serialization;
+using NinjaTrader.Cbi;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript.DrawingTools;
+#endregion
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public class Michelle_GMMA : Indicator
+	{
+		protected override void OnStateChange()
+		{
+			if (State == State.SetDefaults)
+			{
+				Description					= @"Guppy Multiple Moving Average (GMMA) — 12 EMAs, user-toggleable.";
+				Name						= "Michelle_GMMA";
+				Calculate					= Calculate.OnBarClose;
+				IsOverlay					= true;   // GMMA plots on the price panel
+				DisplayInDataBox			= true;
+				DrawOnPricePanel			= true;
+				PaintPriceMarkers			= true;
+				ScaleJustification			= NinjaTrader.Gui.Chart.ScaleJustification.Right;
+				IsSuspendedWhileInactive	= true;
+
+				// --- Colors (hex codes from the original formula) ---
+				// Orange #FF8D1E for the short-term group (P1–P6)
+				// Cyan   #13FFFF for the long-term  group (P7–P12)
+				Brush orange = new SolidColorBrush(Color.FromRgb(0xFF, 0x8D, 0x1E));
+				orange.Freeze();
+				Brush cyan = new SolidColorBrush(Color.FromRgb(0x13, 0xFF, 0xFF));
+				cyan.Freeze();
+
+				// --- Plots (12 EMAs) — line width is the "1" inside Stroke(...) ---
+				AddPlot(new Stroke(orange, 1), PlotStyle.Line, "EMA_P1");
+				AddPlot(new Stroke(orange, 1), PlotStyle.Line, "EMA_P2");
+				AddPlot(new Stroke(orange, 1), PlotStyle.Line, "EMA_P3");
+				AddPlot(new Stroke(orange, 1), PlotStyle.Line, "EMA_P4");
+				AddPlot(new Stroke(orange, 1), PlotStyle.Line, "EMA_P5");
+				AddPlot(new Stroke(orange, 1), PlotStyle.Line, "EMA_P6");
+				AddPlot(new Stroke(cyan,   1), PlotStyle.Line, "EMA_P7");
+				AddPlot(new Stroke(cyan,   1), PlotStyle.Line, "EMA_P8");
+				AddPlot(new Stroke(cyan,   1), PlotStyle.Line, "EMA_P9");
+				AddPlot(new Stroke(cyan,   1), PlotStyle.Line, "EMA_P10");
+				AddPlot(new Stroke(cyan,   1), PlotStyle.Line, "EMA_P11");
+				AddPlot(new Stroke(cyan,   1), PlotStyle.Line, "EMA_P12");
+
+				// --- Default period values (standard Guppy GMMA) ---
+				P1 = 3;   P2 = 5;   P3 = 8;   P4 = 10;  P5 = 12;  P6 = 15;
+				P7 = 30;  P8 = 35;  P9 = 40;  P10 = 45; P11 = 50; P12 = 60;
+
+				// --- Default visibility (P7 and P9 OFF, everything else ON) ---
+				Show_P1  = true;
+				Show_P2  = true;
+				Show_P3  = true;
+				Show_P4  = true;
+				Show_P5  = true;
+				Show_P6  = true;
+				Show_P7  = false;   // OFF by default
+				Show_P8  = true;
+				Show_P9  = false;   // OFF by default
+				Show_P10 = true;
+				Show_P11 = true;
+				Show_P12 = true;
+			}
+		}
+
+		protected override void OnBarUpdate()
+		{
+			// Need at least the longest period of bars before computing anything.
+			// EMA(60) gives sensible values well before 60 bars, but we wait to be safe.
+			if (CurrentBar < 1) return;
+
+			// For each EMA: only compute & plot if the user has it enabled (Show_Px = true).
+			// When disabled, we leave the plot unset so nothing draws on the chart.
+			if (Show_P1)  Values[0][0]  = EMA(Close, P1)[0];
+			if (Show_P2)  Values[1][0]  = EMA(Close, P2)[0];
+			if (Show_P3)  Values[2][0]  = EMA(Close, P3)[0];
+			if (Show_P4)  Values[3][0]  = EMA(Close, P4)[0];
+			if (Show_P5)  Values[4][0]  = EMA(Close, P5)[0];
+			if (Show_P6)  Values[5][0]  = EMA(Close, P6)[0];
+			if (Show_P7)  Values[6][0]  = EMA(Close, P7)[0];
+			if (Show_P8)  Values[7][0]  = EMA(Close, P8)[0];
+			if (Show_P9)  Values[8][0]  = EMA(Close, P9)[0];
+			if (Show_P10) Values[9][0]  = EMA(Close, P10)[0];
+			if (Show_P11) Values[10][0] = EMA(Close, P11)[0];
+			if (Show_P12) Values[11][0] = EMA(Close, P12)[0];
+		}
+
+		#region Properties
+		// ----- Period values (P1–P12) -----
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "P1 period",  Order = 1,  GroupName = "Periods")]
+		public int P1 { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "P2 period",  Order = 2,  GroupName = "Periods")]
+		public int P2 { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "P3 period",  Order = 3,  GroupName = "Periods")]
+		public int P3 { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "P4 period",  Order = 4,  GroupName = "Periods")]
+		public int P4 { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "P5 period",  Order = 5,  GroupName = "Periods")]
+		public int P5 { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "P6 period",  Order = 6,  GroupName = "Periods")]
+		public int P6 { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "P7 period",  Order = 7,  GroupName = "Periods")]
+		public int P7 { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "P8 period",  Order = 8,  GroupName = "Periods")]
+		public int P8 { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "P9 period",  Order = 9,  GroupName = "Periods")]
+		public int P9 { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "P10 period", Order = 10, GroupName = "Periods")]
+		public int P10 { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "P11 period", Order = 11, GroupName = "Periods")]
+		public int P11 { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "P12 period", Order = 12, GroupName = "Periods")]
+		public int P12 { get; set; }
+
+		// ----- Show/Hide toggles -----
+		// Note: the period value shown in the label below is the DEFAULT —
+		// it doesn't auto-update if the user changes Px, because NinjaTrader's
+		// Display attribute is static. For the live value, the user can look
+		// at the Periods group above.
+		[NinjaScriptProperty]
+		[Display(Name = "Show P1 (default 3)",   Order = 1,  GroupName = "Show / Hide")]
+		public bool Show_P1 { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show P2 (default 5)",   Order = 2,  GroupName = "Show / Hide")]
+		public bool Show_P2 { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show P3 (default 8)",   Order = 3,  GroupName = "Show / Hide")]
+		public bool Show_P3 { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show P4 (default 10)",  Order = 4,  GroupName = "Show / Hide")]
+		public bool Show_P4 { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show P5 (default 12)",  Order = 5,  GroupName = "Show / Hide")]
+		public bool Show_P5 { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show P6 (default 15)",  Order = 6,  GroupName = "Show / Hide")]
+		public bool Show_P6 { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show P7 (default 30)",  Order = 7,  GroupName = "Show / Hide")]
+		public bool Show_P7 { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show P8 (default 35)",  Order = 8,  GroupName = "Show / Hide")]
+		public bool Show_P8 { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show P9 (default 40)",  Order = 9,  GroupName = "Show / Hide")]
+		public bool Show_P9 { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show P10 (default 45)", Order = 10, GroupName = "Show / Hide")]
+		public bool Show_P10 { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show P11 (default 50)", Order = 11, GroupName = "Show / Hide")]
+		public bool Show_P11 { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show P12 (default 60)", Order = 12, GroupName = "Show / Hide")]
+		public bool Show_P12 { get; set; }
+		#endregion
+	}
+}
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private Michelle_GMMA[] cacheMichelle_GMMA;
+		public Michelle_GMMA Michelle_GMMA(int p1, int p2, int p3, int p4, int p5, int p6, int p7, int p8, int p9, int p10, int p11, int p12, bool show_P1, bool show_P2, bool show_P3, bool show_P4, bool show_P5, bool show_P6, bool show_P7, bool show_P8, bool show_P9, bool show_P10, bool show_P11, bool show_P12)
+		{
+			return Michelle_GMMA(Input, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, show_P1, show_P2, show_P3, show_P4, show_P5, show_P6, show_P7, show_P8, show_P9, show_P10, show_P11, show_P12);
+		}
+
+		public Michelle_GMMA Michelle_GMMA(ISeries<double> input, int p1, int p2, int p3, int p4, int p5, int p6, int p7, int p8, int p9, int p10, int p11, int p12, bool show_P1, bool show_P2, bool show_P3, bool show_P4, bool show_P5, bool show_P6, bool show_P7, bool show_P8, bool show_P9, bool show_P10, bool show_P11, bool show_P12)
+		{
+			if (cacheMichelle_GMMA != null)
+				for (int idx = 0; idx < cacheMichelle_GMMA.Length; idx++)
+					if (cacheMichelle_GMMA[idx] != null && cacheMichelle_GMMA[idx].P1 == p1 && cacheMichelle_GMMA[idx].P2 == p2 && cacheMichelle_GMMA[idx].P3 == p3 && cacheMichelle_GMMA[idx].P4 == p4 && cacheMichelle_GMMA[idx].P5 == p5 && cacheMichelle_GMMA[idx].P6 == p6 && cacheMichelle_GMMA[idx].P7 == p7 && cacheMichelle_GMMA[idx].P8 == p8 && cacheMichelle_GMMA[idx].P9 == p9 && cacheMichelle_GMMA[idx].P10 == p10 && cacheMichelle_GMMA[idx].P11 == p11 && cacheMichelle_GMMA[idx].P12 == p12 && cacheMichelle_GMMA[idx].Show_P1 == show_P1 && cacheMichelle_GMMA[idx].Show_P2 == show_P2 && cacheMichelle_GMMA[idx].Show_P3 == show_P3 && cacheMichelle_GMMA[idx].Show_P4 == show_P4 && cacheMichelle_GMMA[idx].Show_P5 == show_P5 && cacheMichelle_GMMA[idx].Show_P6 == show_P6 && cacheMichelle_GMMA[idx].Show_P7 == show_P7 && cacheMichelle_GMMA[idx].Show_P8 == show_P8 && cacheMichelle_GMMA[idx].Show_P9 == show_P9 && cacheMichelle_GMMA[idx].Show_P10 == show_P10 && cacheMichelle_GMMA[idx].Show_P11 == show_P11 && cacheMichelle_GMMA[idx].Show_P12 == show_P12 && cacheMichelle_GMMA[idx].EqualsInput(input))
+						return cacheMichelle_GMMA[idx];
+			return CacheIndicator<Michelle_GMMA>(new Michelle_GMMA(){ P1 = p1, P2 = p2, P3 = p3, P4 = p4, P5 = p5, P6 = p6, P7 = p7, P8 = p8, P9 = p9, P10 = p10, P11 = p11, P12 = p12, Show_P1 = show_P1, Show_P2 = show_P2, Show_P3 = show_P3, Show_P4 = show_P4, Show_P5 = show_P5, Show_P6 = show_P6, Show_P7 = show_P7, Show_P8 = show_P8, Show_P9 = show_P9, Show_P10 = show_P10, Show_P11 = show_P11, Show_P12 = show_P12 }, input, ref cacheMichelle_GMMA);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.Michelle_GMMA Michelle_GMMA(int p1, int p2, int p3, int p4, int p5, int p6, int p7, int p8, int p9, int p10, int p11, int p12, bool show_P1, bool show_P2, bool show_P3, bool show_P4, bool show_P5, bool show_P6, bool show_P7, bool show_P8, bool show_P9, bool show_P10, bool show_P11, bool show_P12)
+		{
+			return indicator.Michelle_GMMA(Input, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, show_P1, show_P2, show_P3, show_P4, show_P5, show_P6, show_P7, show_P8, show_P9, show_P10, show_P11, show_P12);
+		}
+
+		public Indicators.Michelle_GMMA Michelle_GMMA(ISeries<double> input , int p1, int p2, int p3, int p4, int p5, int p6, int p7, int p8, int p9, int p10, int p11, int p12, bool show_P1, bool show_P2, bool show_P3, bool show_P4, bool show_P5, bool show_P6, bool show_P7, bool show_P8, bool show_P9, bool show_P10, bool show_P11, bool show_P12)
+		{
+			return indicator.Michelle_GMMA(input, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, show_P1, show_P2, show_P3, show_P4, show_P5, show_P6, show_P7, show_P8, show_P9, show_P10, show_P11, show_P12);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.Michelle_GMMA Michelle_GMMA(int p1, int p2, int p3, int p4, int p5, int p6, int p7, int p8, int p9, int p10, int p11, int p12, bool show_P1, bool show_P2, bool show_P3, bool show_P4, bool show_P5, bool show_P6, bool show_P7, bool show_P8, bool show_P9, bool show_P10, bool show_P11, bool show_P12)
+		{
+			return indicator.Michelle_GMMA(Input, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, show_P1, show_P2, show_P3, show_P4, show_P5, show_P6, show_P7, show_P8, show_P9, show_P10, show_P11, show_P12);
+		}
+
+		public Indicators.Michelle_GMMA Michelle_GMMA(ISeries<double> input , int p1, int p2, int p3, int p4, int p5, int p6, int p7, int p8, int p9, int p10, int p11, int p12, bool show_P1, bool show_P2, bool show_P3, bool show_P4, bool show_P5, bool show_P6, bool show_P7, bool show_P8, bool show_P9, bool show_P10, bool show_P11, bool show_P12)
+		{
+			return indicator.Michelle_GMMA(input, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, show_P1, show_P2, show_P3, show_P4, show_P5, show_P6, show_P7, show_P8, show_P9, show_P10, show_P11, show_P12);
+		}
+	}
+}
+
+#endregion
