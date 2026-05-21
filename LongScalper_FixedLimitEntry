@@ -103,7 +103,7 @@ using NinjaTrader.NinjaScript.DrawingTools;
 //  WHAT'S UNCHANGED FROM v2.5
 // =============================================================================
 //
-//  - All entry logic (LimitMode, FixedPrice / OffsetFromLastPrice)
+//  - All entry logic (LimitMode, Fixed_Price / Fixed_OffsetFromLastPrice)
 //  - Pre-attached brackets via SetProfitTarget / SetStopLoss
 //  - Trailing stop logic (only moves UP, with pullback tolerance)
 //  - One-trade-per-enable model
@@ -123,16 +123,16 @@ using NinjaTrader.NinjaScript.DrawingTools;
 //  KEY PARAMETER DEFAULTS
 //  ----------------------
 //    Quantity                      1
-//    LimitMode                     OffsetFromLastPrice
+//    LimitMode                     Fixed_OffsetFromLastPrice
 //    EntryOffsetMultiplier         0.10
 //    BarSizeAveragePeriod          10
 //    OrderLifeSeconds              5
 //    ProfitTargetPoints            10
 //    StopMode                      OffsetFromFilledPrice    <-- NEW DEFAULT
 //    StopOffsetMultiplier          2.0                       <-- NEW
-//    TrailOffsetMultiplier         0.8                       <-- NEW
+//    TrailOffsetMultiplier         1.2                       <-- NEW
 //    HardStopPoints                20  (FixedPoints mode only)
-//    TrailDistancePoints           8   (FixedPoints mode only)
+//    TrailDistancePoints           10   (FixedPoints mode only)
 //    MonitorIntervalSeconds        3
 //    PullbackTolerancePoints       2
 //    DisableDelaySeconds           1.5
@@ -143,8 +143,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 {
     public enum EntryLimitMode
     {
-        OffsetFromLastPrice,
-        FixedPrice
+        Fixed_OffsetFromLastPrice,
+        Fixed_Price
     }
 
     // [v2.6] Renamed from AtrBased -> OffsetFromFilledPrice.
@@ -200,7 +200,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (State == State.SetDefaults)
             {
                 Description                                 = "Long-only scalper with trailing stop, fixed-limit-price option, and bar-size-based adaptive stops (v2.6).";
-                Name                                        = "LongScalper_FixedLimit";
+                Name                                        = "LongScalper_FixedLimitEntry";
                 Calculate                                   = Calculate.OnEachTick;
                 EntriesPerDirection                         = 1;
                 EntryHandling                               = EntryHandling.AllEntries;
@@ -221,7 +221,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // ---- Defaults ----
                 Quantity                = 1;
 
-                LimitMode               = EntryLimitMode.OffsetFromLastPrice;
+                LimitMode               = EntryLimitMode.Fixed_OffsetFromLastPrice;
                 FixedLimitPrice         = 0;
 
                 EntryOffsetMultiplier   = 0.10;
@@ -532,7 +532,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            if (LimitMode == EntryLimitMode.FixedPrice)
+            if (LimitMode == EntryLimitMode.Fixed_Price)
             {
                 if (FixedLimitPrice <= 0)
                 {
@@ -546,7 +546,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 calculatedLimitPrice = Instrument.MasterInstrument.RoundToTickSize(FixedLimitPrice);
 
-                Print(string.Format("[STEP1] FixedPrice mode: lastPrice={0}, userTyped={1}, rounded limitPrice={2}, avgBarSize={3:F2}",
+                Print(string.Format("[STEP1] Fixed_Price mode: lastPrice={0}, userTyped={1}, rounded limitPrice={2}, avgBarSize={3:F2}",
                     entryLastTradedPrice, FixedLimitPrice, calculatedLimitPrice, avgBarSizeAtEntry));
             }
             else
@@ -1019,20 +1019,20 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ---- Entry ----
         [NinjaScriptProperty]
         [Display(Name="LimitMode",
-            Description="How to compute the buy limit price. OffsetFromLastPrice (default) = lastPrice - (EntryOffsetMultiplier * avgBarSize). FixedPrice = use the FixedLimitPrice value below.",
+            Description="How to compute the buy limit price. Fixed_OffsetFromLastPrice (default) = lastPrice - (EntryOffsetMultiplier * avgBarSize). Fixed_Price = use the FixedLimitPrice value below.",
             Order=2, GroupName="2. Entry")]
         public EntryLimitMode LimitMode { get; set; }
 
         [NinjaScriptProperty]
         [Range(0.0, double.MaxValue)]
         [Display(Name="FixedLimitPrice",
-            Description="The exact limit price to use when LimitMode = FixedPrice. Ignored if LimitMode = OffsetFromLastPrice.",
+            Description="The exact limit price to use when LimitMode = Fixed_Price. Ignored if LimitMode = Fixed_OffsetFromLastPrice.",
             Order=3, GroupName="2. Entry")]
         public double FixedLimitPrice { get; set; }
 
         [NinjaScriptProperty]
         [Range(0.01, 10.0)]
-        [Display(Name="EntryOffsetMultiplier", Description="Limit = lastPrice - (this x avgBarSize). Used only in OffsetFromLastPrice mode. Default 0.10.", Order=4, GroupName="2. Entry")]
+        [Display(Name="EntryOffsetMultiplier", Description="Limit = lastPrice - (this x avgBarSize). Used only in Fixed_OffsetFromLastPrice mode. Default 0.10.", Order=4, GroupName="2. Entry")]
         public double EntryOffsetMultiplier { get; set; }
 
         [NinjaScriptProperty]
