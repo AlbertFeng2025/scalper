@@ -19,9 +19,33 @@ using NinjaTrader.NinjaScript.DrawingTools;
 
 
 // =============================================================================
-// STRATEGY: scalper_RenkoStringPatternAlertEMA v1.4.0
+// STRATEGY: scalper_RenkoStringPatternAlertEMA v1.4.1
 // AUTHOR:   Albert Feng / Drafted with help from Claude
-// REPLACES: v1.3.2
+// REPLACES: v1.4.0
+// =============================================================================
+//
+// v1.4.1 CHANGES vs v1.4.0
+// ------------------------
+// 1) Five order-event sounds added (uses NinjaTrader default .wav files):
+//      - Entry filled         -> Alert4.wav        (neutral)
+//      - Profit target hit    -> Boxing Bell.wav   (cheerful)
+//      - Stop loss hit        -> Glass Break.wav   (negative)
+//      - Order cancel/unfill  -> Alert3.wav        (notice)
+//      - Force-flat workend   -> Alert2.wav        (warning)
+//    Alert sound (Alert1.wav) unchanged.
+//
+// 2) StopLossBricks and ProfitTargetBricks changed from int to double.
+//    Range 0.1 to 50.0, default 1.0. Allows fine tuning like 1.5 bricks
+//    (= 30pt on MNQ standard Renko with brick=80 ticks). Final price is
+//    still rounded to TickSize via RoundToTickSize.
+//
+// 3) CSV filenames fixed - v1.4.0 collided all three log types into one
+//    file with no extension. Now three distinct .csv files:
+//      scalper_RenkoStringPatternAlertEMA_Order_occ.csv
+//      scalper_RenkoStringPatternAlertEMA_Order_alert.csv
+//      scalper_RenkoStringPatternAlertEMA_Order_orders.csv
+//    If you have data in the old combined file, rename or delete it first.
+//
 // =============================================================================
 //
 // v1.4.0 CHANGES vs v1.3.2
@@ -233,7 +257,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Description = "Renko string-pattern alerter+order (v1.4.0). Adds order placement subsystem on top of v1.3.2 alert system. Long-only. EnableOrders=false reproduces v1.3.2 exactly.";
+                Description = "Renko string-pattern alerter+order (v1.4.1). Adds 5 order-event sounds, decimal stop/target bricks. Long-only. EnableOrders=false reproduces v1.3.2 exactly.";
                 Name        = "scalper_RenkoStringPatternAlertEMA_Order";
                 Calculate   = Calculate.OnBarClose;
 
@@ -274,8 +298,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 OrderType            = OrderEntryType.Limit;
                 LimitUnderPoints     = 5.0;
                 UnfilledCancelBricks = 1;
-                StopLossBricks       = 1;
-                ProfitTargetBricks   = 1;
+                StopLossBricks       = 1.0;
+                ProfitTargetBricks   = 1.0;
 
                 // ---- NEW v1.4: Working Hours & Expiry defaults ----
                 EnableOrderHours     = false;          // when false, order hours gate is bypassed (still need EnableOrders)
@@ -305,7 +329,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Realtime)
             {
                 Print("================================================================");
-                Print(string.Format("[INIT] scalper_RenkoStringPatternAlertEMA v1.4.0 at {0}",
+                Print(string.Format("[INIT] scalper_RenkoStringPatternAlertEMA v1.4.1 at {0}",
                     DateTime.Now.ToString("HH:mm:ss.fff")));
 
                 Print(string.Format("[INIT] BarsPeriod.BarsPeriodType = {0}", BarsPeriod.BarsPeriodType));
@@ -345,8 +369,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Print(string.Format("[INIT] OrderType           = {0}", OrderType));
                     Print(string.Format("[INIT] LimitUnderPoints    = {0:F2} (ignored if Market)", LimitUnderPoints));
                     Print(string.Format("[INIT] UnfilledCancelBricks= {0} (ignored if Market)", UnfilledCancelBricks));
-                    Print(string.Format("[INIT] StopLossBricks      = {0}  -> stop offset = {1:F2} pt", StopLossBricks, StopLossBricks * BarsPeriod.Value * TickSize));
-                    Print(string.Format("[INIT] ProfitTargetBricks  = {0}  -> target offset = {1:F2} pt", ProfitTargetBricks, ProfitTargetBricks * BarsPeriod.Value * TickSize));
+                    Print(string.Format("[INIT] StopLossBricks      = {0:F2}  -> stop offset = {1:F2} pt", StopLossBricks, StopLossBricks * BarsPeriod.Value * TickSize));
+                    Print(string.Format("[INIT] ProfitTargetBricks  = {0:F2}  -> target offset = {1:F2} pt", ProfitTargetBricks, ProfitTargetBricks * BarsPeriod.Value * TickSize));
                     Print(string.Format("[INIT] EnableOrderHours    = {0}", EnableOrderHours));
                     if (EnableOrderHours)
                     {
@@ -355,6 +379,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                     Print(string.Format("[INIT] GoodTilDate         = {0:yyyy-MM-dd}", GoodTilDate));
                     Print(string.Format("[INIT] Order will be sent to whichever Account is selected in the strategy's Account dropdown."));
+                    Print("[INIT] Order sounds (v1.4.1):");
+                    Print("[INIT]   Entry filled        -> Alert4.wav");
+                    Print("[INIT]   Profit target hit   -> Boxing Bell.wav");
+                    Print("[INIT]   Stop loss hit       -> Glass Break.wav");
+                    Print("[INIT]   Entry cancelled     -> Alert3.wav");
+                    Print("[INIT]   Force-flat workend  -> Alert2.wav");
                 }
                 else
                 {
@@ -494,6 +524,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     {
                         Print(string.Format("[ORDER] Work-end reached while order WORKING. Cancelling entry order #{0}.", entryOrderNumber));
                         WriteOrderRow("CANCEL_WORKEND", entryOrderNumber, "n/a", entryLimitPrice, 0, 0, "");
+                        PlayOrderSound("Alert2.wav", "Force-flat work-end (cancel working entry)");
                         forceFlatInProgress = true;
                         try { if (workingEntryOrder != null) CancelOrder(workingEntryOrder); }
                         catch (Exception ex) { Print(string.Format("[ORDER] CancelOrder error: {0}", ex.Message)); }
@@ -502,6 +533,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     {
                         Print(string.Format("[ORDER] Work-end reached while POSITION_OPEN. Cancelling OCO bracket and force-flatting at market."));
                         WriteOrderRow("FORCEFLAT_WORKEND", entryOrderNumber, "BRACKET_CANCEL", actualFillPrice, computedStopPrice, computedTargetPrice, "");
+                        PlayOrderSound("Alert2.wav", "Force-flat work-end (exit position)");
                         forceFlatInProgress = true;
                         try
                         {
@@ -784,6 +816,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // Wait for terminal cancelled to reset
                     if (orderUpdateState == NinjaTrader.Cbi.OrderState.Cancelled)
                     {
+                        // Play cancel sound only if this is a "normal" unfilled cancel,
+                        // not a workend cancel (which has its own warning sound below).
+                        if (!forceFlatInProgress)
+                            PlayOrderSound("Alert3.wav", "Entry cancelled (unfilled)");
                         workingEntryOrder = null;
                         ResetOrderSubsystemToIdle("entry_cancelled");
                     }
@@ -820,6 +856,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // adjust quantity on full. With OrderQuantity=1 (default) this is always Filled.
                 if (execution.Order.OrderState == NinjaTrader.Cbi.OrderState.Filled)
                 {
+                    PlayOrderSound("Alert4.wav", "Entry filled");
                     AttachOCOBracket();
                     orderState = OrderSubState.Position;
                     workingEntryOrder = null;
@@ -838,6 +875,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(string.Format("[ORDER] *** {0} HIT *** order #{1} exit @ {2:F2}. Entry={3:F2}. PnL/contract={4:+0.00;-0.00} pt.",
                     which, entryOrderNumber, price, actualFillPrice, pnl));
                 WriteOrderRow(isStopFill ? "EXIT_STOP" : "EXIT_TARGET", entryOrderNumber, "n/a", 0, computedStopPrice, computedTargetPrice, "");
+                if (isStopFill)
+                    PlayOrderSound("Glass Break.wav", "Stop loss hit");
+                else
+                    PlayOrderSound("Boxing Bell.wav", "Profit target hit");
                 ResetOrderSubsystemToIdle(isStopFill ? "stop_hit" : "target_hit");
             }
         }
@@ -854,7 +895,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             computedTargetPrice  = Instrument.MasterInstrument.RoundToTickSize(computedTargetPrice);
             ocoGroupId = "OCO_" + entryOrderNumber + "_" + DateTime.Now.Ticks;
 
-            Print(string.Format("[ORDER] Attaching OCO bracket for order #{0}: STOP @ {1:F2} ({2} brick(s)), TARGET @ {3:F2} ({4} brick(s)). Brick price = {5:F2}.",
+            Print(string.Format("[ORDER] Attaching OCO bracket for order #{0}: STOP @ {1:F2} ({2:F2} brick(s)), TARGET @ {3:F2} ({4:F2} brick(s)). Brick price = {5:F2}.",
                 entryOrderNumber, computedStopPrice, StopLossBricks, computedTargetPrice, ProfitTargetBricks, brickPrice));
             WriteOrderRow("FILLED_BRACKET_ATTACH", entryOrderNumber, "n/a", actualFillPrice, computedStopPrice, computedTargetPrice, "");
 
@@ -1008,6 +1049,27 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
+        // NEW v1.4.1: PlayOrderSound
+        // Plays a NinjaTrader built-in .wav for an order subsystem event.
+        // The five hardcoded sound names below all ship with NinjaTrader 8.
+        // If a file is missing on this install, PlaySound silently fails - we
+        // log which file was attempted so it's easy to spot.
+        // =====================================================================
+        private void PlayOrderSound(string wavFileName, string eventLabel)
+        {
+            try
+            {
+                string fullPath = NinjaTrader.Core.Globals.InstallDir + @"\sounds\" + wavFileName;
+                Print(string.Format("[SOUND] {0} -> playing {1}", eventLabel, wavFileName));
+                PlaySound(fullPath);
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[SOUND] ERROR playing {0}: {1}", wavFileName, ex.Message));
+            }
+        }
+
+        // =====================================================================
         // CSV: per-occurrence (UNCHANGED from v1.3.2 except filename suffix)
         // =====================================================================
         private void WriteOccurrenceRow(PendingOccurrence po, string outcome, double endPrice, bool firedAlert, bool capturedPostAlert, char capturedBit)
@@ -1017,14 +1079,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (!Directory.Exists(AuditLogPath))
                     Directory.CreateDirectory(AuditLogPath);
 
-                string logFile = Path.Combine(AuditLogPath, "scalper_RenkoStringPatternAlertEMA_Order");
+                string logFile = Path.Combine(AuditLogPath, "scalper_RenkoStringPatternAlertEMA_Order_occ.csv");
                 bool fileExists = File.Exists(logFile);
 
                 using (StreamWriter sw = new StreamWriter(logFile, true))
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.4.0");
+                        sw.WriteLine("# schema_version=1.4.1");
                         sw.WriteLine(string.Format("# file_created_NY={0}",
                             TimeZoneInfo.ConvertTime(DateTime.Now, nyTz).ToString("yyyy-MM-dd HH:mm:ss")));
                         sw.WriteLine(string.Format("# file_created_UTC={0}",
@@ -1103,14 +1165,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (!Directory.Exists(AuditLogPath))
                     Directory.CreateDirectory(AuditLogPath);
 
-                string logFile = Path.Combine(AuditLogPath, "scalper_RenkoStringPatternAlertEMA_Order");
+                string logFile = Path.Combine(AuditLogPath, "scalper_RenkoStringPatternAlertEMA_Order_alert.csv");
                 bool fileExists = File.Exists(logFile);
 
                 using (StreamWriter sw = new StreamWriter(logFile, true))
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.4.0");
+                        sw.WriteLine("# schema_version=1.4.1");
                         sw.WriteLine(string.Format("# instrument={0}", Instrument.FullName));
                         sw.WriteLine(string.Format("# brick_size_ticks={0}", BarsPeriod.Value));
                         sw.WriteLine(string.Format("# tick_size={0}", TickSize));
@@ -1155,14 +1217,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (!Directory.Exists(AuditLogPath))
                     Directory.CreateDirectory(AuditLogPath);
 
-                string logFile = Path.Combine(AuditLogPath, "scalper_RenkoStringPatternAlertEMA_Order");
+                string logFile = Path.Combine(AuditLogPath, "scalper_RenkoStringPatternAlertEMA_Order_orders.csv");
                 bool fileExists = File.Exists(logFile);
 
                 using (StreamWriter sw = new StreamWriter(logFile, true))
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.4.0");
+                        sw.WriteLine("# schema_version=1.4.1");
                         sw.WriteLine(string.Format("# instrument={0}", Instrument.FullName));
                         sw.WriteLine(string.Format("# brick_size_ticks={0}", BarsPeriod.Value));
                         sw.WriteLine(string.Format("# tick_size={0}", TickSize));
@@ -1334,18 +1396,18 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int UnfilledCancelBricks { get; set; }
 
         [NinjaScriptProperty]
-        [Range(1, 50)]
+        [Range(0.1, 50.0)]
         [Display(Name="StopLossBricks",
-            Description="Stop-loss distance from fill, in BRICKS (1 brick price = BarsPeriod.Value * TickSize). Default 1.",
+            Description="Stop-loss distance from fill, in BRICKS (decimal allowed, e.g. 1.5). 1 brick price = BarsPeriod.Value * TickSize. Default 1.0.",
             Order=6, GroupName="8. Order Execution")]
-        public int StopLossBricks { get; set; }
+        public double StopLossBricks { get; set; }
 
         [NinjaScriptProperty]
-        [Range(1, 50)]
+        [Range(0.1, 50.0)]
         [Display(Name="ProfitTargetBricks",
-            Description="Profit-target distance from fill, in BRICKS. Default 1.",
+            Description="Profit-target distance from fill, in BRICKS (decimal allowed, e.g. 2.5). Default 1.0.",
             Order=7, GroupName="8. Order Execution")]
-        public int ProfitTargetBricks { get; set; }
+        public double ProfitTargetBricks { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name="EnableOrderHours",
