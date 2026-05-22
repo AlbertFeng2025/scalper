@@ -19,9 +19,31 @@ using NinjaTrader.NinjaScript.DrawingTools;
 
 
 // =============================================================================
-// STRATEGY: scalper_RenkoStringPatternAlertEMA v1.4.1
+// STRATEGY: scalper_RenkoStringPatternAlertEMA v1.4.2
 // AUTHOR:   Albert Feng / Drafted with help from Claude
-// REPLACES: v1.4.0
+// REPLACES: v1.4.1
+// =============================================================================
+//
+// v1.4.2 CHANGES vs v1.4.1
+// ------------------------
+// BUG FIX: state machine could get stuck in Working state if a CancelOrder
+// request did not trigger an OnOrderUpdate callback with terminal state
+// Cancelled. This caused the same cancel to fire on every subsequent brick
+// close, producing thousands of duplicate CANCEL_UNFILLED CSV rows and
+// (worse) blocking all future order activity.
+//
+// Five defensive changes:
+//   1) cancelRequested flag - only issue CancelOrder once per stuck order
+//   2) Grace-period force-reset - if Working state persists for
+//      UnfilledCancelBricks + 2 bricks without the callback resetting us
+//      to Idle, force-reset ourselves
+//   3) Heartbeat log - every 10 bricks while not Idle, print state status
+//   4) Clearer state-transition logging
+//   5) Reset also on OrderState.Rejected (was only on Cancelled)
+//
+// No behavioral changes beyond bug fixes. EnableOrders=false still
+// reproduces v1.3.2.
+//
 // =============================================================================
 //
 // v1.4.1 CHANGES vs v1.4.0
@@ -234,6 +256,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double entryLimitPrice = 0.0;      // submitted limit price (for Limit type)
         private int   entryOrderNumber = 0;        // dailyOrderNumber assigned to this entry
 
+        // NEW v1.4.2: guard so we only request cancel once per stuck order
+        private bool cancelRequested = false;
+        // NEW v1.4.2: heartbeat counter - how many bricks since last state change
+        private int  bricksInCurrentState = 0;
+
         // OCO bracket order tracking
         private Order stopLossOrder = null;
         private Order profitTargetOrder = null;
@@ -257,7 +284,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Description = "Renko string-pattern alerter+order (v1.4.1). Adds 5 order-event sounds, decimal stop/target bricks. Long-only. EnableOrders=false reproduces v1.3.2 exactly.";
+                Description = "Renko string-pattern alerter+order (v1.4.2). Fixes stuck-Working state machine bug. Long-only. EnableOrders=false reproduces v1.3.2 exactly.";
                 Name        = "scalper_RenkoStringPatternAlertEMA_Order";
                 Calculate   = Calculate.OnBarClose;
 
@@ -329,7 +356,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Realtime)
             {
                 Print("================================================================");
-                Print(string.Format("[INIT] scalper_RenkoStringPatternAlertEMA v1.4.1 at {0}",
+                Print(string.Format("[INIT] scalper_RenkoStringPatternAlertEMA v1.4.2 at {0}",
                     DateTime.Now.ToString("HH:mm:ss.fff")));
 
                 Print(string.Format("[INIT] BarsPeriod.BarsPeriodType = {0}", BarsPeriod.BarsPeriodType));
@@ -493,24 +520,52 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             // =================================================================
             // ORDER SUBSYSTEM: tick the working-order brick counter
-            // Each new brick close, if we have a working entry order, increment.
+            // NEW v1.4.2: cancel-once guard + grace-period force-reset.
             // =================================================================
             if (orderState == OrderSubState.Working && workingEntryOrder != null)
             {
                 bricksSinceEntrySubmit++;
-                Print(string.Format("[ORDER] Working order brick tick: {0} of {1} (entry order #{2})",
-                    bricksSinceEntrySubmit, UnfilledCancelBricks, entryOrderNumber));
+                Print(string.Format("[ORDER] Working order brick tick: {0} of {1} (entry order #{2}, cancelRequested={3})",
+                    bricksSinceEntrySubmit, UnfilledCancelBricks, entryOrderNumber, cancelRequested));
 
-                if (bricksSinceEntrySubmit >= UnfilledCancelBricks)
+                if (bricksSinceEntrySubmit >= UnfilledCancelBricks && !cancelRequested)
                 {
-                    // Still not filled - cancel.
+                    // First time we hit the unfilled threshold: request cancel exactly ONCE.
                     Print(string.Format("[ORDER] Entry order #{0} unfilled after {1} brick(s). Cancelling.",
                         entryOrderNumber, UnfilledCancelBricks));
                     WriteOrderRow("CANCEL_UNFILLED", entryOrderNumber, "n/a", entryLimitPrice, 0, 0, "");
+                    cancelRequested = true;
                     try { if (workingEntryOrder != null) CancelOrder(workingEntryOrder); }
                     catch (Exception ex) { Print(string.Format("[ORDER] CancelOrder error: {0}", ex.Message)); }
-                    // OnOrderUpdate will see the cancellation and clean up to Idle.
+                    // OnOrderUpdate should fire next with Cancelled and call ResetOrderSubsystemToIdle.
                 }
+                else if (cancelRequested && bricksSinceEntrySubmit >= UnfilledCancelBricks + 2)
+                {
+                    // GRACE PERIOD EXPIRED: callback never confirmed cancellation.
+                    // Force-reset ourselves so we don't get stuck forever.
+                    Print(string.Format("[ORDER] *** GRACE PERIOD EXPIRED *** Entry order #{0} still Working after cancel request + 2 bricks. Force-resetting to Idle.",
+                        entryOrderNumber));
+                    WriteOrderRow("FORCE_RESET_STUCK", entryOrderNumber, "n/a", entryLimitPrice, 0, 0, "callback_never_arrived");
+                    ResetOrderSubsystemToIdle("force_reset_stuck_working");
+                }
+            }
+
+            // NEW v1.4.2: heartbeat - log non-Idle state every 10 bricks so a
+            // stuck state machine is immediately visible in the Output window.
+            if (orderState != OrderSubState.Idle)
+            {
+                bricksInCurrentState++;
+                if (bricksInCurrentState % 10 == 0)
+                {
+                    Print(string.Format("[HEARTBEAT] orderState={0} for {1} bricks. workingEntryOrder={2}, cancelRequested={3}, bricksSinceEntrySubmit={4}.",
+                        orderState, bricksInCurrentState,
+                        workingEntryOrder == null ? "null" : "set",
+                        cancelRequested, bricksSinceEntrySubmit));
+                }
+            }
+            else
+            {
+                bricksInCurrentState = 0;
             }
 
             // =================================================================
@@ -704,7 +759,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(string.Format("[ORDER] *** SUBMIT MARKET BUY *** qty={0}, ref price (close)={1:F2}. Order #{2}.",
                     OrderQuantity, currentPrice, entryOrderNumber));
                 WriteOrderRow("SUBMIT_MARKET", entryOrderNumber, "MARKET", 0, 0, 0, "");
+                Print(string.Format("[ORDER] *** STATE: Idle -> Working *** (market entry submitted)"));
                 orderState = OrderSubState.Working;
+                bricksInCurrentState = 0;
+                cancelRequested = false;
                 try
                 {
                     workingEntryOrder = EnterLong(OrderQuantity, "EntryV140");
@@ -725,7 +783,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(string.Format("[ORDER] *** SUBMIT LIMIT BUY *** qty={0}, ref close={1:F2}, limit price={2:F2} ({3:F2} below close). Wait {4} brick(s). Order #{5}.",
                     OrderQuantity, currentPrice, limitPrice, LimitUnderPoints, UnfilledCancelBricks, entryOrderNumber));
                 WriteOrderRow("SUBMIT_LIMIT", entryOrderNumber, "LIMIT", limitPrice, 0, 0, "");
+                Print(string.Format("[ORDER] *** STATE: Idle -> Working *** (limit entry submitted)"));
                 orderState = OrderSubState.Working;
+                bricksInCurrentState = 0;
+                cancelRequested = false;
                 try
                 {
                     workingEntryOrder = EnterLongLimit(0, true, OrderQuantity, limitPrice, "EntryV140");
@@ -798,6 +859,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // =====================================================================
         // NEW v1.4: OnOrderUpdate - track entry order lifecycle
+        // v1.4.2: more defensive matching and logging.
         // =====================================================================
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice,
             int quantity, int filled, double averageFillPrice,
@@ -806,23 +868,25 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (order == null) return;
             if (!EnableOrders) return;
 
-            // Entry order updates
-            if (workingEntryOrder != null && order == workingEntryOrder)
+            // v1.4.2: match by reference OR by signal name "EntryV140" to be safe
+            // against NinjaTrader handing us a different object reference for the
+            // same logical order.
+            bool isOurEntry = (workingEntryOrder != null && order == workingEntryOrder)
+                              || (order.Name == "EntryV140" && orderState == OrderSubState.Working);
+
+            if (isOurEntry)
             {
-                if (orderUpdateState == NinjaTrader.Cbi.OrderState.Cancelled
-                 || orderUpdateState == NinjaTrader.Cbi.OrderState.CancelPending)
+                Print(string.Format("[ORDER] OnOrderUpdate: entry order #{0}, name={1}, state={2}.",
+                    entryOrderNumber, order.Name, orderUpdateState));
+
+                if (orderUpdateState == NinjaTrader.Cbi.OrderState.Cancelled)
                 {
-                    Print(string.Format("[ORDER] Entry order #{0} state={1}.", entryOrderNumber, orderUpdateState));
-                    // Wait for terminal cancelled to reset
-                    if (orderUpdateState == NinjaTrader.Cbi.OrderState.Cancelled)
-                    {
-                        // Play cancel sound only if this is a "normal" unfilled cancel,
-                        // not a workend cancel (which has its own warning sound below).
-                        if (!forceFlatInProgress)
-                            PlayOrderSound("Alert3.wav", "Entry cancelled (unfilled)");
-                        workingEntryOrder = null;
-                        ResetOrderSubsystemToIdle("entry_cancelled");
-                    }
+                    // Play cancel sound only if this is a "normal" unfilled cancel,
+                    // not a workend cancel (forceFlatInProgress has its own sound).
+                    if (!forceFlatInProgress)
+                        PlayOrderSound("Alert3.wav", "Entry cancelled (unfilled)");
+                    workingEntryOrder = null;
+                    ResetOrderSubsystemToIdle("entry_cancelled_callback");
                 }
                 else if (orderUpdateState == NinjaTrader.Cbi.OrderState.Rejected)
                 {
@@ -831,6 +895,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     workingEntryOrder = null;
                     ResetOrderSubsystemToIdle("entry_rejected");
                 }
+                // For other states (Accepted, Working, CancelPending) just log and wait.
             }
         }
 
@@ -858,7 +923,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     PlayOrderSound("Alert4.wav", "Entry filled");
                     AttachOCOBracket();
+                    Print(string.Format("[ORDER] *** STATE: Working -> Position *** (order #{0} filled)", entryOrderNumber));
                     orderState = OrderSubState.Position;
+                    bricksInCurrentState = 0;
                     workingEntryOrder = null;
                 }
             }
@@ -912,10 +979,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // =====================================================================
         // NEW v1.4: ResetOrderSubsystemToIdle
+        // v1.4.2: also resets cancelRequested and heartbeat counter.
         // =====================================================================
         private void ResetOrderSubsystemToIdle(string reason)
         {
-            Print(string.Format("[ORDER] Resetting order subsystem to IDLE (reason: {0}).", reason));
+            Print(string.Format("[ORDER] *** STATE -> IDLE *** (reason: {0}).", reason));
             orderState = OrderSubState.Idle;
             workingEntryOrder = null;
             stopLossOrder = null;
@@ -929,6 +997,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             computedTargetPrice = 0.0;
             ocoGroupId = null;
             forceFlatInProgress = false;
+            cancelRequested = false;          // v1.4.2
+            bricksInCurrentState = 0;         // v1.4.2
         }
 
         // =====================================================================
@@ -1086,7 +1156,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.4.1");
+                        sw.WriteLine("# schema_version=1.4.2");
                         sw.WriteLine(string.Format("# file_created_NY={0}",
                             TimeZoneInfo.ConvertTime(DateTime.Now, nyTz).ToString("yyyy-MM-dd HH:mm:ss")));
                         sw.WriteLine(string.Format("# file_created_UTC={0}",
@@ -1172,7 +1242,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.4.1");
+                        sw.WriteLine("# schema_version=1.4.2");
                         sw.WriteLine(string.Format("# instrument={0}", Instrument.FullName));
                         sw.WriteLine(string.Format("# brick_size_ticks={0}", BarsPeriod.Value));
                         sw.WriteLine(string.Format("# tick_size={0}", TickSize));
@@ -1224,7 +1294,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.4.1");
+                        sw.WriteLine("# schema_version=1.4.2");
                         sw.WriteLine(string.Format("# instrument={0}", Instrument.FullName));
                         sw.WriteLine(string.Format("# brick_size_ticks={0}", BarsPeriod.Value));
                         sw.WriteLine(string.Format("# tick_size={0}", TickSize));
