@@ -19,9 +19,44 @@ using NinjaTrader.NinjaScript.DrawingTools;
 
 
 // =============================================================================
-// STRATEGY: scalper_RenkoStringPatternAlertEMA v1.4.2
+// STRATEGY: scalper_RenkoStringPatternAlertEMA v1.4.3
 // AUTHOR:   Albert Feng / Drafted with help from Claude
-// REPLACES: v1.4.1
+// REPLACES: v1.4.2
+// =============================================================================
+//
+// v1.4.3 CHANGES vs v1.4.2 (architectural)
+// ----------------------------------------
+// Philosophy shift: the broker's Position.MarketPosition is the SOURCE OF
+// TRUTH. Our orderState enum tracks intent. When they diverge (which 5/21
+// playback showed can happen), broker wins and we reconcile by force-flat.
+//
+// Three stacked safety layers:
+//   Layer 1: our work-end logic at OrderEndHourNY (e.g. 15:55 NY)
+//   Layer 2: NinjaTrader session close (IsExitOnSessionCloseStrategy=true)
+//   Layer 3: broker server-side bracket (SetStopLoss / SetProfitTarget)
+//
+// Specific fixes:
+//   1) SetStopLoss / SetProfitTarget for atomic, server-side bracket.
+//      Replaces manual ExitLongStopMarket + ExitLongLimit on fill. Removes
+//      the race window between fill and bracket-attach. Bracket parameters
+//      are on the order ticket so the broker holds them even if our local
+//      code is offline.
+//   2) Market orders are NEVER cancelled. Their timeout becomes a wall-clock
+//      heartbeat that logs CRITICAL if no fill confirmation arrives in 30s,
+//      but never tries CancelOrder (which would race with the broker fill).
+//   3) Defensive position-sync check at the TOP of every OnBarUpdate. If
+//      orderState=Idle but Position!=Flat, force-flatten via market exit.
+//      If orderState=Working/Position but Position=Flat, reset to Idle.
+//   4) Force-reset paths now verify Position==Flat before declaring Idle.
+//   5) IsExitOnSessionCloseStrategy = true (was false in v1.4.2).
+//   6) New parameter MaxConsecutiveLosses (default 99 = effectively off).
+//      Set to 5 for live trading. Halts new orders after N losses in a row;
+//      manual reset required (disable + re-enable strategy).
+//   7) OnConnectionStatusUpdate plays Alert2.wav on broker disconnect.
+//   8) Display Names enhanced with UPPERCASE unit hints (BRICKS / POINTS).
+//   9) Startup INIT log includes a dollar-value sizing summary so the user
+//      sees exact $/trade exposure on enable.
+//
 // =============================================================================
 //
 // v1.4.2 CHANGES vs v1.4.1
@@ -261,6 +296,19 @@ namespace NinjaTrader.NinjaScript.Strategies
         // NEW v1.4.2: heartbeat counter - how many bricks since last state change
         private int  bricksInCurrentState = 0;
 
+        // NEW v1.4.3: track which order type the current Working order is
+        private OrderEntryType currentWorkingOrderType = OrderEntryType.Limit;
+        // NEW v1.4.3: wall-clock time when market order was submitted (for heartbeat check)
+        private DateTime marketSubmitWallClock = DateTime.MinValue;
+        private bool marketTimeoutLogged = false;
+        // NEW v1.4.3: consecutive-loss tracking for safety brake
+        private int consecutiveLosses = 0;
+        private bool safetyBrakeTripped = false;
+        // NEW v1.4.3: remember last entry order # for desync logging
+        private int lastEntryOrderNumber = 0;
+        // NEW v1.4.3: track whether we've recently logged a desync to avoid log spam
+        private DateTime lastDesyncLogTime = DateTime.MinValue;
+
         // OCO bracket order tracking
         private Order stopLossOrder = null;
         private Order profitTargetOrder = null;
@@ -284,13 +332,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Description = "Renko string-pattern alerter+order (v1.4.2). Fixes stuck-Working state machine bug. Long-only. EnableOrders=false reproduces v1.3.2 exactly.";
+                Description = "Renko string-pattern alerter+order (v1.4.3). Broker is source of truth: defensive desync detection, server-side bracket via SetStopLoss/SetProfitTarget, market orders never cancelled, MaxConsecutiveLosses safety brake. Long-only. EnableOrders=false reproduces v1.3.2 exactly.";
                 Name        = "scalper_RenkoStringPatternAlertEMA_Order";
                 Calculate   = Calculate.OnBarClose;
 
                 EntriesPerDirection                       = 1;
                 EntryHandling                             = EntryHandling.AllEntries;
-                IsExitOnSessionCloseStrategy              = false;
+                IsExitOnSessionCloseStrategy              = true;  // v1.4.3: Layer 2 safety net - NT auto-flat at session close
                 BarsRequiredToTrade                       = 20;
                 IsInstantiatedOnEachOptimizationIteration = true;
 
@@ -327,6 +375,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 UnfilledCancelBricks = 1;
                 StopLossBricks       = 1.0;
                 ProfitTargetBricks   = 1.0;
+                MaxConsecutiveLosses = 99;             // v1.4.3: default = effectively off; set to 5 for live
 
                 // ---- NEW v1.4: Working Hours & Expiry defaults ----
                 EnableOrderHours     = false;          // when false, order hours gate is bypassed (still need EnableOrders)
@@ -356,7 +405,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Realtime)
             {
                 Print("================================================================");
-                Print(string.Format("[INIT] scalper_RenkoStringPatternAlertEMA v1.4.2 at {0}",
+                Print(string.Format("[INIT] scalper_RenkoStringPatternAlertEMA v1.4.3 at {0}",
                     DateTime.Now.ToString("HH:mm:ss.fff")));
 
                 Print(string.Format("[INIT] BarsPeriod.BarsPeriodType = {0}", BarsPeriod.BarsPeriodType));
@@ -387,17 +436,48 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(string.Format("[INIT] Beep: {0} beeps, {1}s apart", AlertSoundCount, AlertReminderSecs));
                 Print(string.Format("[INIT] CSV path: {0}", AuditLogPath));
 
-                // ---- NEW v1.4: order subsystem init log ----
-                Print("[INIT] ----- ORDER SUBSYSTEM v1.4 -----");
+                // ---- NEW v1.4.3: order subsystem init log with sizing summary ----
+                Print("[INIT] ----- ORDER SUBSYSTEM v1.4.3 -----");
                 Print(string.Format("[INIT] EnableOrders        = {0}", EnableOrders));
                 if (EnableOrders)
                 {
-                    Print(string.Format("[INIT] OrderQuantity       = {0}", OrderQuantity));
+                    Print(string.Format("[INIT] OrderQuantity       = {0} contract(s)", OrderQuantity));
                     Print(string.Format("[INIT] OrderType           = {0}", OrderType));
-                    Print(string.Format("[INIT] LimitUnderPoints    = {0:F2} (ignored if Market)", LimitUnderPoints));
-                    Print(string.Format("[INIT] UnfilledCancelBricks= {0} (ignored if Market)", UnfilledCancelBricks));
-                    Print(string.Format("[INIT] StopLossBricks      = {0:F2}  -> stop offset = {1:F2} pt", StopLossBricks, StopLossBricks * BarsPeriod.Value * TickSize));
-                    Print(string.Format("[INIT] ProfitTargetBricks  = {0:F2}  -> target offset = {1:F2} pt", ProfitTargetBricks, ProfitTargetBricks * BarsPeriod.Value * TickSize));
+                    Print(string.Format("[INIT] LimitUnderPoints    = {0:F2} pt (ignored if Market)", LimitUnderPoints));
+                    Print(string.Format("[INIT] UnfilledCancelBricks= {0} (LIMIT only - market orders never cancelled)", UnfilledCancelBricks));
+
+                    // === SIZING SUMMARY ===
+                    double brickTicks = BarsPeriod.Value;
+                    double brickPoints = brickTicks * TickSize;
+                    double stopTicks = StopLossBricks * brickTicks;
+                    double stopPoints = stopTicks * TickSize;
+                    double targetTicks = ProfitTargetBricks * brickTicks;
+                    double targetPoints = targetTicks * TickSize;
+
+                    // Best-effort point value lookup (MNQ = $2/pt, MES = $5/pt, etc.)
+                    double pointValue = 0.0;
+                    try { pointValue = Instrument.MasterInstrument.PointValue; }
+                    catch { pointValue = 0.0; }
+
+                    Print("[INIT] === Order sizing summary ===");
+                    Print(string.Format("[INIT]   Brick size:     {0:F1} ticks = {1:F2} points{2}",
+                        brickTicks, brickPoints,
+                        pointValue > 0 ? string.Format(" = ${0:F2}/contract", brickPoints * pointValue) : ""));
+                    Print(string.Format("[INIT]   Stop loss:      {0:F2} bricks = {1:F1} ticks = {2:F2} points{3}",
+                        StopLossBricks, stopTicks, stopPoints,
+                        pointValue > 0 ? string.Format(" = ${0:F2} RISK/contract", stopPoints * pointValue) : ""));
+                    Print(string.Format("[INIT]   Profit target:  {0:F2} bricks = {1:F1} ticks = {2:F2} points{3}",
+                        ProfitTargetBricks, targetTicks, targetPoints,
+                        pointValue > 0 ? string.Format(" = ${0:F2} REWARD/contract", targetPoints * pointValue) : ""));
+                    Print(string.Format("[INIT]   Risk:Reward = 1:{0:F2}", ProfitTargetBricks / StopLossBricks));
+                    if (OrderType == OrderEntryType.Limit)
+                        Print(string.Format("[INIT]   Limit offset:   {0:F2} points = {1:F1} ticks", LimitUnderPoints, LimitUnderPoints / TickSize));
+                    Print("[INIT] ============================");
+
+                    Print(string.Format("[INIT] MaxConsecutiveLosses = {0}{1}",
+                        MaxConsecutiveLosses,
+                        MaxConsecutiveLosses >= 99 ? " (effectively OFF)" : " (safety brake ACTIVE)"));
+
                     Print(string.Format("[INIT] EnableOrderHours    = {0}", EnableOrderHours));
                     if (EnableOrderHours)
                     {
@@ -405,13 +485,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                             OrderStartHourNY, OrderStartMinuteNY, OrderEndHourNY, OrderEndMinuteNY));
                     }
                     Print(string.Format("[INIT] GoodTilDate         = {0:yyyy-MM-dd}", GoodTilDate));
-                    Print(string.Format("[INIT] Order will be sent to whichever Account is selected in the strategy's Account dropdown."));
+                    Print(string.Format("[INIT] Order routes to account selected in strategy's Account dropdown."));
+
+                    Print("[INIT] v1.4.3 safety layers active:");
+                    Print("[INIT]   Layer 1: work-end logic at OrderEndHourNY");
+                    Print("[INIT]   Layer 2: NT session-close auto-flat (IsExitOnSessionCloseStrategy=true)");
+                    Print("[INIT]   Layer 3: broker server-side bracket (SetStopLoss/SetProfitTarget)");
+                    Print("[INIT]   Defensive: position-sync check every brick");
+                    Print("[INIT]   Defensive: market orders NEVER cancelled (use heartbeat instead)");
+
                     Print("[INIT] Order sounds (v1.4.1):");
                     Print("[INIT]   Entry filled        -> Alert4.wav");
                     Print("[INIT]   Profit target hit   -> Boxing Bell.wav");
                     Print("[INIT]   Stop loss hit       -> Glass Break.wav");
                     Print("[INIT]   Entry cancelled     -> Alert3.wav");
                     Print("[INIT]   Force-flat workend  -> Alert2.wav");
+                    Print("[INIT]   Connection lost     -> Alert2.wav");
                 }
                 else
                 {
@@ -474,6 +563,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (CurrentBar < 1) return;
             if (!configValid) return;
 
+            // =================================================================
+            // NEW v1.4.3: DEFENSIVE POSITION-SYNC CHECK
+            // Run before everything else. Broker is the source of truth.
+            // =================================================================
+            if (EnableOrders)
+                CheckPositionSync();
+
             // ---- Daily reset check ----
             DateTime barTimeNy = TimeZoneInfo.ConvertTime(Time[0], nyTz);
             int minuteOfDayNy = barTimeNy.Hour * 60 + barTimeNy.Minute;
@@ -519,34 +615,67 @@ namespace NinjaTrader.NinjaScript.Strategies
             double currentPrice = Close[0];
 
             // =================================================================
-            // ORDER SUBSYSTEM: tick the working-order brick counter
-            // NEW v1.4.2: cancel-once guard + grace-period force-reset.
+            // ORDER SUBSYSTEM: Working-state handling
+            // v1.4.3: branches by order type. LIMIT uses brick timeout +
+            // CancelOrder. MARKET uses wall-clock heartbeat only, NEVER cancels.
             // =================================================================
             if (orderState == OrderSubState.Working && workingEntryOrder != null)
             {
                 bricksSinceEntrySubmit++;
-                Print(string.Format("[ORDER] Working order brick tick: {0} of {1} (entry order #{2}, cancelRequested={3})",
-                    bricksSinceEntrySubmit, UnfilledCancelBricks, entryOrderNumber, cancelRequested));
 
-                if (bricksSinceEntrySubmit >= UnfilledCancelBricks && !cancelRequested)
+                if (currentWorkingOrderType == OrderEntryType.Limit)
                 {
-                    // First time we hit the unfilled threshold: request cancel exactly ONCE.
-                    Print(string.Format("[ORDER] Entry order #{0} unfilled after {1} brick(s). Cancelling.",
-                        entryOrderNumber, UnfilledCancelBricks));
-                    WriteOrderRow("CANCEL_UNFILLED", entryOrderNumber, "n/a", entryLimitPrice, 0, 0, "");
-                    cancelRequested = true;
-                    try { if (workingEntryOrder != null) CancelOrder(workingEntryOrder); }
-                    catch (Exception ex) { Print(string.Format("[ORDER] CancelOrder error: {0}", ex.Message)); }
-                    // OnOrderUpdate should fire next with Cancelled and call ResetOrderSubsystemToIdle.
+                    // ---- LIMIT branch: brick-counted timeout + cancel ----
+                    Print(string.Format("[ORDER] Working LIMIT brick tick: {0} of {1} (entry order #{2}, cancelRequested={3})",
+                        bricksSinceEntrySubmit, UnfilledCancelBricks, entryOrderNumber, cancelRequested));
+
+                    if (bricksSinceEntrySubmit >= UnfilledCancelBricks && !cancelRequested)
+                    {
+                        Print(string.Format("[ORDER] LIMIT entry order #{0} unfilled after {1} brick(s). Cancelling.",
+                            entryOrderNumber, UnfilledCancelBricks));
+                        WriteOrderRow("CANCEL_UNFILLED", entryOrderNumber, "n/a", entryLimitPrice, 0, 0, "");
+                        cancelRequested = true;
+                        try { if (workingEntryOrder != null) CancelOrder(workingEntryOrder); }
+                        catch (Exception ex) { Print(string.Format("[ORDER] CancelOrder error: {0}", ex.Message)); }
+                    }
+                    else if (cancelRequested && bricksSinceEntrySubmit >= UnfilledCancelBricks + 2)
+                    {
+                        // GRACE PERIOD EXPIRED for LIMIT order
+                        // v1.4.3: verify Position is Flat before declaring Idle.
+                        Print(string.Format("[ORDER] *** LIMIT GRACE PERIOD EXPIRED *** Entry #{0}. Verifying broker position before reset.",
+                            entryOrderNumber));
+                        WriteOrderRow("FORCE_RESET_STUCK", entryOrderNumber, "n/a", entryLimitPrice, 0, 0, "callback_never_arrived");
+                        if (Position.MarketPosition == MarketPosition.Flat)
+                        {
+                            ResetOrderSubsystemToIdle("force_reset_stuck_limit_broker_flat");
+                        }
+                        else
+                        {
+                            // Broker says we have a position despite our state confusion!
+                            // Force-flatten via market exit. Don't declare Idle until exit confirms.
+                            Print(string.Format("[CRITICAL] LIMIT grace-period expired but Position={0} (not Flat). Force-flattening at market.",
+                                Position.MarketPosition));
+                            WriteOrderRow("DESYNC_FORCE_FLAT", entryOrderNumber, "n/a", 0, 0, 0, "limit_grace_broker_not_flat");
+                            try { ExitLong(Math.Abs(Position.Quantity), "ExitDesync", "EntryV140"); }
+                            catch (Exception ex) { Print(string.Format("[CRITICAL] ExitLong (desync) failed: {0}", ex.Message)); }
+                            // Stay in Working; CheckPositionSync will reset us when exit confirms.
+                        }
+                    }
                 }
-                else if (cancelRequested && bricksSinceEntrySubmit >= UnfilledCancelBricks + 2)
+                else // currentWorkingOrderType == Market
                 {
-                    // GRACE PERIOD EXPIRED: callback never confirmed cancellation.
-                    // Force-reset ourselves so we don't get stuck forever.
-                    Print(string.Format("[ORDER] *** GRACE PERIOD EXPIRED *** Entry order #{0} still Working after cancel request + 2 bricks. Force-resetting to Idle.",
-                        entryOrderNumber));
-                    WriteOrderRow("FORCE_RESET_STUCK", entryOrderNumber, "n/a", entryLimitPrice, 0, 0, "callback_never_arrived");
-                    ResetOrderSubsystemToIdle("force_reset_stuck_working");
+                    // ---- MARKET branch: wall-clock heartbeat, NEVER cancel ----
+                    TimeSpan elapsed = DateTime.Now - marketSubmitWallClock;
+                    if (elapsed.TotalSeconds > 30 && !marketTimeoutLogged)
+                    {
+                        Print(string.Format("[CRITICAL] MARKET order #{0} no fill confirmation after {1:F1}s. Broker may be slow or disconnected. NOT cancelling (market orders typically fill at broker even on slow callback). Manual check recommended.",
+                            entryOrderNumber, elapsed.TotalSeconds));
+                        WriteOrderRow("MARKET_HEARTBEAT_WARN", entryOrderNumber, "MARKET", 0, 0, 0,
+                            string.Format("elapsed_seconds={0:F1}", elapsed.TotalSeconds));
+                        marketTimeoutLogged = true;
+                        // Do NOT cancel. Do NOT reset state. Just log and wait.
+                        // CheckPositionSync will reconcile if/when broker reports a position.
+                    }
                 }
             }
 
@@ -557,10 +686,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 bricksInCurrentState++;
                 if (bricksInCurrentState % 10 == 0)
                 {
-                    Print(string.Format("[HEARTBEAT] orderState={0} for {1} bricks. workingEntryOrder={2}, cancelRequested={3}, bricksSinceEntrySubmit={4}.",
+                    Print(string.Format("[HEARTBEAT] orderState={0} for {1} bricks. workingEntryOrder={2}, cancelRequested={3}, bricksSinceEntrySubmit={4}, brokerPosition={5}.",
                         orderState, bricksInCurrentState,
                         workingEntryOrder == null ? "null" : "set",
-                        cancelRequested, bricksSinceEntrySubmit));
+                        cancelRequested, bricksSinceEntrySubmit,
+                        Position.MarketPosition));
                 }
             }
             else
@@ -570,6 +700,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             // =================================================================
             // ORDER SUBSYSTEM: work-end force-flat check (every brick close)
+            // v1.4.3: bracket is now server-side via SetStopLoss/SetProfitTarget.
+            // NinjaTrader will auto-cancel the bracket when we submit ExitLong.
             // =================================================================
             if (EnableOrders && EnableOrderHours && !forceFlatInProgress)
             {
@@ -586,19 +718,28 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                     else if (orderState == OrderSubState.Position)
                     {
-                        Print(string.Format("[ORDER] Work-end reached while POSITION_OPEN. Cancelling OCO bracket and force-flatting at market."));
-                        WriteOrderRow("FORCEFLAT_WORKEND", entryOrderNumber, "BRACKET_CANCEL", actualFillPrice, computedStopPrice, computedTargetPrice, "");
+                        Print(string.Format("[ORDER] Work-end reached while POSITION_OPEN. Submitting market exit (bracket auto-cancels)."));
+                        WriteOrderRow("FORCEFLAT_WORKEND", entryOrderNumber, "MARKET_EXIT", actualFillPrice, computedStopPrice, computedTargetPrice, "");
                         PlayOrderSound("Alert2.wav", "Force-flat work-end (exit position)");
+                        forceFlatInProgress = true;
+                        try { ExitLong(OrderQuantity, "ExitWorkEnd", "EntryV140"); }
+                        catch (Exception ex) { Print(string.Format("[ORDER] ExitLong (workend) error: {0}", ex.Message)); }
+                    }
+                    else if (orderState == OrderSubState.Idle
+                             && Position.MarketPosition != MarketPosition.Flat)
+                    {
+                        // v1.4.3: Layer 1 catches ghost positions too at work-end.
+                        Print(string.Format("[CRITICAL] Work-end reached: orderState=Idle but Position={0}. Force-flatten as part of work-end.",
+                            Position.MarketPosition));
+                        WriteOrderRow("FORCEFLAT_WORKEND_GHOST", lastEntryOrderNumber, "MARKET_EXIT", 0, 0, 0, "ghost_position_at_workend");
+                        PlayOrderSound("Alert2.wav", "Force-flat ghost position at work-end");
                         forceFlatInProgress = true;
                         try
                         {
-                            if (stopLossOrder      != null) CancelOrder(stopLossOrder);
-                            if (profitTargetOrder  != null) CancelOrder(profitTargetOrder);
+                            if (Position.MarketPosition == MarketPosition.Long)
+                                ExitLong(Math.Abs(Position.Quantity), "ExitWorkEndGhost", "EntryV140");
                         }
-                        catch (Exception ex) { Print(string.Format("[ORDER] Cancel bracket error: {0}", ex.Message)); }
-                        // Submit market exit. Use ExitLong with no price (market).
-                        try { ExitLong(OrderQuantity, "ExitWorkEnd", "EntryV140"); }
-                        catch (Exception ex) { Print(string.Format("[ORDER] ExitLong (workend) error: {0}", ex.Message)); }
+                        catch (Exception ex) { Print(string.Format("[CRITICAL] Ghost work-end exit failed: {0}", ex.Message)); }
                     }
                 }
             }
@@ -747,22 +888,56 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
+            // Gate h (NEW v1.4.3): safety brake from consecutive losses
+            if (safetyBrakeTripped)
+            {
+                Print(string.Format("[ORDER] EMA-qualified pattern detected but SAFETY BRAKE is tripped ({0} consecutive losses >= {1}). No order. Disable+re-enable strategy to reset.",
+                    consecutiveLosses, MaxConsecutiveLosses));
+                return;
+            }
+
             // All gates passed. Submit entry order.
             dailyOrderNumber++;
             entryOrderNumber = dailyOrderNumber;
+            lastEntryOrderNumber = entryOrderNumber;        // v1.4.3
             entryReferencePrice = currentPrice;
             bricksSinceEntrySubmit = 0;
             entrySubmitBarIdx = CurrentBar;
+            currentWorkingOrderType = OrderType;            // v1.4.3: remember type
+            cancelRequested = false;
+            marketTimeoutLogged = false;
+
+            // ============================================================
+            // NEW v1.4.3: pre-set the OCO bracket via SetStopLoss / SetProfitTarget
+            // This MUST happen BEFORE the entry call so NinjaTrader can attach
+            // the bracket atomically (server-side) the moment the entry fills.
+            // Units: ticks, computed from brick math.
+            // ============================================================
+            double brickTicks = BarsPeriod.Value;                       // brick size in ticks
+            int stopTicks   = (int)Math.Round(StopLossBricks    * brickTicks);
+            int targetTicks = (int)Math.Round(ProfitTargetBricks * brickTicks);
+            try
+            {
+                SetStopLoss("EntryV140", CalculationMode.Ticks, stopTicks, false);
+                SetProfitTarget("EntryV140", CalculationMode.Ticks, targetTicks);
+                Print(string.Format("[ORDER] Pre-set OCO bracket: stop={0} ticks, target={1} ticks (server-side).",
+                    stopTicks, targetTicks));
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[CRITICAL] SetStopLoss/SetProfitTarget failed: {0}. ABORTING ENTRY.", ex.Message));
+                return;
+            }
 
             if (OrderType == OrderEntryType.Market)
             {
-                Print(string.Format("[ORDER] *** SUBMIT MARKET BUY *** qty={0}, ref price (close)={1:F2}. Order #{2}.",
+                Print(string.Format("[ORDER] *** SUBMIT MARKET BUY *** qty={0}, ref price (close)={1:F2}. Order #{2}. (NEVER cancelled - market orders only.)",
                     OrderQuantity, currentPrice, entryOrderNumber));
                 WriteOrderRow("SUBMIT_MARKET", entryOrderNumber, "MARKET", 0, 0, 0, "");
                 Print(string.Format("[ORDER] *** STATE: Idle -> Working *** (market entry submitted)"));
                 orderState = OrderSubState.Working;
                 bricksInCurrentState = 0;
-                cancelRequested = false;
+                marketSubmitWallClock = DateTime.Now;       // v1.4.3: start wall-clock timer
                 try
                 {
                     workingEntryOrder = EnterLong(OrderQuantity, "EntryV140");
@@ -786,7 +961,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(string.Format("[ORDER] *** STATE: Idle -> Working *** (limit entry submitted)"));
                 orderState = OrderSubState.Working;
                 bricksInCurrentState = 0;
-                cancelRequested = false;
                 try
                 {
                     workingEntryOrder = EnterLongLimit(0, true, OrderQuantity, limitPrice, "EntryV140");
@@ -901,6 +1075,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // =====================================================================
         // NEW v1.4: OnExecutionUpdate - fired when an order fills
+        // v1.4.3: bracket is now managed by NT (SetStopLoss/SetProfitTarget).
+        // We just detect entry fill -> Position, and exit fills -> Idle.
+        // Exits are identified by their Order.Name ("Stop loss" or "Profit target"
+        // are NT's default names when set via SetStopLoss/SetProfitTarget).
         // =====================================================================
         protected override void OnExecutionUpdate(Execution execution, string executionId, double price,
             int quantity, MarketPosition marketPosition, string orderId, DateTime time)
@@ -908,8 +1086,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!EnableOrders) return;
             if (execution == null || execution.Order == null) return;
 
-            // Entry fill
-            if (workingEntryOrder != null && execution.Order == workingEntryOrder
+            string oName = execution.Order.Name ?? "";
+
+            // Entry fill - identified by signal name "EntryV140"
+            if (oName == "EntryV140"
                 && (execution.Order.OrderState == NinjaTrader.Cbi.OrderState.Filled
                  || execution.Order.OrderState == NinjaTrader.Cbi.OrderState.PartFilled))
             {
@@ -917,69 +1097,165 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(string.Format("[ORDER] *** ENTRY FILLED *** order #{0} qty={1} @ {2:F2} (state={3})",
                     entryOrderNumber, quantity, price, execution.Order.OrderState));
 
-                // Only attach bracket on full fill. For partial, attach on first partial then
-                // adjust quantity on full. With OrderQuantity=1 (default) this is always Filled.
                 if (execution.Order.OrderState == NinjaTrader.Cbi.OrderState.Filled)
                 {
                     PlayOrderSound("Alert4.wav", "Entry filled");
-                    AttachOCOBracket();
+                    // v1.4.3: NinjaTrader auto-attached the bracket via SetStopLoss/SetProfitTarget.
+                    // We don't call AttachOCOBracket() anymore. Just log the expected exit prices.
+                    double brickPrice = BarsPeriod.Value * TickSize;
+                    computedStopPrice   = actualFillPrice - (StopLossBricks     * brickPrice);
+                    computedTargetPrice = actualFillPrice + (ProfitTargetBricks * brickPrice);
+                    computedStopPrice   = Instrument.MasterInstrument.RoundToTickSize(computedStopPrice);
+                    computedTargetPrice = Instrument.MasterInstrument.RoundToTickSize(computedTargetPrice);
+                    Print(string.Format("[ORDER] Bracket auto-attached server-side: STOP ~{0:F2} ({1:F2} brick(s)), TARGET ~{2:F2} ({3:F2} brick(s)).",
+                        computedStopPrice, StopLossBricks, computedTargetPrice, ProfitTargetBricks));
+                    WriteOrderRow("FILLED_BRACKET_ATTACH", entryOrderNumber, "n/a", actualFillPrice, computedStopPrice, computedTargetPrice, "");
                     Print(string.Format("[ORDER] *** STATE: Working -> Position *** (order #{0} filled)", entryOrderNumber));
                     orderState = OrderSubState.Position;
                     bricksInCurrentState = 0;
                     workingEntryOrder = null;
+                    marketTimeoutLogged = false;
                 }
+                return;
             }
 
-            // Stop / Target fills (exits) - return to idle
-            bool isStopFill   = (stopLossOrder      != null && execution.Order == stopLossOrder);
-            bool isTargetFill = (profitTargetOrder  != null && execution.Order == profitTargetOrder);
+            // Exit fills - identified by NT's default bracket order names.
+            // "Stop loss" is the default name from SetStopLoss.
+            // "Profit target" is the default name from SetProfitTarget.
+            bool isStopFill   = oName.IndexOf("Stop", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool isTargetFill = oName.IndexOf("Profit", StringComparison.OrdinalIgnoreCase) >= 0
+                             || oName.IndexOf("Target", StringComparison.OrdinalIgnoreCase) >= 0;
 
+            // Defensive: only treat as exit if we're actually in Position state
             if ((isStopFill || isTargetFill)
-                && execution.Order.OrderState == NinjaTrader.Cbi.OrderState.Filled)
+                && execution.Order.OrderState == NinjaTrader.Cbi.OrderState.Filled
+                && orderState == OrderSubState.Position)
             {
                 string which = isStopFill ? "STOP" : "TARGET";
                 double pnl = price - actualFillPrice;
-                Print(string.Format("[ORDER] *** {0} HIT *** order #{1} exit @ {2:F2}. Entry={3:F2}. PnL/contract={4:+0.00;-0.00} pt.",
-                    which, entryOrderNumber, price, actualFillPrice, pnl));
+                Print(string.Format("[ORDER] *** {0} HIT *** order #{1} ({2}) exit @ {3:F2}. Entry={4:F2}. PnL/contract={5:+0.00;-0.00} pt.",
+                    which, entryOrderNumber, oName, price, actualFillPrice, pnl));
                 WriteOrderRow(isStopFill ? "EXIT_STOP" : "EXIT_TARGET", entryOrderNumber, "n/a", 0, computedStopPrice, computedTargetPrice, "");
+
+                // v1.4.3: consecutive-loss tracking
                 if (isStopFill)
+                {
+                    consecutiveLosses++;
                     PlayOrderSound("Glass Break.wav", "Stop loss hit");
+                    Print(string.Format("[ORDER] Consecutive losses now = {0} of {1}.", consecutiveLosses, MaxConsecutiveLosses));
+                    if (consecutiveLosses >= MaxConsecutiveLosses && !safetyBrakeTripped)
+                    {
+                        safetyBrakeTripped = true;
+                        Print(string.Format("[CRITICAL] *** SAFETY BRAKE TRIPPED *** {0} consecutive losses >= MaxConsecutiveLosses={1}. ALL FURTHER ORDERS HALTED. Disable+re-enable strategy to reset.",
+                            consecutiveLosses, MaxConsecutiveLosses));
+                        WriteOrderRow("SAFETY_BRAKE_TRIPPED", entryOrderNumber, "n/a", 0, 0, 0,
+                            string.Format("consecutive_losses={0}", consecutiveLosses));
+                        // Audible alarm
+                        PlayOrderSound("Alert2.wav", "Safety brake tripped");
+                    }
+                }
                 else
+                {
                     PlayOrderSound("Boxing Bell.wav", "Profit target hit");
+                    if (consecutiveLosses > 0)
+                        Print(string.Format("[ORDER] Win resets consecutive losses counter (was {0}).", consecutiveLosses));
+                    consecutiveLosses = 0;
+                }
+
                 ResetOrderSubsystemToIdle(isStopFill ? "stop_hit" : "target_hit");
             }
         }
 
         // =====================================================================
-        // NEW v1.4: AttachOCOBracket
+        // NEW v1.4.3: CheckPositionSync
+        // The DEFENSIVE GUARD that runs at the top of every OnBarUpdate.
+        // Broker's Position.MarketPosition is the source of truth.
         // =====================================================================
-        private void AttachOCOBracket()
+        private void CheckPositionSync()
         {
-            double brickPrice = BarsPeriod.Value * TickSize;
-            computedStopPrice    = actualFillPrice - (StopLossBricks     * brickPrice);
-            computedTargetPrice  = actualFillPrice + (ProfitTargetBricks * brickPrice);
-            computedStopPrice    = Instrument.MasterInstrument.RoundToTickSize(computedStopPrice);
-            computedTargetPrice  = Instrument.MasterInstrument.RoundToTickSize(computedTargetPrice);
-            ocoGroupId = "OCO_" + entryOrderNumber + "_" + DateTime.Now.Ticks;
-
-            Print(string.Format("[ORDER] Attaching OCO bracket for order #{0}: STOP @ {1:F2} ({2:F2} brick(s)), TARGET @ {3:F2} ({4:F2} brick(s)). Brick price = {5:F2}.",
-                entryOrderNumber, computedStopPrice, StopLossBricks, computedTargetPrice, ProfitTargetBricks, brickPrice));
-            WriteOrderRow("FILLED_BRACKET_ATTACH", entryOrderNumber, "n/a", actualFillPrice, computedStopPrice, computedTargetPrice, "");
-
             try
             {
-                stopLossOrder = ExitLongStopMarket(0, true, OrderQuantity, computedStopPrice, "ExitStop", "EntryV140");
-                profitTargetOrder = ExitLongLimit(0, true, OrderQuantity, computedTargetPrice, "ExitTarget", "EntryV140");
+                MarketPosition brokerPos = Position.MarketPosition;
+
+                // Case A: strategy thinks Idle but broker has a position = GHOST POSITION
+                if (orderState == OrderSubState.Idle && brokerPos != MarketPosition.Flat)
+                {
+                    // Throttle log spam (only log once per 30 seconds)
+                    bool shouldLog = (DateTime.Now - lastDesyncLogTime).TotalSeconds > 30;
+                    if (shouldLog)
+                    {
+                        Print(string.Format("[CRITICAL] *** DESYNC DETECTED *** orderState=Idle but broker Position={0} (qty={1}). Force-flattening at market.",
+                            brokerPos, Position.Quantity));
+                        WriteOrderRow("DESYNC_FORCE_FLAT", lastEntryOrderNumber, "n/a", 0, 0, 0,
+                            string.Format("orderState=Idle, brokerPosition={0}", brokerPos));
+                        PlayOrderSound("Alert2.wav", "Desync ghost position detected");
+                        lastDesyncLogTime = DateTime.Now;
+                    }
+
+                    try
+                    {
+                        if (brokerPos == MarketPosition.Long)
+                            ExitLong(Math.Abs(Position.Quantity), "ExitDesync", "EntryV140");
+                        else if (brokerPos == MarketPosition.Short)
+                            ExitShort(Math.Abs(Position.Quantity), "ExitDesyncShort", "EntryV140");
+                    }
+                    catch (Exception ex)
+                    {
+                        if (shouldLog)
+                            Print(string.Format("[CRITICAL] Desync force-flat failed: {0}", ex.Message));
+                    }
+                }
+
+                // Case B: strategy thinks Working/Position but broker is Flat = STALE STATE
+                else if ((orderState == OrderSubState.Working || orderState == OrderSubState.Position)
+                         && brokerPos == MarketPosition.Flat)
+                {
+                    // Throttle: only act once
+                    if ((DateTime.Now - lastDesyncLogTime).TotalSeconds > 5)
+                    {
+                        Print(string.Format("[CRITICAL] *** DESYNC DETECTED *** orderState={0} but broker Position=Flat. Resetting to Idle.",
+                            orderState));
+                        WriteOrderRow("DESYNC_RESET_IDLE", lastEntryOrderNumber, "n/a", 0, 0, 0,
+                            string.Format("orderState={0}, brokerPosition=Flat", orderState));
+                        lastDesyncLogTime = DateTime.Now;
+                        ResetOrderSubsystemToIdle("desync_broker_flat");
+                    }
+                }
             }
             catch (Exception ex)
             {
-                Print(string.Format("[ORDER] AttachOCOBracket error: {0}", ex.Message));
+                Print(string.Format("[ORDER] CheckPositionSync error: {0}", ex.Message));
+            }
+        }
+
+        // =====================================================================
+        // NEW v1.4.3: OnConnectionStatusUpdate - audible alarm on disconnect
+        // =====================================================================
+        protected override void OnConnectionStatusUpdate(ConnectionStatusEventArgs connectionStatusUpdate)
+        {
+            if (connectionStatusUpdate == null) return;
+
+            ConnectionStatus status = connectionStatusUpdate.Status;
+            Print(string.Format("[CONN] Connection status update: {0}", status));
+
+            if (status == ConnectionStatus.Disconnected || status == ConnectionStatus.Disconnecting)
+            {
+                Print("[CRITICAL] *** BROKER CONNECTION LOST *** Server-side bracket should still protect open positions, but no new orders can be placed.");
+                try { PlayOrderSound("Alert2.wav", "Broker connection lost"); }
+                catch { /* sound can fail if NT shutting down */ }
+            }
+            else if (status == ConnectionStatus.Connected)
+            {
+                Print("[CONN] Broker connection (re)established.");
             }
         }
 
         // =====================================================================
         // NEW v1.4: ResetOrderSubsystemToIdle
         // v1.4.2: also resets cancelRequested and heartbeat counter.
+        // v1.4.3: also resets market timer and currentWorkingOrderType.
+        //         Does NOT reset consecutiveLosses or safetyBrakeTripped
+        //         (those persist across trades intentionally).
         // =====================================================================
         private void ResetOrderSubsystemToIdle(string reason)
         {
@@ -997,8 +1273,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             computedTargetPrice = 0.0;
             ocoGroupId = null;
             forceFlatInProgress = false;
-            cancelRequested = false;          // v1.4.2
-            bricksInCurrentState = 0;         // v1.4.2
+            cancelRequested = false;             // v1.4.2
+            bricksInCurrentState = 0;            // v1.4.2
+            currentWorkingOrderType = OrderEntryType.Limit;  // v1.4.3
+            marketSubmitWallClock = DateTime.MinValue;       // v1.4.3
+            marketTimeoutLogged = false;                     // v1.4.3
+            // NOTE: lastDesyncLogTime is NOT reset (throttle persists across states)
+            // NOTE: consecutiveLosses and safetyBrakeTripped are NOT reset (persistent)
         }
 
         // =====================================================================
@@ -1156,7 +1437,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.4.2");
+                        sw.WriteLine("# schema_version=1.4.3");
                         sw.WriteLine(string.Format("# file_created_NY={0}",
                             TimeZoneInfo.ConvertTime(DateTime.Now, nyTz).ToString("yyyy-MM-dd HH:mm:ss")));
                         sw.WriteLine(string.Format("# file_created_UTC={0}",
@@ -1242,7 +1523,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.4.2");
+                        sw.WriteLine("# schema_version=1.4.3");
                         sw.WriteLine(string.Format("# instrument={0}", Instrument.FullName));
                         sw.WriteLine(string.Format("# brick_size_ticks={0}", BarsPeriod.Value));
                         sw.WriteLine(string.Format("# tick_size={0}", TickSize));
@@ -1294,7 +1575,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.4.2");
+                        sw.WriteLine("# schema_version=1.4.3");
                         sw.WriteLine(string.Format("# instrument={0}", Instrument.FullName));
                         sw.WriteLine(string.Format("# brick_size_ticks={0}", BarsPeriod.Value));
                         sw.WriteLine(string.Format("# tick_size={0}", TickSize));
@@ -1307,11 +1588,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                         sw.WriteLine("#");
                         sw.WriteLine("# Event types:");
                         sw.WriteLine("#   SUBMIT_MARKET / SUBMIT_LIMIT   - entry order submitted");
-                        sw.WriteLine("#   FILLED_BRACKET_ATTACH          - entry filled, OCO bracket submitted");
+                        sw.WriteLine("#   FILLED_BRACKET_ATTACH          - entry filled, server-side bracket active");
                         sw.WriteLine("#   EXIT_STOP / EXIT_TARGET        - bracket leg filled");
-                        sw.WriteLine("#   CANCEL_UNFILLED                - entry cancelled because too many bricks elapsed");
+                        sw.WriteLine("#   CANCEL_UNFILLED                - LIMIT entry cancelled (too many bricks elapsed)");
                         sw.WriteLine("#   CANCEL_WORKEND                 - entry cancelled because work-end reached");
                         sw.WriteLine("#   FORCEFLAT_WORKEND              - position force-flatted at work-end");
+                        sw.WriteLine("#   FORCEFLAT_WORKEND_GHOST        - v1.4.3: ghost position flatted at work-end");
+                        sw.WriteLine("#   FORCE_RESET_STUCK              - LIMIT grace expired, callback never arrived");
+                        sw.WriteLine("#   DESYNC_FORCE_FLAT              - v1.4.3: orderState=Idle but broker has position");
+                        sw.WriteLine("#   DESYNC_RESET_IDLE              - v1.4.3: orderState=Working/Position but broker Flat");
+                        sw.WriteLine("#   MARKET_HEARTBEAT_WARN          - v1.4.3: market order no fill confirm after 30s");
+                        sw.WriteLine("#   SAFETY_BRAKE_TRIPPED           - v1.4.3: consecutive losses limit reached");
                         sw.WriteLine("#   REJECTED                       - entry order rejected");
                         sw.WriteLine("#");
                         sw.WriteLine("EventTime_NY,EventType,EntryOrderNumber,OrderTypeStr,Price,StopPrice,TargetPrice,OrderState,Extra");
@@ -1440,81 +1727,88 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Range(1, 100)]
-        [Display(Name="OrderQuantity",
-            Description="Contracts per order. Default 1.",
+        [Display(Name="Order quantity (CONTRACTS)",
+            Description="Number of contracts per entry. Default 1.",
             Order=2, GroupName="8. Order Execution")]
         public int OrderQuantity { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name="OrderType",
-            Description="Limit (buy below close by LimitUnderPoints) or Market (immediate, may slip).",
+        [Display(Name="Order type (Market or Limit)",
+            Description="Limit = buy LimitUnderPoints below close. Market = immediate fill at market price (may slip).",
             Order=3, GroupName="8. Order Execution")]
         public OrderEntryType OrderType { get; set; }
 
         [NinjaScriptProperty]
         [Range(0.0, 100.0)]
-        [Display(Name="LimitUnderPoints",
-            Description="(Limit only) Submit limit buy at (close - this many points). Default 5.0. Ignored for Market orders.",
+        [Display(Name="Limit offset under close (POINTS)",
+            Description="(LIMIT only) Submit limit buy at (brick close - this many points). Default 5.0. Ignored if Market.",
             Order=4, GroupName="8. Order Execution")]
         public double LimitUnderPoints { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 20)]
-        [Display(Name="UnfilledCancelBricks",
-            Description="(Limit only) Cancel limit order if not filled after this many brick closes. Default 1. Ignored for Market.",
+        [Display(Name="Limit unfilled cancel after N (BRICKS)",
+            Description="(LIMIT only) Cancel limit if not filled after this many brick closes. Default 1. Market orders never cancelled.",
             Order=5, GroupName="8. Order Execution")]
         public int UnfilledCancelBricks { get; set; }
 
         [NinjaScriptProperty]
         [Range(0.1, 50.0)]
-        [Display(Name="StopLossBricks",
-            Description="Stop-loss distance from fill, in BRICKS (decimal allowed, e.g. 1.5). 1 brick price = BarsPeriod.Value * TickSize. Default 1.0.",
+        [Display(Name="Stop loss distance (BRICKS, decimal OK)",
+            Description="Stop-loss distance from fill, in BRICKS (e.g. 1.5 = 1.5 x brick size in price). Default 1.0. 1 brick = BarsPeriod.Value * TickSize. Server-side via SetStopLoss.",
             Order=6, GroupName="8. Order Execution")]
         public double StopLossBricks { get; set; }
 
         [NinjaScriptProperty]
         [Range(0.1, 50.0)]
-        [Display(Name="ProfitTargetBricks",
-            Description="Profit-target distance from fill, in BRICKS (decimal allowed, e.g. 2.5). Default 1.0.",
+        [Display(Name="Profit target distance (BRICKS, decimal OK)",
+            Description="Profit-target distance from fill, in BRICKS (e.g. 2.0). Default 1.0. Server-side via SetProfitTarget.",
             Order=7, GroupName="8. Order Execution")]
         public double ProfitTargetBricks { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name="EnableOrderHours",
+        [Range(1, 100)]
+        [Display(Name="Max consecutive losses before halt (99 = OFF)",
+            Description="Halt new orders after this many losing trades in a row. Default 99 (effectively off). Set to 5 for live trading. Disable+re-enable strategy to reset.",
+            Order=8, GroupName="8. Order Execution")]
+        public int MaxConsecutiveLosses { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Enable Order Hours filter",
             Description="If true, restrict order placement to the NY time window below. Alerts still fire 24h.",
             Order=1, GroupName="9. Order Hours (NY) & Expiry")]
         public bool EnableOrderHours { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 23)]
-        [Display(Name="OrderStartHourNY",
-            Description="Order window start hour (NY, 0-23). Default 9.",
+        [Display(Name="Order start HOUR (NY, 0-23)",
+            Description="Order window start hour, NY time. Default 9.",
             Order=2, GroupName="9. Order Hours (NY) & Expiry")]
         public int OrderStartHourNY { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 59)]
-        [Display(Name="OrderStartMinuteNY",
-            Description="Order window start minute (NY, 0-59). Default 30.",
+        [Display(Name="Order start MINUTE (NY, 0-59)",
+            Description="Order window start minute, NY time. Default 30.",
             Order=3, GroupName="9. Order Hours (NY) & Expiry")]
         public int OrderStartMinuteNY { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 23)]
-        [Display(Name="OrderEndHourNY",
-            Description="Order window end hour (NY, 0-23). Default 15.",
+        [Display(Name="Order end HOUR (NY, 0-23)",
+            Description="Order window end hour, NY time. Default 15.",
             Order=4, GroupName="9. Order Hours (NY) & Expiry")]
         public int OrderEndHourNY { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 59)]
-        [Display(Name="OrderEndMinuteNY",
-            Description="Order window end minute (NY, 0-59). Default 55. At/after this time, position force-flat, working orders cancelled.",
+        [Display(Name="Order end MINUTE (NY, 0-59)",
+            Description="Order window end minute, NY time. Default 55. At/after this time: position force-flat at market, working orders cancelled.",
             Order=5, GroupName="9. Order Hours (NY) & Expiry")]
         public int OrderEndMinuteNY { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name="GoodTilDate",
+        [Display(Name="Good til DATE (NY)",
             Description="Last NY date orders may be placed. After this date, no new orders (alerts continue).",
             Order=6, GroupName="9. Order Hours (NY) & Expiry")]
         public DateTime GoodTilDate { get; set; }
