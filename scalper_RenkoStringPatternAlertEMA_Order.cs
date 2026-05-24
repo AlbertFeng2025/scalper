@@ -19,181 +19,99 @@ using NinjaTrader.NinjaScript.DrawingTools;
 
 
 // =============================================================================
-// STRATEGY: scalper_RenkoStringPatternAlertEMA v1.4.3
+// STRATEGY: scalper_RenkoStringPatternAlertEMA_Order v1.4.4
 // AUTHOR:   Albert Feng / Drafted with help from Claude
-// REPLACES: v1.4.2
+// REPLACES: v1.4.3
 // =============================================================================
+//
+// v1.4.4 CHANGES vs v1.4.3 (alert subsystem only — order subsystem untouched)
+// --------------------------------------------------------------------------
+//
+// Ports the v1.3.3 alert-pattern-list feature from the alert-only strategy.
+//
+// CHANGE 1 - AlertPattern accepts a COMMA-SEPARATED LIST of patterns
+//   Old: AlertPattern was a single string, e.g. "01"
+//   New: AlertPattern is a comma-separated list, e.g. "01, 011, 0111"
+//        Whitespace around commas is trimmed. Each entry must be 1-10 chars
+//        of '0' or '1'. Empty entries (e.g. from stray commas like "01,,011")
+//        are skipped silently. Duplicates are deduplicated with a Print
+//        warning. If the entire list is empty or all entries invalid, the
+//        strategy refuses to start (existing behavior).
+//
+//   Backward compatible: a single pattern like "01" still works exactly the
+//   same as v1.4.3.
+//
+// CHANGE 2 - Alert firing rule: ONE alert per brick close (boolean OR)
+//   On every EMA-qualified outcome bit appended to tradedOutcomeString,
+//   each pattern in the list is suffix-matched against the tail. If ANY
+//   matches, ONE alert fires for that brick close (sound, diamond,
+//   CSV row, counter +1). Multiple simultaneous matches collapse to one.
+//
+//   The order subsystem reads isAlerted = "any pattern matches tail". This
+//   is recomputed after every EMA-qualified outcome append, exactly as
+//   v1.4.3 recomputed it for a single pattern.
+//
+// CHANGE 3 - Suffix-overlap warning at startup
+//   For every pair (a, b) in the list where len(a) < len(b), if
+//   b.EndsWith(a), prints a [VALIDATE] WARN to Output window AND writes
+//   a warning to NinjaTrader's Log tab. Strategy still runs.
+//
+// CHANGE 4 - CSV columns UNCHANGED
+//   AlertPattern column logs the FULL LIST as entered by the user (e.g.
+//   "01, 011, 0111"). Values containing commas are wrapped in double
+//   quotes so the CSV stays parseable. New `# AlertPatternParsed=[...]`
+//   header line added to the occurrence CSV.
+//
+// CHANGE 5 - Schema version bumped to 1.4.4 in CSV headers
+//   File names (scalper_RenkoStringPatternAlertEMA_Order_*.csv) UNCHANGED.
+//   The orders CSV file path was never versioned in v1.4.x so no naming
+//   collision concern. The occurrence and alert CSV file paths likewise
+//   keep the v1.4.x name.
+//
+// CHANGE 6 - Description text updated on AlertPattern parameter
+//
+// CHANGE 7 - ORDER SUBSYSTEM IS UNCHANGED
+//   No changes to TryEnterOrder, gates, SetStopLoss/SetProfitTarget,
+//   OnOrderUpdate, OnExecutionUpdate, OnConnectionStatusUpdate,
+//   CheckPositionSync, ResetOrderSubsystemToIdle, work-end logic,
+//   safety brake, or any order-related fields/methods.
+//
+//   The order subsystem reads isAlerted (a boolean) and acts on the next
+//   EMA-qualified pattern occurrence. With a multi-pattern list, isAlerted
+//   can stay true across several consecutive bricks (e.g. "01, 011, 0111"
+//   on stream "0111" fires alerts on each of bricks 2, 3, 4 and keeps
+//   isAlerted=true throughout). The order subsystem will still fire AT
+//   MOST ONE entry per qualifying pattern occurrence, gated by
+//   orderState == Idle, so successive orders fire only after the previous
+//   one has fully resolved (entry fill + bracket exit + reset to Idle).
+//
+// =============================================================================
+//
+// (v1.4.3 changes documented in prior version retained below for history.)
 //
 // v1.4.3 CHANGES vs v1.4.2 (architectural)
-// ----------------------------------------
-// Philosophy shift: the broker's Position.MarketPosition is the SOURCE OF
-// TRUTH. Our orderState enum tracks intent. When they diverge (which 5/21
-// playback showed can happen), broker wins and we reconcile by force-flat.
-//
-// Three stacked safety layers:
-//   Layer 1: our work-end logic at OrderEndHourNY (e.g. 15:55 NY)
-//   Layer 2: NinjaTrader session close (IsExitOnSessionCloseStrategy=true)
-//   Layer 3: broker server-side bracket (SetStopLoss / SetProfitTarget)
-//
-// Specific fixes:
-//   1) SetStopLoss / SetProfitTarget for atomic, server-side bracket.
-//      Replaces manual ExitLongStopMarket + ExitLongLimit on fill. Removes
-//      the race window between fill and bracket-attach. Bracket parameters
-//      are on the order ticket so the broker holds them even if our local
-//      code is offline.
-//   2) Market orders are NEVER cancelled. Their timeout becomes a wall-clock
-//      heartbeat that logs CRITICAL if no fill confirmation arrives in 30s,
-//      but never tries CancelOrder (which would race with the broker fill).
-//   3) Defensive position-sync check at the TOP of every OnBarUpdate. If
-//      orderState=Idle but Position!=Flat, force-flatten via market exit.
-//      If orderState=Working/Position but Position=Flat, reset to Idle.
-//   4) Force-reset paths now verify Position==Flat before declaring Idle.
-//   5) IsExitOnSessionCloseStrategy = true (was false in v1.4.2).
-//   6) New parameter MaxConsecutiveLosses (default 99 = effectively off).
-//      Set to 5 for live trading. Halts new orders after N losses in a row;
-//      manual reset required (disable + re-enable strategy).
-//   7) OnConnectionStatusUpdate plays Alert2.wav on broker disconnect.
-//   8) Display Names enhanced with UPPERCASE unit hints (BRICKS / POINTS).
-//   9) Startup INIT log includes a dollar-value sizing summary so the user
-//      sees exact $/trade exposure on enable.
-//
-// =============================================================================
+//   - Philosophy shift: broker's Position.MarketPosition is the SOURCE OF TRUTH.
+//   - Three stacked safety layers (work-end, NT session close, server-side bracket).
+//   - SetStopLoss / SetProfitTarget for atomic server-side bracket.
+//   - Market orders never cancelled; wall-clock heartbeat only.
+//   - Defensive position-sync check at top of every OnBarUpdate.
+//   - IsExitOnSessionCloseStrategy = true.
+//   - MaxConsecutiveLosses safety brake.
+//   - OnConnectionStatusUpdate audible alarm on broker disconnect.
 //
 // v1.4.2 CHANGES vs v1.4.1
-// ------------------------
-// BUG FIX: state machine could get stuck in Working state if a CancelOrder
-// request did not trigger an OnOrderUpdate callback with terminal state
-// Cancelled. This caused the same cancel to fire on every subsequent brick
-// close, producing thousands of duplicate CANCEL_UNFILLED CSV rows and
-// (worse) blocking all future order activity.
-//
-// Five defensive changes:
-//   1) cancelRequested flag - only issue CancelOrder once per stuck order
-//   2) Grace-period force-reset - if Working state persists for
-//      UnfilledCancelBricks + 2 bricks without the callback resetting us
-//      to Idle, force-reset ourselves
-//   3) Heartbeat log - every 10 bricks while not Idle, print state status
-//   4) Clearer state-transition logging
-//   5) Reset also on OrderState.Rejected (was only on Cancelled)
-//
-// No behavioral changes beyond bug fixes. EnableOrders=false still
-// reproduces v1.3.2.
-//
-// =============================================================================
+//   - Bug fix: state machine could get stuck in Working state if Cancel
+//     callback never arrived. Added cancelRequested guard, grace-period
+//     force-reset, heartbeat log, reset on Rejected too.
 //
 // v1.4.1 CHANGES vs v1.4.0
-// ------------------------
-// 1) Five order-event sounds added (uses NinjaTrader default .wav files):
-//      - Entry filled         -> Alert4.wav        (neutral)
-//      - Profit target hit    -> Boxing Bell.wav   (cheerful)
-//      - Stop loss hit        -> Glass Break.wav   (negative)
-//      - Order cancel/unfill  -> Alert3.wav        (notice)
-//      - Force-flat workend   -> Alert2.wav        (warning)
-//    Alert sound (Alert1.wav) unchanged.
-//
-// 2) StopLossBricks and ProfitTargetBricks changed from int to double.
-//    Range 0.1 to 50.0, default 1.0. Allows fine tuning like 1.5 bricks
-//    (= 30pt on MNQ standard Renko with brick=80 ticks). Final price is
-//    still rounded to TickSize via RoundToTickSize.
-//
-// 3) CSV filenames fixed - v1.4.0 collided all three log types into one
-//    file with no extension. Now three distinct .csv files:
-//      scalper_RenkoStringPatternAlertEMA_Order_occ.csv
-//      scalper_RenkoStringPatternAlertEMA_Order_alert.csv
-//      scalper_RenkoStringPatternAlertEMA_Order_orders.csv
-//    If you have data in the old combined file, rename or delete it first.
-//
-// =============================================================================
+//   - Five order-event sounds added.
+//   - Stop/Target bricks changed from int to double.
+//   - CSV filenames de-collided.
 //
 // v1.4.0 CHANGES vs v1.3.2
-// ------------------------
-// The entire alert subsystem from v1.3.2 is preserved verbatim. v1.4.0 adds
-// an independent ORDER SUBSYSTEM that layers on top.
-//
-// ARCHITECTURE
-// ------------
-// Two independent subsystems share one signal (the alert):
-//
-// 1) ALERT SUBSYSTEM (unchanged from v1.3.2 except one new flag):
-//      - Detects patterns, builds OutcomeString and TradedOutcomeString.
-//      - Fires alerts: beep + diamond + CSV row.
-//      - Runs 24h, ignores work hours, ignores EnableOrders.
-//      - Stops only if the entire strategy is disabled in NinjaTrader.
-//
-//      NEW in v1.4: maintains a boolean `isAlerted` that reflects whether
-//      the current tail of TradedOutcomeString equals AlertPattern. This is
-//      a STATE, not an event. Recomputed every time a new EMA-qualified
-//      outcome appends.
-//
-//      Example: AlertPattern = "01", stream = 010001001111
-//        bit | TradedOutcomeString | tail=="01"? | isAlerted
-//         0  | 0                   | no          | false
-//         1  | 01                  | YES         | true   <- order chance #1
-//         0  | 010                 | no          | false
-//         0  | 0100                | no          | false
-//         0  | 01000               | no          | false
-//         1  | 010001              | YES         | true   <- order chance #2
-//         0  | 0100010             | no          | false
-//         0  | 01000100            | no          | false
-//         1  | 010001001           | YES         | true   <- order chance #3
-//         1  | 0100010011          | no          | false
-//         1  | 01000100111         | no          | false
-//         1  | 010001001111        | no          | false
-//
-// 2) ORDER SUBSYSTEM (NEW, gated by EnableOrders):
-//      Trigger: a new EMA-qualified pattern is detected (same condition the
-//      v1.3.2 code already computes: PatternToMatch matches AND
-//      Open[0] > EMA1 AND Open[0] > EMA2).
-//
-//      Gates (ALL must be true at the pattern's last brick close):
-//        a. EnableOrders = true
-//        b. Current NY time is inside [OrderStart, OrderEnd]
-//        c. Today's NY date <= GoodTilDate
-//        d. isAlerted == true                  (alert subsystem says "go")
-//        e. orderState == Idle                 (no working order, no position)
-//        f. Position.MarketPosition == Flat    (no strategy-owned position)
-//        g. No external/manual position on this instrument in the account
-//
-//      If all gates pass:
-//        - MARKET: submit Market Buy, attach OCO stop+target on fill.
-//        - LIMIT:  submit Limit Buy at Close - LimitUnderPoints.
-//                  Wait UnfilledCancelBricks bricks. Filled -> bracket.
-//                  Not filled -> cancel, back to Idle.
-//
-//      Stop / Target are measured in BRICKS, where 1 brick in price =
-//      BarsPeriod.Value * TickSize.  Examples:
-//        - MNQ standard Renko brick = 80 ticks, TickSize = 0.25 -> 1 brick = 20 pt
-//        - Default StopBricks=1, TargetBricks=1 -> stop=-20pt, target=+20pt (MNQ)
-//
-//      Stop / Target are computed from the ACTUAL FILL price (not the limit
-//      price), so slippage on a market order is accounted for.
-//
-//      Work-end behavior (when current NY time crosses OrderEnd):
-//        - ORDER_WORKING -> cancel working entry, back to Idle.
-//        - POSITION_OPEN -> cancel OCO bracket, market exit, back to Idle.
-//        - Strategy keeps running; alerts continue; CSV continues.
-//
-//      GoodTilDate behavior (when NY date passes GoodTilDate):
-//        - Order subsystem stops arming.
-//        - Alert subsystem continues normally.
-//        - To fully disable, the user disables the entire strategy in NT.
-//
-// BACKWARD COMPATIBILITY
-// ----------------------
-// With EnableOrders = false (default), v1.4.0 behaves IDENTICALLY to v1.3.2.
-// All CSV files, beep cadence, chart markers, and pattern logic are preserved.
-//
-// LONG-ONLY
-// ---------
-// v1.4.0 is long-only. The EMA filter (Open > EMA1 AND Open > EMA2) is a
-// bull-trend filter, so only buy orders are submitted. A symmetric short
-// side is a future enhancement.
-//
-// CSV FILES
-// ---------
-// _v140_occ.csv     - per-occurrence rows (unchanged from v1.3.2 schema)
-// _v140_alert.csv   - per-alert rows (unchanged schema)
-// _v140_orders.csv  - NEW: per-order-event rows for full order audit trail
+//   - Added order subsystem (entry + OCO bracket + work-end + GoodTilDate)
+//     gated by EnableOrders. With EnableOrders=false, behaves like v1.3.2.
 //
 // =============================================================================
 
@@ -212,9 +130,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private enum OrderSubState
         {
-            Idle,           // no working order, no position; ready to act on next EMA pattern if alerted
-            Working,        // entry order submitted, waiting for fill
-            Position        // entry filled, OCO bracket attached, waiting for stop or target
+            Idle,
+            Working,
+            Position
         }
 
         #region Variables
@@ -228,14 +146,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private StringBuilder postAlertOutcomeString = new StringBuilder();
         private int pendingPostAlertCaptures = 0;
 
-        // ---- NEW v1.4: alert status flag read by the order subsystem ----
+        // ---- Alert status flag read by the order subsystem (recomputed after every EMA-qualified append) ----
         private bool isAlerted = false;
 
-        // ---- Daily numbering for CSV correlation ----
+        // ---- Daily numbering ----
         private int dailyOccurrenceNumber = 0;
         private int dailyTradedOccurrenceNumber = 0;
         private int dailyAlertNumber = 0;
-        private int dailyOrderNumber = 0;        // NEW v1.4: counts order submissions
+        private int dailyOrderNumber = 0;
 
         // ---- Beep cadence ----
         private DateTime lastBeepWallClock;
@@ -250,7 +168,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ---- Compiled patterns ----
         private int[] compiledPattern  = null;
         private int[] compiledFollowUp = null;
-        private string compiledAlertPattern = null;
+
+        // [v1.4.4] AlertPattern is now a LIST of patterns. Stored as List<string>
+        // (each entry is the raw "01"/"011"/etc. string used for tail compare).
+        private List<string> compiledAlertPatterns = null;
+
         private bool configValid = false;
 
         // ---- EMA indicator references ----
@@ -279,48 +201,36 @@ namespace NinjaTrader.NinjaScript.Strategies
         private List<PendingOccurrence> pendingOccurrences = new List<PendingOccurrence>();
 
         // =====================================================================
-        // NEW v1.4: ORDER SUBSYSTEM state
+        // ORDER SUBSYSTEM state (unchanged from v1.4.3)
         // =====================================================================
         private OrderSubState orderState = OrderSubState.Idle;
 
-        // Working entry order tracking
         private Order workingEntryOrder = null;
         private int   bricksSinceEntrySubmit = 0;
         private int   entrySubmitBarIdx = -1;
-        private double entryReferencePrice = 0.0;  // close of pattern brick that triggered entry
-        private double entryLimitPrice = 0.0;      // submitted limit price (for Limit type)
-        private int   entryOrderNumber = 0;        // dailyOrderNumber assigned to this entry
+        private double entryReferencePrice = 0.0;
+        private double entryLimitPrice = 0.0;
+        private int   entryOrderNumber = 0;
 
-        // NEW v1.4.2: guard so we only request cancel once per stuck order
         private bool cancelRequested = false;
-        // NEW v1.4.2: heartbeat counter - how many bricks since last state change
         private int  bricksInCurrentState = 0;
 
-        // NEW v1.4.3: track which order type the current Working order is
         private OrderEntryType currentWorkingOrderType = OrderEntryType.Limit;
-        // NEW v1.4.3: wall-clock time when market order was submitted (for heartbeat check)
         private DateTime marketSubmitWallClock = DateTime.MinValue;
         private bool marketTimeoutLogged = false;
-        // NEW v1.4.3: consecutive-loss tracking for safety brake
         private int consecutiveLosses = 0;
         private bool safetyBrakeTripped = false;
-        // NEW v1.4.3: remember last entry order # for desync logging
         private int lastEntryOrderNumber = 0;
-        // NEW v1.4.3: track whether we've recently logged a desync to avoid log spam
         private DateTime lastDesyncLogTime = DateTime.MinValue;
 
-        // OCO bracket order tracking
         private Order stopLossOrder = null;
         private Order profitTargetOrder = null;
         private double actualFillPrice = 0.0;
         private double computedStopPrice = 0.0;
         private double computedTargetPrice = 0.0;
 
-        // OCO group id - used to link stop and target as one-cancels-other
         private string ocoGroupId = null;
 
-        // Flag set when we are mid force-flat at work-end to suppress normal
-        // re-arming and gate routing while we wait for the exits to land.
         private bool forceFlatInProgress = false;
 
         #endregion
@@ -332,13 +242,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Description = "Renko string-pattern alerter+order (v1.4.3). Broker is source of truth: defensive desync detection, server-side bracket via SetStopLoss/SetProfitTarget, market orders never cancelled, MaxConsecutiveLosses safety brake. Long-only. EnableOrders=false reproduces v1.3.2 exactly.";
+                Description = "Renko string-pattern alerter+order (v1.4.4). Alert subsystem now accepts a comma-separated AlertPattern list (e.g. '01, 011, 0111'); one alert fires per brick close if ANY listed pattern matches. Order subsystem unchanged from v1.4.3: broker is source of truth, server-side bracket, safety brake. Long-only. EnableOrders=false reproduces alert-only behavior.";
                 Name        = "scalper_RenkoStringPatternAlertEMA_Order";
                 Calculate   = Calculate.OnBarClose;
 
                 EntriesPerDirection                       = 1;
                 EntryHandling                             = EntryHandling.AllEntries;
-                IsExitOnSessionCloseStrategy              = true;  // v1.4.3: Layer 2 safety net - NT auto-flat at session close
+                IsExitOnSessionCloseStrategy              = true;
                 BarsRequiredToTrade                       = 20;
                 IsInstantiatedOnEachOptimizationIteration = true;
 
@@ -346,8 +256,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 PatternToMatch   = "011";
                 FollowUpPattern  = "1";
 
-                // ---- AlertPattern ----
-                AlertPattern     = "01";
+                // ---- [v1.4.4] AlertPattern now accepts a comma-separated list ----
+                AlertPattern     = "01,011,011";
 
                 // ---- EMA filter ----
                 EMA1Period       = 20;
@@ -367,18 +277,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // ---- Memory cap ----
                 MaxBitsKept = 5000;
 
-                // ---- NEW v1.4: Order Execution defaults ----
-                EnableOrders         = false;          // master switch: OFF by default = behaves like v1.3.2
+                // ---- Order Execution defaults ----
+                EnableOrders         = false;
                 OrderQuantity        = 1;
                 OrderType            = OrderEntryType.Limit;
                 LimitUnderPoints     = 5.0;
                 UnfilledCancelBricks = 1;
                 StopLossBricks       = 1.0;
                 ProfitTargetBricks   = 1.0;
-                MaxConsecutiveLosses = 99;             // v1.4.3: default = effectively off; set to 5 for live
+                MaxConsecutiveLosses = 99;
 
-                // ---- NEW v1.4: Working Hours & Expiry defaults ----
-                EnableOrderHours     = false;          // when false, order hours gate is bypassed (still need EnableOrders)
+                // ---- Working Hours & Expiry defaults ----
+                EnableOrderHours     = false;
                 OrderStartHourNY     = 9;
                 OrderStartMinuteNY   = 30;
                 OrderEndHourNY       = 15;
@@ -405,7 +315,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Realtime)
             {
                 Print("================================================================");
-                Print(string.Format("[INIT] scalper_RenkoStringPatternAlertEMA v1.4.3 at {0}",
+                Print(string.Format("[INIT] scalper_RenkoStringPatternAlertEMA_Order v1.4.4 at {0}",
                     DateTime.Now.ToString("HH:mm:ss.fff")));
 
                 Print(string.Format("[INIT] BarsPeriod.BarsPeriodType = {0}", BarsPeriod.BarsPeriodType));
@@ -427,17 +337,26 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 Print(string.Format("[INIT] PatternToMatch  = \"{0}\" (length {1})", PatternToMatch, compiledPattern.Length));
                 Print(string.Format("[INIT] FollowUpPattern = \"{0}\" (length {1})", FollowUpPattern, compiledFollowUp.Length));
-                Print(string.Format("[INIT] AlertPattern    = \"{0}\" (length {1})", compiledAlertPattern, compiledAlertPattern.Length));
+
+                // [v1.4.4] Log the parsed alert pattern list
+                Print(string.Format("[INIT] AlertPattern (raw input) = \"{0}\"", AlertPattern));
+                Print(string.Format("[INIT] AlertPattern (parsed list, {0} pattern(s)): [{1}]",
+                    compiledAlertPatterns.Count, string.Join(", ", compiledAlertPatterns)));
+
+                // [v1.4.4] Run suffix-overlap validation
+                CheckForSuffixOverlaps();
+
                 Print("[INIT] Bit encoding: SUCCESS=1, FAILURE=0.");
-                Print("[INIT] AlertPattern is suffix-matched against OutcomeString_EmaQualified.");
+                Print("[INIT] Each pattern in AlertPattern list is suffix-matched against OutcomeString_EmaQualified.");
+                Print("[INIT] Rule: at each EMA-qualified brick close, if ANY pattern matches the tail, fire ONE alert.");
                 Print(string.Format("[INIT] EMA1 period = {0}, EMA2 period = {1}", EMA1Period, EMA2Period));
                 Print("[INIT] EMA filter: trade only when Open[0] > EMA1 AND Open[0] > EMA2.");
                 Print(string.Format("[INIT] Daily reset: 9:30 AM NY (DST-safe)"));
                 Print(string.Format("[INIT] Beep: {0} beeps, {1}s apart", AlertSoundCount, AlertReminderSecs));
                 Print(string.Format("[INIT] CSV path: {0}", AuditLogPath));
 
-                // ---- NEW v1.4.3: order subsystem init log with sizing summary ----
-                Print("[INIT] ----- ORDER SUBSYSTEM v1.4.3 -----");
+                // ---- Order subsystem init log with sizing summary (unchanged from v1.4.3) ----
+                Print("[INIT] ----- ORDER SUBSYSTEM v1.4.3 (unchanged in v1.4.4) -----");
                 Print(string.Format("[INIT] EnableOrders        = {0}", EnableOrders));
                 if (EnableOrders)
                 {
@@ -446,7 +365,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Print(string.Format("[INIT] LimitUnderPoints    = {0:F2} pt (ignored if Market)", LimitUnderPoints));
                     Print(string.Format("[INIT] UnfilledCancelBricks= {0} (LIMIT only - market orders never cancelled)", UnfilledCancelBricks));
 
-                    // === SIZING SUMMARY ===
                     double brickTicks = BarsPeriod.Value;
                     double brickPoints = brickTicks * TickSize;
                     double stopTicks = StopLossBricks * brickTicks;
@@ -454,7 +372,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     double targetTicks = ProfitTargetBricks * brickTicks;
                     double targetPoints = targetTicks * TickSize;
 
-                    // Best-effort point value lookup (MNQ = $2/pt, MES = $5/pt, etc.)
                     double pointValue = 0.0;
                     try { pointValue = Instrument.MasterInstrument.PointValue; }
                     catch { pointValue = 0.0; }
@@ -504,26 +421,110 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 else
                 {
-                    Print("[INIT] (orders disabled - strategy will only generate alerts, identical to v1.3.2)");
+                    Print("[INIT] (orders disabled - strategy will only generate alerts)");
                 }
                 Print("[INIT] ---------------------------------");
             }
         }
 
         // =====================================================================
-        // TryCompilePatterns
+        // [v1.4.4] TryCompilePatterns - parses comma-separated AlertPattern
         // =====================================================================
         private bool TryCompilePatterns()
         {
             compiledPattern  = TryCompileOne(PatternToMatch,  "PatternToMatch");
             compiledFollowUp = TryCompileOne(FollowUpPattern, "FollowUpPattern");
 
-            int[] alertBits = TryCompileOne(AlertPattern, "AlertPattern");
-            compiledAlertPattern = (alertBits != null) ? AlertPattern : null;
+            compiledAlertPatterns = ParseAlertPatternList(AlertPattern);
 
             return compiledPattern != null
                 && compiledFollowUp != null
-                && compiledAlertPattern != null;
+                && compiledAlertPatterns != null
+                && compiledAlertPatterns.Count > 0;
+        }
+
+        // [v1.4.4] Parse comma-separated AlertPattern input into a list of valid patterns.
+        // (Identical to v1.3.3's ParseAlertPatternList.)
+        private List<string> ParseAlertPatternList(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                Print("[VALIDATE] *** AlertPattern is empty. Must contain at least one pattern (1-10 chars of '0' or '1'). ***");
+                return null;
+            }
+
+            var result = new List<string>();
+            var rawParts = raw.Split(',');
+            foreach (var rawPart in rawParts)
+            {
+                string p = rawPart.Trim();
+                if (p.Length == 0) continue;
+                if (p.Length > 10)
+                {
+                    Print(string.Format("[VALIDATE] *** AlertPattern entry \"{0}\" is {1} chars; max allowed is 10. Skipping. ***",
+                        p, p.Length));
+                    continue;
+                }
+
+                bool ok = true;
+                for (int i = 0; i < p.Length; i++)
+                {
+                    if (p[i] != '0' && p[i] != '1')
+                    {
+                        Print(string.Format("[VALIDATE] *** AlertPattern entry \"{0}\" contains invalid char '{1}' at position {2}. Only '0' and '1' allowed. Skipping. ***",
+                            p, p[i], i));
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok) continue;
+
+                if (result.Contains(p))
+                {
+                    Print(string.Format("[VALIDATE] WARN: duplicate AlertPattern entry \"{0}\" — keeping only first occurrence.", p));
+                    continue;
+                }
+
+                result.Add(p);
+            }
+
+            if (result.Count == 0)
+            {
+                Print("[VALIDATE] *** AlertPattern list produced 0 valid entries after parsing. Strategy cannot start. ***");
+                return null;
+            }
+
+            return result;
+        }
+
+        // [v1.4.4] Warn user if any pattern is a suffix of another.
+        private void CheckForSuffixOverlaps()
+        {
+            if (compiledAlertPatterns == null || compiledAlertPatterns.Count < 2) return;
+
+            int warnCount = 0;
+            for (int i = 0; i < compiledAlertPatterns.Count; i++)
+            {
+                for (int j = 0; j < compiledAlertPatterns.Count; j++)
+                {
+                    if (i == j) continue;
+                    string a = compiledAlertPatterns[i];
+                    string b = compiledAlertPatterns[j];
+                    if (a.Length < b.Length && b.EndsWith(a))
+                    {
+                        string msg = string.Format(
+                            "AlertPattern overlap: \"{0}\" is a suffix of \"{1}\". Both will match the same brick when the tail ends in \"{1}\", but only ONE alert fires per brick (no extra information). Consider removing \"{0}\" if you don't need it.",
+                            a, b);
+                        Print(string.Format("[VALIDATE] WARN: {0}", msg));
+                        try { Log(msg, LogLevel.Warning); } catch { }
+                        warnCount++;
+                    }
+                }
+            }
+            if (warnCount == 0)
+                Print("[VALIDATE] AlertPattern list: no suffix overlaps detected.");
+            else
+                Print(string.Format("[VALIDATE] AlertPattern list: {0} suffix-overlap warning(s) above. Strategy will still run.", warnCount));
         }
 
         private int[] TryCompileOne(string s, string fieldName)
@@ -557,16 +558,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // =====================================================================
         // OnBarUpdate - one call per closed Renko brick
+        // (Order-subsystem logic UNCHANGED from v1.4.3.)
         // =====================================================================
         protected override void OnBarUpdate()
         {
             if (CurrentBar < 1) return;
             if (!configValid) return;
 
-            // =================================================================
-            // NEW v1.4.3: DEFENSIVE POSITION-SYNC CHECK
-            // Run before everything else. Broker is the source of truth.
-            // =================================================================
+            // DEFENSIVE POSITION-SYNC CHECK (v1.4.3)
             if (EnableOrders)
                 CheckPositionSync();
 
@@ -614,18 +613,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             int currentBrickIdx = bricks.Count - 1;
             double currentPrice = Close[0];
 
-            // =================================================================
-            // ORDER SUBSYSTEM: Working-state handling
-            // v1.4.3: branches by order type. LIMIT uses brick timeout +
-            // CancelOrder. MARKET uses wall-clock heartbeat only, NEVER cancels.
-            // =================================================================
+            // ---- Working-state handling (UNCHANGED from v1.4.3) ----
             if (orderState == OrderSubState.Working && workingEntryOrder != null)
             {
                 bricksSinceEntrySubmit++;
 
                 if (currentWorkingOrderType == OrderEntryType.Limit)
                 {
-                    // ---- LIMIT branch: brick-counted timeout + cancel ----
                     Print(string.Format("[ORDER] Working LIMIT brick tick: {0} of {1} (entry order #{2}, cancelRequested={3})",
                         bricksSinceEntrySubmit, UnfilledCancelBricks, entryOrderNumber, cancelRequested));
 
@@ -640,8 +634,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                     else if (cancelRequested && bricksSinceEntrySubmit >= UnfilledCancelBricks + 2)
                     {
-                        // GRACE PERIOD EXPIRED for LIMIT order
-                        // v1.4.3: verify Position is Flat before declaring Idle.
                         Print(string.Format("[ORDER] *** LIMIT GRACE PERIOD EXPIRED *** Entry #{0}. Verifying broker position before reset.",
                             entryOrderNumber));
                         WriteOrderRow("FORCE_RESET_STUCK", entryOrderNumber, "n/a", entryLimitPrice, 0, 0, "callback_never_arrived");
@@ -651,36 +643,28 @@ namespace NinjaTrader.NinjaScript.Strategies
                         }
                         else
                         {
-                            // Broker says we have a position despite our state confusion!
-                            // Force-flatten via market exit. Don't declare Idle until exit confirms.
                             Print(string.Format("[CRITICAL] LIMIT grace-period expired but Position={0} (not Flat). Force-flattening at market.",
                                 Position.MarketPosition));
                             WriteOrderRow("DESYNC_FORCE_FLAT", entryOrderNumber, "n/a", 0, 0, 0, "limit_grace_broker_not_flat");
                             try { ExitLong(Math.Abs(Position.Quantity), "ExitDesync", "EntryV140"); }
                             catch (Exception ex) { Print(string.Format("[CRITICAL] ExitLong (desync) failed: {0}", ex.Message)); }
-                            // Stay in Working; CheckPositionSync will reset us when exit confirms.
                         }
                     }
                 }
-                else // currentWorkingOrderType == Market
+                else
                 {
-                    // ---- MARKET branch: wall-clock heartbeat, NEVER cancel ----
                     TimeSpan elapsed = DateTime.Now - marketSubmitWallClock;
                     if (elapsed.TotalSeconds > 30 && !marketTimeoutLogged)
                     {
-                        Print(string.Format("[CRITICAL] MARKET order #{0} no fill confirmation after {1:F1}s. Broker may be slow or disconnected. NOT cancelling (market orders typically fill at broker even on slow callback). Manual check recommended.",
+                        Print(string.Format("[CRITICAL] MARKET order #{0} no fill confirmation after {1:F1}s. Broker may be slow or disconnected. NOT cancelling. Manual check recommended.",
                             entryOrderNumber, elapsed.TotalSeconds));
                         WriteOrderRow("MARKET_HEARTBEAT_WARN", entryOrderNumber, "MARKET", 0, 0, 0,
                             string.Format("elapsed_seconds={0:F1}", elapsed.TotalSeconds));
                         marketTimeoutLogged = true;
-                        // Do NOT cancel. Do NOT reset state. Just log and wait.
-                        // CheckPositionSync will reconcile if/when broker reports a position.
                     }
                 }
             }
 
-            // NEW v1.4.2: heartbeat - log non-Idle state every 10 bricks so a
-            // stuck state machine is immediately visible in the Output window.
             if (orderState != OrderSubState.Idle)
             {
                 bricksInCurrentState++;
@@ -698,11 +682,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 bricksInCurrentState = 0;
             }
 
-            // =================================================================
-            // ORDER SUBSYSTEM: work-end force-flat check (every brick close)
-            // v1.4.3: bracket is now server-side via SetStopLoss/SetProfitTarget.
-            // NinjaTrader will auto-cancel the bracket when we submit ExitLong.
-            // =================================================================
+            // ---- Work-end force-flat check (UNCHANGED from v1.4.3) ----
             if (EnableOrders && EnableOrderHours && !forceFlatInProgress)
             {
                 if (IsBeyondOrderEnd(barTimeNy))
@@ -728,7 +708,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     else if (orderState == OrderSubState.Idle
                              && Position.MarketPosition != MarketPosition.Flat)
                     {
-                        // v1.4.3: Layer 1 catches ghost positions too at work-end.
                         Print(string.Format("[CRITICAL] Work-end reached: orderState=Idle but Position={0}. Force-flatten as part of work-end.",
                             Position.MarketPosition));
                         WriteOrderRow("FORCEFLAT_WORKEND_GHOST", lastEntryOrderNumber, "MARKET_EXIT", 0, 0, 0, "ghost_position_at_workend");
@@ -744,7 +723,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 
-            // ---- Resolve pending occurrences (UNCHANGED from v1.3.2) ----
+            // ---- Resolve pending occurrences ----
             List<PendingOccurrence> resolved = new List<PendingOccurrence>();
 
             foreach (var po in pendingOccurrences)
@@ -767,7 +746,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             foreach (var po in resolved)
                 pendingOccurrences.Remove(po);
 
-            // ---- Detect new occurrence ending at this brick (UNCHANGED) ----
+            // ---- Detect new occurrence ending at this brick ----
             int patternLen = compiledPattern.Length;
             if (bricks.Count >= patternLen)
             {
@@ -816,10 +795,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         openPrice, currentPrice, ema1Val, ema2Val,
                         emaQualified ? "YES" : "NO"));
 
-                    // =========================================================
-                    // NEW v1.4: ORDER SUBSYSTEM TRIGGER POINT
-                    // EMA-qualified pattern just detected. Check all gates.
-                    // =========================================================
+                    // ORDER SUBSYSTEM TRIGGER POINT (UNCHANGED from v1.4.3)
                     if (emaQualified)
                     {
                         TryEnterOrder(currentPrice, barTimeNy);
@@ -829,20 +805,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // NEW v1.4: TryEnterOrder
-        // Called when an EMA-qualified pattern is freshly detected.
-        // Checks all gates and submits an entry order if everything passes.
+        // TryEnterOrder (UNCHANGED from v1.4.3)
         // =====================================================================
         private void TryEnterOrder(double currentPrice, DateTime barTimeNy)
         {
-            // Gate a: master switch
             if (!EnableOrders)
             {
-                // silent - this is the v1.3.2 fallthrough
                 return;
             }
 
-            // Gate b: order hours (NY)
             if (EnableOrderHours && !IsWithinOrderHours(barTimeNy))
             {
                 Print(string.Format("[ORDER] EMA-qualified pattern at {0} NY but outside order hours [{1:D2}:{2:D2}-{3:D2}:{4:D2}]. No order.",
@@ -851,7 +822,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // Gate c: good-til-date
             if (barTimeNy.Date > GoodTilDate.Date)
             {
                 Print(string.Format("[ORDER] EMA-qualified pattern at {0} NY but past GoodTilDate ({1:yyyy-MM-dd}). No order. Alerts continue.",
@@ -859,21 +829,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // Gate d: alert status
             if (!isAlerted)
             {
                 Print("[ORDER] EMA-qualified pattern detected but isAlerted=false. No order.");
                 return;
             }
 
-            // Gate e: order subsystem must be Idle
             if (orderState != OrderSubState.Idle)
             {
                 Print(string.Format("[ORDER] EMA-qualified pattern detected but orderState={0} (not Idle). No order.", orderState));
                 return;
             }
 
-            // Gate f: strategy position must be flat
             if (Position.MarketPosition != MarketPosition.Flat)
             {
                 Print(string.Format("[ORDER] EMA-qualified pattern detected but strategy position is {0} (not Flat). No order.",
@@ -881,14 +848,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // Gate g: no external/manual position on this instrument in the account
             if (HasExternalPositionOnInstrument())
             {
                 Print("[ORDER] EMA-qualified pattern detected but external/manual position exists on this instrument in the account. No order.");
                 return;
             }
 
-            // Gate h (NEW v1.4.3): safety brake from consecutive losses
             if (safetyBrakeTripped)
             {
                 Print(string.Format("[ORDER] EMA-qualified pattern detected but SAFETY BRAKE is tripped ({0} consecutive losses >= {1}). No order. Disable+re-enable strategy to reset.",
@@ -896,24 +861,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // All gates passed. Submit entry order.
             dailyOrderNumber++;
             entryOrderNumber = dailyOrderNumber;
-            lastEntryOrderNumber = entryOrderNumber;        // v1.4.3
+            lastEntryOrderNumber = entryOrderNumber;
             entryReferencePrice = currentPrice;
             bricksSinceEntrySubmit = 0;
             entrySubmitBarIdx = CurrentBar;
-            currentWorkingOrderType = OrderType;            // v1.4.3: remember type
+            currentWorkingOrderType = OrderType;
             cancelRequested = false;
             marketTimeoutLogged = false;
 
-            // ============================================================
-            // NEW v1.4.3: pre-set the OCO bracket via SetStopLoss / SetProfitTarget
-            // This MUST happen BEFORE the entry call so NinjaTrader can attach
-            // the bracket atomically (server-side) the moment the entry fills.
-            // Units: ticks, computed from brick math.
-            // ============================================================
-            double brickTicks = BarsPeriod.Value;                       // brick size in ticks
+            double brickTicks = BarsPeriod.Value;
             int stopTicks   = (int)Math.Round(StopLossBricks    * brickTicks);
             int targetTicks = (int)Math.Round(ProfitTargetBricks * brickTicks);
             try
@@ -937,7 +895,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(string.Format("[ORDER] *** STATE: Idle -> Working *** (market entry submitted)"));
                 orderState = OrderSubState.Working;
                 bricksInCurrentState = 0;
-                marketSubmitWallClock = DateTime.Now;       // v1.4.3: start wall-clock timer
+                marketSubmitWallClock = DateTime.Now;
                 try
                 {
                     workingEntryOrder = EnterLong(OrderQuantity, "EntryV140");
@@ -949,7 +907,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     workingEntryOrder = null;
                 }
             }
-            else // Limit
+            else
             {
                 double limitPrice = currentPrice - LimitUnderPoints;
                 limitPrice = Instrument.MasterInstrument.RoundToTickSize(limitPrice);
@@ -975,9 +933,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // NEW v1.4: HasExternalPositionOnInstrument
-        // Check if the account has a position on this instrument that was not
-        // opened by this strategy instance.
+        // HasExternalPositionOnInstrument (UNCHANGED from v1.4.3)
         // =====================================================================
         private bool HasExternalPositionOnInstrument()
         {
@@ -990,9 +946,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     {
                         if (pos.Instrument == Instrument && pos.MarketPosition != MarketPosition.Flat)
                         {
-                            // Account-level says there's a position. If this strategy's own
-                            // position is flat, then it must be from another source (manual,
-                            // another strategy, etc).
                             if (Position.MarketPosition == MarketPosition.Flat)
                                 return true;
                         }
@@ -1007,7 +960,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // NEW v1.4: IsWithinOrderHours / IsBeyondOrderEnd
+        // IsWithinOrderHours / IsBeyondOrderEnd (UNCHANGED from v1.4.3)
         // =====================================================================
         private bool IsWithinOrderHours(DateTime nyTime)
         {
@@ -1016,7 +969,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             int endMin   = OrderEndHourNY   * 60 + OrderEndMinuteNY;
             if (startMin <= endMin)
                 return curMin >= startMin && curMin <= endMin;
-            // Wraps midnight (e.g. 22:00 - 02:00)
             return curMin >= startMin || curMin <= endMin;
         }
 
@@ -1027,13 +979,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             int endMin   = OrderEndHourNY   * 60 + OrderEndMinuteNY;
             if (startMin <= endMin)
                 return curMin > endMin || curMin < startMin;
-            // Wraps midnight
             return curMin > endMin && curMin < startMin;
         }
 
         // =====================================================================
-        // NEW v1.4: OnOrderUpdate - track entry order lifecycle
-        // v1.4.2: more defensive matching and logging.
+        // OnOrderUpdate (UNCHANGED from v1.4.3)
         // =====================================================================
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice,
             int quantity, int filled, double averageFillPrice,
@@ -1042,9 +992,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (order == null) return;
             if (!EnableOrders) return;
 
-            // v1.4.2: match by reference OR by signal name "EntryV140" to be safe
-            // against NinjaTrader handing us a different object reference for the
-            // same logical order.
             bool isOurEntry = (workingEntryOrder != null && order == workingEntryOrder)
                               || (order.Name == "EntryV140" && orderState == OrderSubState.Working);
 
@@ -1055,8 +1002,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (orderUpdateState == NinjaTrader.Cbi.OrderState.Cancelled)
                 {
-                    // Play cancel sound only if this is a "normal" unfilled cancel,
-                    // not a workend cancel (forceFlatInProgress has its own sound).
                     if (!forceFlatInProgress)
                         PlayOrderSound("Alert3.wav", "Entry cancelled (unfilled)");
                     workingEntryOrder = null;
@@ -1069,16 +1014,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     workingEntryOrder = null;
                     ResetOrderSubsystemToIdle("entry_rejected");
                 }
-                // For other states (Accepted, Working, CancelPending) just log and wait.
             }
         }
 
         // =====================================================================
-        // NEW v1.4: OnExecutionUpdate - fired when an order fills
-        // v1.4.3: bracket is now managed by NT (SetStopLoss/SetProfitTarget).
-        // We just detect entry fill -> Position, and exit fills -> Idle.
-        // Exits are identified by their Order.Name ("Stop loss" or "Profit target"
-        // are NT's default names when set via SetStopLoss/SetProfitTarget).
+        // OnExecutionUpdate (UNCHANGED from v1.4.3)
         // =====================================================================
         protected override void OnExecutionUpdate(Execution execution, string executionId, double price,
             int quantity, MarketPosition marketPosition, string orderId, DateTime time)
@@ -1088,7 +1028,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             string oName = execution.Order.Name ?? "";
 
-            // Entry fill - identified by signal name "EntryV140"
             if (oName == "EntryV140"
                 && (execution.Order.OrderState == NinjaTrader.Cbi.OrderState.Filled
                  || execution.Order.OrderState == NinjaTrader.Cbi.OrderState.PartFilled))
@@ -1100,8 +1039,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (execution.Order.OrderState == NinjaTrader.Cbi.OrderState.Filled)
                 {
                     PlayOrderSound("Alert4.wav", "Entry filled");
-                    // v1.4.3: NinjaTrader auto-attached the bracket via SetStopLoss/SetProfitTarget.
-                    // We don't call AttachOCOBracket() anymore. Just log the expected exit prices.
                     double brickPrice = BarsPeriod.Value * TickSize;
                     computedStopPrice   = actualFillPrice - (StopLossBricks     * brickPrice);
                     computedTargetPrice = actualFillPrice + (ProfitTargetBricks * brickPrice);
@@ -1119,14 +1056,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // Exit fills - identified by NT's default bracket order names.
-            // "Stop loss" is the default name from SetStopLoss.
-            // "Profit target" is the default name from SetProfitTarget.
             bool isStopFill   = oName.IndexOf("Stop", StringComparison.OrdinalIgnoreCase) >= 0;
             bool isTargetFill = oName.IndexOf("Profit", StringComparison.OrdinalIgnoreCase) >= 0
                              || oName.IndexOf("Target", StringComparison.OrdinalIgnoreCase) >= 0;
 
-            // Defensive: only treat as exit if we're actually in Position state
             if ((isStopFill || isTargetFill)
                 && execution.Order.OrderState == NinjaTrader.Cbi.OrderState.Filled
                 && orderState == OrderSubState.Position)
@@ -1137,7 +1070,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     which, entryOrderNumber, oName, price, actualFillPrice, pnl));
                 WriteOrderRow(isStopFill ? "EXIT_STOP" : "EXIT_TARGET", entryOrderNumber, "n/a", 0, computedStopPrice, computedTargetPrice, "");
 
-                // v1.4.3: consecutive-loss tracking
                 if (isStopFill)
                 {
                     consecutiveLosses++;
@@ -1150,7 +1082,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                             consecutiveLosses, MaxConsecutiveLosses));
                         WriteOrderRow("SAFETY_BRAKE_TRIPPED", entryOrderNumber, "n/a", 0, 0, 0,
                             string.Format("consecutive_losses={0}", consecutiveLosses));
-                        // Audible alarm
                         PlayOrderSound("Alert2.wav", "Safety brake tripped");
                     }
                 }
@@ -1167,9 +1098,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // NEW v1.4.3: CheckPositionSync
-        // The DEFENSIVE GUARD that runs at the top of every OnBarUpdate.
-        // Broker's Position.MarketPosition is the source of truth.
+        // CheckPositionSync (UNCHANGED from v1.4.3)
         // =====================================================================
         private void CheckPositionSync()
         {
@@ -1177,10 +1106,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 MarketPosition brokerPos = Position.MarketPosition;
 
-                // Case A: strategy thinks Idle but broker has a position = GHOST POSITION
                 if (orderState == OrderSubState.Idle && brokerPos != MarketPosition.Flat)
                 {
-                    // Throttle log spam (only log once per 30 seconds)
                     bool shouldLog = (DateTime.Now - lastDesyncLogTime).TotalSeconds > 30;
                     if (shouldLog)
                     {
@@ -1206,11 +1133,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                 }
 
-                // Case B: strategy thinks Working/Position but broker is Flat = STALE STATE
                 else if ((orderState == OrderSubState.Working || orderState == OrderSubState.Position)
                          && brokerPos == MarketPosition.Flat)
                 {
-                    // Throttle: only act once
                     if ((DateTime.Now - lastDesyncLogTime).TotalSeconds > 5)
                     {
                         Print(string.Format("[CRITICAL] *** DESYNC DETECTED *** orderState={0} but broker Position=Flat. Resetting to Idle.",
@@ -1229,7 +1154,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // NEW v1.4.3: OnConnectionStatusUpdate - audible alarm on disconnect
+        // OnConnectionStatusUpdate (UNCHANGED from v1.4.3)
         // =====================================================================
         protected override void OnConnectionStatusUpdate(ConnectionStatusEventArgs connectionStatusUpdate)
         {
@@ -1242,7 +1167,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 Print("[CRITICAL] *** BROKER CONNECTION LOST *** Server-side bracket should still protect open positions, but no new orders can be placed.");
                 try { PlayOrderSound("Alert2.wav", "Broker connection lost"); }
-                catch { /* sound can fail if NT shutting down */ }
+                catch { }
             }
             else if (status == ConnectionStatus.Connected)
             {
@@ -1251,11 +1176,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // NEW v1.4: ResetOrderSubsystemToIdle
-        // v1.4.2: also resets cancelRequested and heartbeat counter.
-        // v1.4.3: also resets market timer and currentWorkingOrderType.
-        //         Does NOT reset consecutiveLosses or safetyBrakeTripped
-        //         (those persist across trades intentionally).
+        // ResetOrderSubsystemToIdle (UNCHANGED from v1.4.3)
         // =====================================================================
         private void ResetOrderSubsystemToIdle(string reason)
         {
@@ -1273,19 +1194,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             computedTargetPrice = 0.0;
             ocoGroupId = null;
             forceFlatInProgress = false;
-            cancelRequested = false;             // v1.4.2
-            bricksInCurrentState = 0;            // v1.4.2
-            currentWorkingOrderType = OrderEntryType.Limit;  // v1.4.3
-            marketSubmitWallClock = DateTime.MinValue;       // v1.4.3
-            marketTimeoutLogged = false;                     // v1.4.3
-            // NOTE: lastDesyncLogTime is NOT reset (throttle persists across states)
-            // NOTE: consecutiveLosses and safetyBrakeTripped are NOT reset (persistent)
+            cancelRequested = false;
+            bricksInCurrentState = 0;
+            currentWorkingOrderType = OrderEntryType.Limit;
+            marketSubmitWallClock = DateTime.MinValue;
+            marketTimeoutLogged = false;
         }
 
         // =====================================================================
         // HandleOccurrenceOutcome
-        // (UNCHANGED from v1.3.2 except: recompute isAlerted after every
-        //  EMA-qualified append.)
+        // [v1.4.4] AlertPattern is now a list. ONE alert per brick if ANY
+        // pattern matches the tail. isAlerted = "any pattern matches tail".
         // =====================================================================
         private void HandleOccurrenceOutcome(PendingOccurrence po, string outcome, double currentPrice)
         {
@@ -1304,6 +1223,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Time[0].ToString("HH:mm:ss"),
                     tradedOutcomeString.ToString()));
 
+                // Post-alert capture FIRST (so alert doesn't capture itself)
                 if (pendingPostAlertCaptures > 0)
                 {
                     capturedBit = outcome == "S" ? '1' : '0';
@@ -1314,22 +1234,21 @@ namespace NinjaTrader.NinjaScript.Strategies
                         capturedBit, postAlertOutcomeString.ToString(), pendingPostAlertCaptures));
                 }
 
-                if (TradedTailMatchesAlertPattern())
+                // [v1.4.4] ONE alert per brick if ANY pattern in the list matches
+                if (AnyAlertPatternMatchesTail())
                 {
                     FireAlert();
                     firedAlert = true;
                 }
 
-                // NEW v1.4: After every EMA-qualified append, recompute the
-                // alert status flag that the order subsystem reads.
+                // [v1.4.4] Recompute isAlerted (used by order subsystem) after every EMA-qualified append.
+                // Same boolean function as the alert check (the alert subsystem and order subsystem
+                // both read "any pattern matches current tail").
                 bool prev = isAlerted;
-                isAlerted = TradedTailMatchesAlertPattern();
+                isAlerted = AnyAlertPatternMatchesTail();
                 if (prev != isAlerted)
-                    Print(string.Format("[ALERTSTATE] isAlerted: {0} -> {1} (tail of OutcomeString_EmaQualified now \"{2}\")",
-                        prev, isAlerted,
-                        tradedOutcomeString.Length >= compiledAlertPattern.Length
-                            ? tradedOutcomeString.ToString().Substring(tradedOutcomeString.Length - compiledAlertPattern.Length)
-                            : tradedOutcomeString.ToString()));
+                    Print(string.Format("[ALERTSTATE] isAlerted: {0} -> {1} (tail of OutcomeString_EmaQualified now ends in a pattern from the list = {2})",
+                        prev, isAlerted, isAlerted ? "YES" : "no"));
             }
             else
             {
@@ -1355,31 +1274,48 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        private bool TradedTailMatchesAlertPattern()
+        // =====================================================================
+        // [v1.4.4] AnyAlertPatternMatchesTail
+        // Returns true iff ANY pattern in compiledAlertPatterns is a suffix of
+        // the current tradedOutcomeString. Boolean OR across all patterns.
+        // (Identical to v1.3.3.)
+        // =====================================================================
+        private bool AnyAlertPatternMatchesTail()
         {
-            int patLen = compiledAlertPattern.Length;
-            if (tradedOutcomeString.Length < patLen) return false;
-
-            int start = tradedOutcomeString.Length - patLen;
-            for (int i = 0; i < patLen; i++)
+            string tail = tradedOutcomeString.ToString();
+            foreach (var p in compiledAlertPatterns)
             {
-                if (tradedOutcomeString[start + i] != compiledAlertPattern[i])
-                    return false;
+                if (tail.Length < p.Length) continue;
+                bool match = true;
+                int start = tail.Length - p.Length;
+                for (int i = 0; i < p.Length; i++)
+                {
+                    if (tail[start + i] != p[i])
+                    {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) return true;
             }
-            return true;
+            return false;
         }
 
+        // =====================================================================
+        // FireAlert
+        // [v1.4.4] Body unchanged; shows full user-input list on chart text.
+        // =====================================================================
         private void FireAlert()
         {
             dailyAlertNumber++;
             pendingPostAlertCaptures++;
 
             Print("================================================================");
-            Print(string.Format("[ALERT] *** AlertPattern \"{0}\" matched at {1}. Daily alert #{2}. Pending captures = {3}. ***",
-                compiledAlertPattern, Time[0].ToString("HH:mm:ss"), dailyAlertNumber, pendingPostAlertCaptures));
-            Print(string.Format("[ALERT] Tail: \"...{0}\"",
-                tradedOutcomeString.Length >= compiledAlertPattern.Length
-                    ? tradedOutcomeString.ToString().Substring(tradedOutcomeString.Length - compiledAlertPattern.Length)
+            Print(string.Format("[ALERT] *** AlertPattern list matched the tail of OutcomeString_EmaQualified at {0}. Daily alert #{1}. Pending captures = {2}. ***",
+                Time[0].ToString("HH:mm:ss"), dailyAlertNumber, pendingPostAlertCaptures));
+            Print(string.Format("[ALERT] Tail (last 20): \"...{0}\"",
+                tradedOutcomeString.Length > 20
+                    ? tradedOutcomeString.ToString().Substring(tradedOutcomeString.Length - 20)
                     : tradedOutcomeString.ToString()));
             Print("[ALERT] Watch the chart. Next EMA-qualified pattern occurrence is your trial.");
 
@@ -1392,7 +1328,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string tag = "RSP_ALERT_" + CurrentBar + "_" + dailyAlertNumber;
                 Draw.Diamond(this, tag, true, 0, High[0] + (6 * TickSize), Brushes.Magenta);
                 string txt = "RSP_ALERT_TXT_" + CurrentBar + "_" + dailyAlertNumber;
-                Draw.Text(this, txt, string.Format("ALERT #{0}\nAP=\"{1}\"", dailyAlertNumber, compiledAlertPattern),
+                // [v1.4.4] Show the user's full list on chart text
+                Draw.Text(this, txt, string.Format("ALERT #{0}\nAP=\"{1}\"", dailyAlertNumber, AlertPattern),
                     0, High[0] + (10 * TickSize), Brushes.Magenta);
             }
 
@@ -1400,11 +1337,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // NEW v1.4.1: PlayOrderSound
-        // Plays a NinjaTrader built-in .wav for an order subsystem event.
-        // The five hardcoded sound names below all ship with NinjaTrader 8.
-        // If a file is missing on this install, PlaySound silently fails - we
-        // log which file was attempted so it's easy to spot.
+        // PlayOrderSound (UNCHANGED from v1.4.3)
         // =====================================================================
         private void PlayOrderSound(string wavFileName, string eventLabel)
         {
@@ -1421,7 +1354,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // CSV: per-occurrence (UNCHANGED from v1.3.2 except filename suffix)
+        // CSV: per-occurrence
+        // [v1.4.4] Schema bumped to 1.4.4. AlertPattern column logs full user
+        // input; double-quoted if it contains a comma. Added AlertPatternParsed
+        // header line.
         // =====================================================================
         private void WriteOccurrenceRow(PendingOccurrence po, string outcome, double endPrice, bool firedAlert, bool capturedPostAlert, char capturedBit)
         {
@@ -1437,7 +1373,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.4.3");
+                        sw.WriteLine("# schema_version=1.4.4");
                         sw.WriteLine(string.Format("# file_created_NY={0}",
                             TimeZoneInfo.ConvertTime(DateTime.Now, nyTz).ToString("yyyy-MM-dd HH:mm:ss")));
                         sw.WriteLine(string.Format("# file_created_UTC={0}",
@@ -1450,6 +1386,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         sw.WriteLine(string.Format("# PatternToMatch={0}", PatternToMatch));
                         sw.WriteLine(string.Format("# FollowUpPattern={0}", FollowUpPattern));
                         sw.WriteLine(string.Format("# AlertPattern={0}", AlertPattern));
+                        sw.WriteLine(string.Format("# AlertPatternParsed=[{0}]", string.Join(", ", compiledAlertPatterns)));
                         sw.WriteLine(string.Format("# EMA1Period={0}", EMA1Period));
                         sw.WriteLine(string.Format("# EMA2Period={0}", EMA2Period));
                         sw.WriteLine(string.Format("# EnableOrders={0}", EnableOrders));
@@ -1471,6 +1408,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     for (int i = 0; i < compiledFollowUp.Length && (startIdx + i) < bricks.Count; i++)
                         actualFollow += bricks[startIdx + i].ToString();
 
+                    // [v1.4.4] Quote AlertPattern if it contains a comma so CSV stays parseable
+                    string apForCsv = AlertPattern.Contains(",") ? "\"" + AlertPattern + "\"" : AlertPattern;
+
                     sw.WriteLine(string.Format(
                         "{0},{1},{2},{3},{4},{5},{6},{7:F2},{8:F2},{9:F2},{10},{11},{12},{13:F2},{14:F2},{15},{16},{17},{18},{19},{20},{21},{22},{23},{24}",
                         TimeZoneInfo.ConvertTime(po.OccurrenceTime, nyTz).ToString("yyyy-MM-dd HH:mm:ss"),
@@ -1483,7 +1423,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         po.OpenAtDetect,
                         po.PatternEndPrice,
                         endPrice,
-                        compiledAlertPattern,
+                        apForCsv,
                         po.OccurrenceNumberAtDetect,
                         outcomeString.ToString(),
                         po.Ema1AtDetect,
@@ -1507,7 +1447,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // CSV: per-alert (UNCHANGED from v1.3.2 except filename suffix)
+        // CSV: per-alert
+        // [v1.4.4] Schema bumped to 1.4.4. AlertPattern column quoted if comma.
         // =====================================================================
         private void WriteAlertRow()
         {
@@ -1523,10 +1464,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.4.3");
+                        sw.WriteLine("# schema_version=1.4.4");
                         sw.WriteLine(string.Format("# instrument={0}", Instrument.FullName));
                         sw.WriteLine(string.Format("# brick_size_ticks={0}", BarsPeriod.Value));
                         sw.WriteLine(string.Format("# tick_size={0}", TickSize));
+                        sw.WriteLine(string.Format("# AlertPattern={0}", AlertPattern));
+                        sw.WriteLine(string.Format("# AlertPatternParsed=[{0}]", string.Join(", ", compiledAlertPatterns)));
                         sw.WriteLine("# all timestamps NY time");
                         sw.WriteLine("#");
                         sw.WriteLine("AlertTime_NY,DailyAlertNumber,AlertPattern,"
@@ -1535,11 +1478,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                             + "PostAlertOutcomeString,PendingPostAlertCapturesAfter,"
                             + "IsAlertedAfter,OrderStateAtAlert");
                     }
+
+                    string apForCsv = AlertPattern.Contains(",") ? "\"" + AlertPattern + "\"" : AlertPattern;
+
                     sw.WriteLine(string.Format(
                         "{0},{1},{2},{3},{4},{5:F2},{6},{7},{8},{9},{10},{11}",
                         TimeZoneInfo.ConvertTime(Time[0], nyTz).ToString("yyyy-MM-dd HH:mm:ss"),
                         dailyAlertNumber,
-                        compiledAlertPattern,
+                        apForCsv,
                         PatternToMatch,
                         FollowUpPattern,
                         Close[0],
@@ -1558,7 +1504,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // NEW v1.4: CSV per-order-event
+        // CSV: per-order-event
+        // [v1.4.4] Schema bumped to 1.4.4. Otherwise unchanged from v1.4.3.
         // =====================================================================
         private void WriteOrderRow(string eventType, int orderNumber, string orderTypeStr,
             double price, double stopPx, double targetPx, string extra)
@@ -1575,7 +1522,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.4.3");
+                        sw.WriteLine("# schema_version=1.4.4");
                         sw.WriteLine(string.Format("# instrument={0}", Instrument.FullName));
                         sw.WriteLine(string.Format("# brick_size_ticks={0}", BarsPeriod.Value));
                         sw.WriteLine(string.Format("# tick_size={0}", TickSize));
@@ -1622,7 +1569,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // ResetState (daily reset at 9:30 NY)
+        // ResetState (daily reset at 9:30 NY) - UNCHANGED from v1.4.3
         // =====================================================================
         private void ResetState()
         {
@@ -1638,11 +1585,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             postAlertOutcomeString.Clear();
             pendingPostAlertCaptures = 0;
             isAlerted = false;
-            // Note: order subsystem state is NOT cleared on daily reset. If a
-            // position carries across the 9:30 boundary, we let it finish.
+            // Note: order subsystem state is NOT cleared on daily reset.
         }
 
-        #region Properties (existing v1.3.2 properties unchanged)
+        #region Properties
 
         [NinjaScriptProperty]
         [Display(Name="PatternToMatch",
@@ -1657,8 +1603,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         public string FollowUpPattern { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name="AlertPattern",
-            Description="Suffix pattern matched against TradedOutcomeString (S=1, F=0).",
+        [Display(Name="AlertPattern (comma-separated list OK)",
+            Description="[v1.4.4] One or more suffix patterns, comma-separated. Each entry 1-10 chars of '0'/'1'. At each EMA-qualified brick close, if ANY pattern matches the tail of OutcomeString_EmaQualified, ONE alert fires (sound + diamond + CSV row), and isAlerted becomes true (the order subsystem can then place an order on the next EMA-qualified pattern). Examples: \"01\" (single, back-compat), \"01, 011, 0111\" (any of three). WARNING: avoid lists where one entry is a suffix of another (e.g. \"1, 11\" or \"101, 10101\") - the shorter is redundant under the one-alert-per-brick rule. Strategy still runs but prints a warning.",
             Order=3, GroupName="2. Alert")]
         public string AlertPattern { get; set; }
 
@@ -1716,7 +1662,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int MaxBitsKept { get; set; }
 
         // =====================================================================
-        // NEW v1.4 PROPERTIES
+        // ORDER PROPERTIES (UNCHANGED from v1.4.3)
         // =====================================================================
 
         [NinjaScriptProperty]
