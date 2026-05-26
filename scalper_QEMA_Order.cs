@@ -19,7 +19,7 @@ using NinjaTrader.NinjaScript.DrawingTools;
 
 
 // =============================================================================
-// STRATEGY: scalper_QEMA_Order v1.0.0
+// STRATEGY: scalper_QEMA_Order v1.0.1
 // AUTHOR:   Albert Feng / Drafted with help from Claude
 // =============================================================================
 //
@@ -38,17 +38,55 @@ using NinjaTrader.NinjaScript.DrawingTools;
 //   4. EventWindowBars expired (hold window)
 //   5. NEW QUALIFIED EMA CROSS — closes the current trade, does NOT open new
 //
-// The cross that closes a trade is "consumed" as a killer; it does not also
-// open a new trade on the same bar. The NEXT qualified cross (later) is the
-// next entry candidate. This is the main behavioral difference from MACD.
+// =============================================================================
+// v1.0.1 CHANGES vs v1.0.0 — safety-brake logic redesign
+// =============================================================================
 //
-// To adapt to another indicator:
-//   - Copy this file
-//   - Replace the EVENT GENERATOR section
-//   - Leave ALERT SUBSYSTEM and ORDER SUBSYSTEM unchanged
-//   - Rename class, Name property, CSV file prefixes
+// CHANGE 1: consecutiveLosses now counts ANY losing bit (bit=0), regardless
+//   of which close trigger produced it. A winning bit (bit=1) resets the
+//   counter to 0.
 //
-// See spec doc for full design: scalper_QEMA_Order_v100_spec.md
+//   Old (v1.0.0): only clean STOP fills counted as losses; window/hours/
+//   new-cross resolutions never touched the counter.
+//
+//   New (v1.0.1): any resolution where outcome bit=0 increments the counter.
+//   Any resolution where outcome bit=1 resets it. Counter logic moved from
+//   OnExecutionUpdate to ResolvePending so it runs uniformly for all five
+//   close triggers.
+//
+// CHANGE 2: When safety brake trips, the strategy AUTO-DISABLES itself.
+//
+//   Old (v1.0.0): brake set safetyBrakeTripped=true but the strategy stayed
+//   enabled, silently blocking new entries. To the user, the strategy
+//   appeared to be running normally — you'd only discover the brake had
+//   tripped by reading the Output log. This is the failure mode that
+//   originally motivated this version.
+//
+//   New (v1.0.1): brake trip → safetyBrakeTripped=true → strategy calls
+//   SetState(State.Finalized) via TriggerCustomEvent. NT's Strategies tab
+//   shows the strategy as disabled immediately. The user sees the failure
+//   instantly instead of discovering it later. To resume trading, the user
+//   re-enables the strategy manually — which naturally resets all state
+//   including the safety brake counter.
+//
+//   Implementation note: SetState(State.Finalized) must run on NT's UI
+//   thread, not the bar-processing thread, hence the TriggerCustomEvent
+//   wrapper. Pattern borrowed from ShortScalper_FixedLimitEntry.
+//
+// NOTE: This counter does NOT distinguish historical-replay outcomes from
+// live-trade outcomes. A streak during NT's historical replay can trip the
+// brake before any real live trading begins. If you observe this:
+//   - Read the [BRAKE] log lines in Output to understand the historical streak
+//   - Raise MaxConsecutiveLosses (e.g., to 10) in NT parameter panel
+//   - NT will restart the strategy; historical will replay with the new
+//     threshold; brake likely won't trip; live trading proceeds
+//   - You may lower the threshold back later, but each parameter change
+//     restarts the strategy
+//
+// Schema version bumped to 1.0.1 in all three CSV headers. File names unchanged.
+//
+// EVERYTHING ELSE IDENTICAL TO v1.0.0. No changes to event generator, alert
+// subsystem, order subsystem state machine, CSV column layout, or defaults.
 // =============================================================================
 
 namespace NinjaTrader.NinjaScript.Strategies
@@ -403,7 +441,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void PrintInitLog()
         {
             Print("================================================================");
-            Print(string.Format("[INIT] scalper_QEMA_Order v1.0.0 at {0}",
+            Print(string.Format("[INIT] scalper_QEMA_Order v1.0.1 at {0}",
                 DateTime.Now.ToString("HH:mm:ss.fff")));
             Print(string.Format("[INIT] Instrument: {0}  TickSize: {1}",
                 Instrument.FullName, TickSize));
@@ -484,6 +522,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(string.Format("[INIT] MaxConsecutiveLosses = {0}{1}",
                     MaxConsecutiveLosses,
                     MaxConsecutiveLosses >= 99 ? " (effectively OFF)" : " (safety brake ACTIVE)"));
+                Print("[INIT]   [v1.0.1] Counter increments on ANY losing bit (bit=0) from any of");
+                Print("[INIT]            the 5 close triggers. Wins (bit=1) reset to 0.");
+                Print("[INIT]   [v1.0.1] When brake trips, strategy AUTO-DISABLES itself (visible in");
+                Print("[INIT]            NT Strategies tab). Re-enable manually to reset.");
                 Print("[INIT] Safety layers active:");
                 Print("[INIT]   Layer 1: trading-hours end force-flat");
                 Print("[INIT]   Layer 2: NT session-close auto-flat (IsExitOnSessionCloseStrategy=true)");
@@ -730,6 +772,47 @@ namespace NinjaTrader.NinjaScript.Strategies
                 rawCrossNumber: pendingDailyCrossNumber,
                 qualifiedNumber: pendingDailyQualifiedNumber,
                 liveOrderNumber: pendingLiveOrderNumber);
+
+            // [v1.0.1] UNIFIED consecutiveLosses TRACKING
+            // Counts ANY losing bit (bit=0) regardless of which close trigger
+            // produced it: STOP, WINDOW_LOSS, HOURS_LOSS, NEW_QEMA_LOSS all
+            // count equally. ANY winning bit (bit=1) resets the counter to 0.
+            //
+            // Note: this counter does NOT distinguish historical replay outcomes
+            // from real-time live outcomes. A streak during NT's historical
+            // replay can trip the safety brake before any real live trading.
+            // Workarounds: raise MaxConsecutiveLosses, or disable+re-enable
+            // the strategy to reset.
+            if (EnableOrders)
+            {
+                if (bit == 0)
+                {
+                    consecutiveLosses++;
+                    Print(string.Format("[BRAKE] Loss recorded ({0}). Consecutive losses now = {1} of {2}.",
+                        resolutionType, consecutiveLosses, MaxConsecutiveLosses));
+                    if (consecutiveLosses >= MaxConsecutiveLosses && !safetyBrakeTripped)
+                    {
+                        safetyBrakeTripped = true;
+                        Print(string.Format("[CRITICAL] *** SAFETY BRAKE TRIPPED *** {0} consecutive losses >= {1}. STRATEGY AUTO-DISABLING. Re-enable manually to reset.",
+                            consecutiveLosses, MaxConsecutiveLosses));
+                        WriteOrderRow("SAFETY_BRAKE_TRIPPED", pendingLiveOrderNumber, "n/a", 0, 0, 0,
+                            string.Format("consecutive_losses={0} reason={1}", consecutiveLosses, resolutionType));
+                        try { PlayOrderSound("Alert2.wav", "Safety brake tripped — strategy auto-disabling"); } catch { }
+
+                        // [v1.0.1] Auto-disable so the user sees the failure in NT's
+                        // Strategies tab immediately rather than discovering it later
+                        // by reading Output logs.
+                        DisableStrategyDueToSafetyBrake();
+                    }
+                }
+                else
+                {
+                    if (consecutiveLosses > 0)
+                        Print(string.Format("[BRAKE] Win ({0}) resets consecutive losses (was {1}).",
+                            resolutionType, consecutiveLosses));
+                    consecutiveLosses = 0;
+                }
+            }
 
             // Chart marker for outcome
             if (EnableChartMarkers && ShowOutcomeLabels)
@@ -1490,25 +1573,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (isStopFill)
                 {
-                    consecutiveLosses++;
                     PlayOrderSound("Glass Break.wav", "Stop loss hit");
-                    Print(string.Format("[ORDER] Consecutive losses now = {0} of {1}.", consecutiveLosses, MaxConsecutiveLosses));
-                    if (consecutiveLosses >= MaxConsecutiveLosses && !safetyBrakeTripped)
-                    {
-                        safetyBrakeTripped = true;
-                        Print(string.Format("[CRITICAL] *** SAFETY BRAKE TRIPPED *** {0} consecutive losses >= {1}. ALL FURTHER ORDERS HALTED.",
-                            consecutiveLosses, MaxConsecutiveLosses));
-                        WriteOrderRow("SAFETY_BRAKE_TRIPPED", entryOrderNumber, "n/a", 0, 0, 0,
-                            string.Format("consecutive_losses={0}", consecutiveLosses));
-                        PlayOrderSound("Alert2.wav", "Safety brake tripped");
-                    }
+                    // [v1.0.1] consecutiveLosses bookkeeping moved to ResolvePending,
+                    // so it counts ALL losing bits (any close trigger), not just
+                    // bracket stops. Sound still fires here at the actual moment
+                    // the broker confirms the stop fill.
                 }
                 else
                 {
                     PlayOrderSound("Boxing Bell.wav", "Profit target hit");
-                    if (consecutiveLosses > 0)
-                        Print(string.Format("[ORDER] Win resets consecutive losses (was {0}).", consecutiveLosses));
-                    consecutiveLosses = 0;
                 }
 
                 ResetOrderSubsystemToIdle(isStopFill ? "stop_hit" : "target_hit");
@@ -1640,6 +1713,32 @@ namespace NinjaTrader.NinjaScript.Strategies
             // NOTE: consecutiveLosses and safetyBrakeTripped persist.
         }
 
+        // [v1.0.1] Auto-disable the strategy after the safety brake trips.
+        // SetState(State.Finalized) must run on NT's UI thread, not the bar-
+        // processing thread, hence the TriggerCustomEvent wrapper. Pattern
+        // borrowed from ShortScalper_FixedLimitEntry.
+        private void DisableStrategyDueToSafetyBrake()
+        {
+            Print(string.Format("[DISABLE] Triggering strategy disable at {0}",
+                DateTime.Now.ToString("HH:mm:ss.fff")));
+            try
+            {
+                TriggerCustomEvent(o =>
+                {
+                    try { SetState(State.Finalized); }
+                    catch (Exception ex)
+                    {
+                        Print(string.Format("[DISABLE] SetState(Finalized) error: {0}", ex.Message));
+                    }
+                }, null);
+                Print("[DISABLE] Strategy disable scheduled. Check NT Strategies tab — strategy should appear disabled shortly.");
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[DISABLE] TriggerCustomEvent error: {0}", ex.Message));
+            }
+        }
+
         // =====================================================================
         // ============================================================
         //   ORDER SUBSYSTEM — END
@@ -1714,7 +1813,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void WriteCommonOccHeader(StreamWriter sw)
         {
-            sw.WriteLine("# schema_version=1.0.0");
+            sw.WriteLine("# schema_version=1.0.1");
             sw.WriteLine(string.Format("# file_created_NY={0}",
                 TimeZoneInfo.ConvertTime(DateTime.Now, nyTz).ToString("yyyy-MM-dd HH:mm:ss")));
             sw.WriteLine(string.Format("# file_created_UTC={0}",
@@ -1896,7 +1995,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.0.0");
+                        sw.WriteLine("# schema_version=1.0.1");
                         sw.WriteLine(string.Format("# instrument={0}", Instrument.FullName));
                         sw.WriteLine(string.Format("# tick_size={0}", TickSize));
                         sw.WriteLine(string.Format("# AlertPattern={0}", AlertPattern));
@@ -1944,7 +2043,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.0.0");
+                        sw.WriteLine("# schema_version=1.0.1");
                         sw.WriteLine(string.Format("# instrument={0}", Instrument.FullName));
                         sw.WriteLine(string.Format("# tick_size={0}", TickSize));
                         sw.WriteLine(string.Format("# StopPoints={0}", StopPoints));
