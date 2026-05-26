@@ -19,7 +19,7 @@ using NinjaTrader.NinjaScript.DrawingTools;
 
 
 // =============================================================================
-// STRATEGY: scalper_QEMA_Order v1.0.2
+// STRATEGY: scalper_QEMA_Order v1.0.3
 // AUTHOR:   Albert Feng / Drafted with help from Claude
 // =============================================================================
 //
@@ -37,6 +37,33 @@ using NinjaTrader.NinjaScript.DrawingTools;
 //   3. Trading hours end
 //   4. EventWindowBars expired (hold window)
 //   5. NEW QUALIFIED EMA CROSS — closes the current trade, does NOT open new
+//
+// =============================================================================
+// v1.0.3 CHANGES vs v1.0.2 — trading hours UI simplification
+// =============================================================================
+//
+// CHANGE: Trading-hours input collapsed from four integer fields
+//   (TradingStartHourNY, TradingStartMinuteNY, TradingEndHourNY,
+//   TradingEndMinuteNY) into two string fields:
+//
+//     TradingStartTimeNY = "HH:mm" (default "09:30")
+//     TradingEndTimeNY   = "HH:mm" (default "16:00")
+//
+//   Format is strict 24-hour "HH:mm" — examples: "09:30", "16:00",
+//   "23:45", "00:15", "18:00", "02:00". Single digits also accepted
+//   ("9:30", "1:5" → 09:30, 01:05). Validation runs in State.Configure;
+//   bad strings set configValid=false and the strategy refuses to process
+//   bars with a clear error message in Output.
+//
+//   BACKWARD COMPAT: the four original int properties remain in the class
+//   marked [Browsable(false)] so they are invisible in NT's parameter panel
+//   but still serialize. State.Configure parses the two new string fields
+//   and populates the int properties. All downstream code (IsWithinTradingHours,
+//   IsBeyondTradingHours, daily reset, CSV headers, INIT log) is unchanged.
+//
+// EVERYTHING ELSE IDENTICAL TO v1.0.2. Schema bumped to 1.0.3 in all three
+// CSV headers. File names unchanged.
+// =============================================================================
 //
 // =============================================================================
 // v1.0.2 CHANGES vs v1.0.1 — brake counter scope + observability
@@ -286,6 +313,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TargetPoints      = 50.0;
 
                 // ---- Trading Hours defaults (NY) ----
+                // [v1.0.3] New string-format fields (visible in UI).
+                TradingStartTimeNY = "09:30";
+                TradingEndTimeNY   = "16:00";
+                // [v1.0.3] Legacy int fields (hidden via Browsable=false on the
+                // property) kept for backward-compat. Populated from the strings
+                // above in State.Configure. Defaults match the strings.
                 TradingStartHourNY   = 9;
                 TradingStartMinuteNY = 30;
                 TradingEndHourNY     = 16;
@@ -367,6 +400,28 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return false;
             }
 
+            // [v1.0.3] Parse the two visible HH:mm string fields into the
+            // legacy hour/minute int fields used by the rest of the code.
+            int startH, startM, endH, endM;
+            if (!TryParseHHmm(TradingStartTimeNY, out startH, out startM))
+            {
+                Print(string.Format("[VALIDATE] *** TradingStartTimeNY = \"{0}\" is not valid 24h HH:mm. Examples: \"09:30\", \"16:00\", \"23:45\", \"00:15\". ***",
+                    TradingStartTimeNY));
+                return false;
+            }
+            if (!TryParseHHmm(TradingEndTimeNY, out endH, out endM))
+            {
+                Print(string.Format("[VALIDATE] *** TradingEndTimeNY = \"{0}\" is not valid 24h HH:mm. Examples: \"09:30\", \"16:00\", \"23:45\", \"00:15\". ***",
+                    TradingEndTimeNY));
+                return false;
+            }
+            TradingStartHourNY   = startH;
+            TradingStartMinuteNY = startM;
+            TradingEndHourNY     = endH;
+            TradingEndMinuteNY   = endM;
+            Print(string.Format("[VALIDATE] Trading hours parsed: start=\"{0}\" ({1:D2}:{2:D2}), end=\"{3}\" ({4:D2}:{5:D2}).",
+                TradingStartTimeNY, startH, startM, TradingEndTimeNY, endH, endM));
+
             if (TradingStartHourNY * 60 + TradingStartMinuteNY ==
                 TradingEndHourNY   * 60 + TradingEndMinuteNY)
             {
@@ -386,6 +441,33 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return false;
             }
 
+            return true;
+        }
+
+        // [v1.0.3] Strict 24-hour HH:mm parser. Accepts single-digit hours
+        // and minutes ("9:30", "1:5"). Rejects 12h format, am/pm suffixes,
+        // negative values, hours > 23, minutes > 59, extra characters,
+        // and empty strings. Returns false with parsed = 0/0 on failure.
+        private bool TryParseHHmm(string raw, out int hour, out int minute)
+        {
+            hour = 0; minute = 0;
+            if (string.IsNullOrWhiteSpace(raw)) return false;
+            string s = raw.Trim();
+            int colonIdx = s.IndexOf(':');
+            if (colonIdx <= 0 || colonIdx >= s.Length - 1) return false;
+            string hPart = s.Substring(0, colonIdx).Trim();
+            string mPart = s.Substring(colonIdx + 1).Trim();
+            // Reject any non-digit chars in either part
+            foreach (char c in hPart) if (c < '0' || c > '9') return false;
+            foreach (char c in mPart) if (c < '0' || c > '9') return false;
+            if (hPart.Length == 0 || hPart.Length > 2) return false;
+            if (mPart.Length == 0 || mPart.Length > 2) return false;
+            int h, m;
+            if (!int.TryParse(hPart, out h)) return false;
+            if (!int.TryParse(mPart, out m)) return false;
+            if (h < 0 || h > 23) return false;
+            if (m < 0 || m > 59) return false;
+            hour = h; minute = m;
             return true;
         }
 
@@ -513,8 +595,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TargetPoints,
                 pointValue > 0 ? string.Format(" = ${0:F2} REWARD/contract", TargetPoints * pointValue) : ""));
             Print(string.Format("[INIT] Risk:Reward = 1:{0:F2}", TargetPoints / StopPoints));
-            Print(string.Format("[INIT] Trading hours: {0:D2}:{1:D2} - {2:D2}:{3:D2} NY",
-                TradingStartHourNY, TradingStartMinuteNY, TradingEndHourNY, TradingEndMinuteNY));
+            Print(string.Format("[INIT] Trading hours: {0} - {1} NY  (24h HH:mm)",
+                TradingStartTimeNY, TradingEndTimeNY));
 
             Print(string.Format("[INIT] AlertPattern (raw): \"{0}\"", AlertPattern));
             Print(string.Format("[INIT] AlertPattern (parsed, {0} pattern(s)): [{1}]",
@@ -1809,7 +1891,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void WriteCommonOccHeader(StreamWriter sw)
         {
-            sw.WriteLine("# schema_version=1.0.2");
+            sw.WriteLine("# schema_version=1.0.3");
             sw.WriteLine(string.Format("# file_created_NY={0}",
                 TimeZoneInfo.ConvertTime(DateTime.Now, nyTz).ToString("yyyy-MM-dd HH:mm:ss")));
             sw.WriteLine(string.Format("# file_created_UTC={0}",
@@ -2007,7 +2089,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.0.2");
+                        sw.WriteLine("# schema_version=1.0.3");
                         sw.WriteLine(string.Format("# instrument={0}", Instrument.FullName));
                         sw.WriteLine(string.Format("# tick_size={0}", TickSize));
                         sw.WriteLine(string.Format("# AlertPattern={0}", AlertPattern));
@@ -2058,7 +2140,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.0.2");
+                        sw.WriteLine("# schema_version=1.0.3");
                         sw.WriteLine(string.Format("# instrument={0}", Instrument.FullName));
                         sw.WriteLine(string.Format("# tick_size={0}", TickSize));
                         sw.WriteLine(string.Format("# StopPoints={0}", StopPoints));
@@ -2179,33 +2261,43 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double TargetPoints { get; set; }
 
         // ===== Group 3: Trading Hours (NY) =====
+        //
+        // [v1.0.3] UI simplified from 4 int fields to 2 string fields in
+        // strict 24-hour "HH:mm" format. The 4 legacy int properties below
+        // remain in the class but are hidden via [Browsable(false)] for
+        // backward compatibility with serialized workspaces. They are
+        // populated from the strings in State.Configure -> TryCompileConfig
+        // and all downstream code (IsWithinTradingHours, IsBeyondTradingHours,
+        // daily reset, INIT log) continues to read the int properties.
 
         [NinjaScriptProperty]
-        [Range(0, 23)]
-        [Display(Name = "Trading Start HOUR (NY)",
-            Description = "Trading window start hour (NY time). Default 9.",
+        [Display(Name = "Trading Start Time (NY, HH:mm)",
+            Description = "Trading window start time in 24-hour HH:mm format (NY time). Examples: \"09:30\" (US open), \"16:00\" (US close), \"18:00\" (Asia open), \"02:00\" (London open), \"23:45\" (end-of-day). Default \"09:30\".",
             Order = 1, GroupName = "3. Trading Hours (NY)")]
+        public string TradingStartTimeNY { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trading End Time (NY, HH:mm)",
+            Description = "Trading window end time in 24-hour HH:mm format (NY time). At/after this time, position is force-flat at market and working orders cancelled. If End is earlier than Start (e.g. start \"22:00\", end \"02:00\"), the window WRAPS midnight. Examples: \"16:00\", \"23:00\", \"02:00\". Default \"16:00\".",
+            Order = 2, GroupName = "3. Trading Hours (NY)")]
+        public string TradingEndTimeNY { get; set; }
+
+        // ----- Hidden legacy int fields (kept for backward compat) -----
+
+        [Browsable(false)]
+        [Range(0, 23)]
         public int TradingStartHourNY { get; set; }
 
-        [NinjaScriptProperty]
+        [Browsable(false)]
         [Range(0, 59)]
-        [Display(Name = "Trading Start MINUTE (NY)",
-            Description = "Trading window start minute (NY time). Default 30.",
-            Order = 2, GroupName = "3. Trading Hours (NY)")]
         public int TradingStartMinuteNY { get; set; }
 
-        [NinjaScriptProperty]
+        [Browsable(false)]
         [Range(0, 23)]
-        [Display(Name = "Trading End HOUR (NY)",
-            Description = "Trading window end hour (NY time). Default 16.",
-            Order = 3, GroupName = "3. Trading Hours (NY)")]
         public int TradingEndHourNY { get; set; }
 
-        [NinjaScriptProperty]
+        [Browsable(false)]
         [Range(0, 59)]
-        [Display(Name = "Trading End MINUTE (NY)",
-            Description = "Trading window end minute (NY time). Default 0. At/after this time: position force-flat at market, working orders cancelled.",
-            Order = 4, GroupName = "3. Trading Hours (NY)")]
         public int TradingEndMinuteNY { get; set; }
 
         // ===== Group 4: Alert Subsystem =====
