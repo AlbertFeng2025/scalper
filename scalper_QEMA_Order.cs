@@ -19,7 +19,7 @@ using NinjaTrader.NinjaScript.DrawingTools;
 
 
 // =============================================================================
-// STRATEGY: scalper_QEMA_Order v1.0.1
+// STRATEGY: scalper_QEMA_Order v1.0.2
 // AUTHOR:   Albert Feng / Drafted with help from Claude
 // =============================================================================
 //
@@ -39,54 +39,85 @@ using NinjaTrader.NinjaScript.DrawingTools;
 //   5. NEW QUALIFIED EMA CROSS — closes the current trade, does NOT open new
 //
 // =============================================================================
-// v1.0.1 CHANGES vs v1.0.0 — safety-brake logic redesign
+// v1.0.2 CHANGES vs v1.0.1 — brake counter scope + observability
 // =============================================================================
 //
-// CHANGE 1: consecutiveLosses now counts ANY losing bit (bit=0), regardless
-//   of which close trigger produced it. A winning bit (bit=1) resets the
-//   counter to 0.
+// CHANGE 1: consecutiveLosses now counts ONLY post-alert captured outcomes
+//   (capturedPostAlert == true). These are the trades the order subsystem
+//   would actually take with real money — i.e. simulated real-order outcomes.
 //
-//   Old (v1.0.0): only clean STOP fills counted as losses; window/hours/
-//   new-cross resolutions never touched the counter.
+//   Old (v1.0.1): the brake counted ANY qualified outcome with bit=0,
+//   regardless of whether an alert had armed the next entry. This meant
+//   "would-trade" qualified crosses that occurred BEFORE the first alert
+//   fired could trip the brake even though the order subsystem would never
+//   have placed an order on them.
 //
-//   New (v1.0.1): any resolution where outcome bit=0 increments the counter.
-//   Any resolution where outcome bit=1 resets it. Counter logic moved from
-//   OnExecutionUpdate to ResolvePending so it runs uniformly for all five
-//   close triggers.
+//   New (v1.0.2): the brake counts only outcomes that satisfy
+//   capturedPostAlert == true (the same condition that appends a bit to
+//   PostAlertOutcomeString). For these rows:
+//       bit == 0  → consecutiveLosses++  (simulated real-order loss)
+//       bit == 1  → consecutiveLosses=0  (simulated real-order win, reset)
+//   Rows with capturedPostAlert == false do not touch the counter.
 //
-// CHANGE 2: When safety brake trips, the strategy AUTO-DISABLES itself.
+//   The brake is now also evaluated regardless of EnableOrders, because the
+//   captured sequence is a SIMULATION of what real orders would have done.
+//   This makes historical replay diagnostic-useful: a multi-day preload that
+//   trips the brake is telling you exactly what your real-order P&L history
+//   looked like under the current parameters.
 //
-//   Old (v1.0.0): brake set safetyBrakeTripped=true but the strategy stayed
-//   enabled, silently blocking new entries. To the user, the strategy
-//   appeared to be running normally — you'd only discover the brake had
-//   tripped by reading the Output log. This is the failure mode that
-//   originally motivated this version.
+//   NOTE ON 'bit' SEMANTICS — what the brake actually counts:
+//     STOP    → bit=0 (broker stop fired = real loss)
+//     TARGET  → bit=1 (broker target fired = real win)
+//     WINDOW_EXPIRED / HOURS_BOUNDARY / NEW_QEMA killer:
+//             → bit = sign of (Close[0] vs Entry) at force-flat moment.
+//               This is the would-be P&L sign of the simulated market exit.
+//     EDGE CASE: Close[0] == Entry exactly is classified as bit=0 (loss).
+//     This is the conservative choice — a real order would pay commission +
+//     slippage on a flat exit, producing a small real loss. Documented here
+//     so users understand why a perfectly flat resolution counts against
+//     the brake.
 //
-//   New (v1.0.1): brake trip → safetyBrakeTripped=true → strategy calls
-//   SetState(State.Finalized) via TriggerCustomEvent. NT's Strategies tab
-//   shows the strategy as disabled immediately. The user sees the failure
-//   instantly instead of discovering it later. To resume trading, the user
-//   re-enables the strategy manually — which naturally resets all state
-//   including the safety brake counter.
+// CHANGE 2: New CSV columns in scalper_QEMA_occ.csv
+//   - SimConsecutiveLossesAfter: running count of consecutive sim-order losses
+//     after processing THIS row. Resets to 0 on a sim win. Unchanged on
+//     non-captured rows (carries forward the previous value).
+//   - RunningMaxSimConsLossesEver: highest value SimConsecutiveLossesAfter
+//     has ever reached up to and including this row. Monotonically increasing.
+//     READ THE LAST ROW to know the worst sim-loss streak in your history.
+//   These columns are written for EVERY row (qualified + skipped) so the
+//   reader can scan top-to-bottom without filtering.
 //
-//   Implementation note: SetState(State.Finalized) must run on NT's UI
-//   thread, not the bar-processing thread, hence the TriggerCustomEvent
-//   wrapper. Pattern borrowed from ShortScalper_FixedLimitEntry.
+// CHANGE 3: Safety brake trips during historical replay too
+//   Because Change 1 made the counter reflect simulated real orders, the
+//   brake now meaningfully reads historical data. If a preload contains a
+//   sim-loss streak >= MaxConsecutiveLosses, the strategy auto-disables
+//   IMMEDIATELY (during the historical pass, before reaching realtime).
 //
-// NOTE: This counter does NOT distinguish historical-replay outcomes from
-// live-trade outcomes. A streak during NT's historical replay can trip the
-// brake before any real live trading begins. If you observe this:
-//   - Read the [BRAKE] log lines in Output to understand the historical streak
-//   - Raise MaxConsecutiveLosses (e.g., to 10) in NT parameter panel
-//   - NT will restart the strategy; historical will replay with the new
-//     threshold; brake likely won't trip; live trading proceeds
-//   - You may lower the threshold back later, but each parameter change
-//     restarts the strategy
+//   This is the intended UX: the user enables the strategy, sees it disable,
+//   opens scalper_QEMA_occ.csv, sorts/searches RunningMaxSimConsLossesEver,
+//   and learns the historical worst streak. They can then either:
+//     (a) raise MaxConsecutiveLosses to (historical_max + a few) and re-enable
+//     (b) reconsider the entry rules
 //
-// Schema version bumped to 1.0.1 in all three CSV headers. File names unchanged.
+//   IMPORTANT WARNING — historical replay vs. real-time can differ:
+//     NinjaTrader's historical replay is bar-close based and runs on
+//     completed bars. Real-time runs on the same bar-close events but
+//     real orders experience slippage, partial fills, and broker delays
+//     that the simulator does not model. The captured-bit sequence assumes
+//     the simulated order resolves exactly at the qualified setup's
+//     stop/target/close prices. In live trading the actual P&L bit may
+//     differ on edge cases (e.g. a stop-and-target both within one bar's
+//     range, a TARGET fill at a price worse than the bracket level due to
+//     slippage, or a WINDOW exit that fills materially worse than Close).
+//     The brake counter is therefore CALIBRATED on simulated outcomes;
+//     real-time outcomes may produce slightly different streak lengths.
+//     This is acceptable because the brake's job is to detect REGIME
+//     issues (broken parameters, bad market hours), not slippage-level
+//     differences.
 //
-// EVERYTHING ELSE IDENTICAL TO v1.0.0. No changes to event generator, alert
-// subsystem, order subsystem state machine, CSV column layout, or defaults.
+// EVERYTHING ELSE IDENTICAL TO v1.0.1. No changes to event generator, alert
+// subsystem state, order subsystem state machine, file names, or defaults.
+// Schema version bumped to 1.0.2 in all three CSV headers.
 // =============================================================================
 
 namespace NinjaTrader.NinjaScript.Strategies
@@ -178,10 +209,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Live order linkage (only meaningful when EnableOrders=true)
         private int pendingLiveOrderNumber = 0;
 
-        // Previous-bar MACD/Signal values for cross detection
-        // (Pulled from indicator history each bar; no need to cache manually
-        //  if indicator provides .Default[1] and .Avg[1].)
-
         // =====================================================================
         // ORDER SUBSYSTEM STATE (universal)
         // =====================================================================
@@ -201,7 +228,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         private OrderEntryType currentWorkingOrderType = OrderEntryType.Market;
         private DateTime marketSubmitWallClock = DateTime.MinValue;
         private bool marketTimeoutLogged = false;
+
+        // [v1.0.2] consecutiveLosses is now driven by SIMULATED real-order
+        // outcomes (capturedPostAlert==true rows only), not all qualified
+        // outcomes. See header comments Change 1.
         private int consecutiveLosses = 0;
+
+        // [v1.0.2] runningMaxSimConsLossesEver tracks the all-time peak of
+        // consecutiveLosses. Written to every CSV row so the user can read
+        // the worst historical sim-loss streak directly from the last row.
+        private int runningMaxSimConsLossesEver = 0;
+
         private bool safetyBrakeTripped = false;
         private int lastEntryOrderNumber = 0;
         private DateTime lastDesyncLogTime = DateTime.MinValue;
@@ -441,7 +478,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void PrintInitLog()
         {
             Print("================================================================");
-            Print(string.Format("[INIT] scalper_QEMA_Order v1.0.1 at {0}",
+            Print(string.Format("[INIT] scalper_QEMA_Order v1.0.2 at {0}",
                 DateTime.Now.ToString("HH:mm:ss.fff")));
             Print(string.Format("[INIT] Instrument: {0}  TickSize: {1}",
                 Instrument.FullName, TickSize));
@@ -522,10 +559,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(string.Format("[INIT] MaxConsecutiveLosses = {0}{1}",
                     MaxConsecutiveLosses,
                     MaxConsecutiveLosses >= 99 ? " (effectively OFF)" : " (safety brake ACTIVE)"));
-                Print("[INIT]   [v1.0.1] Counter increments on ANY losing bit (bit=0) from any of");
-                Print("[INIT]            the 5 close triggers. Wins (bit=1) reset to 0.");
-                Print("[INIT]   [v1.0.1] When brake trips, strategy AUTO-DISABLES itself (visible in");
+                Print("[INIT]   [v1.0.2] Counter increments ONLY on post-alert captured outcomes");
+                Print("[INIT]            (rows where CapturedPostAlert=YES). bit=0 increments, bit=1 resets.");
+                Print("[INIT]            Qualified crosses BEFORE the first alert do NOT touch counter.");
+                Print("[INIT]   [v1.0.2] Counter active in BOTH historical replay and realtime. A multi-day");
+                Print("[INIT]            preload may trip the brake on historical sim-losses; this is the");
+                Print("[INIT]            intended diagnostic UX — open the CSV, read RunningMaxSimConsLossesEver");
+                Print("[INIT]            in the last row to see the worst historical sim-loss streak.");
+                Print("[INIT]   [v1.0.2] When brake trips, strategy AUTO-DISABLES itself (visible in");
                 Print("[INIT]            NT Strategies tab). Re-enable manually to reset.");
+                Print("[INIT]   NOTE: brake reads SIMULATED outcomes (bit values). Real-time order P&L can");
+                Print("[INIT]         differ slightly due to slippage. The brake's job is regime detection,");
+                Print("[INIT]         not slippage-level accuracy. See header comments for details.");
                 Print("[INIT] Safety layers active:");
                 Print("[INIT]   Layer 1: trading-hours end force-flat");
                 Print("[INIT]   Layer 2: NT session-close auto-flat (IsExitOnSessionCloseStrategy=true)");
@@ -614,20 +659,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Note: pendingState is NOT cleared on daily reset. If a cross
             // was started yesterday and is still resolving, let it finish.
             // Note: order subsystem state is NOT cleared on daily reset.
-            // Note: consecutiveLosses, safetyBrakeTripped persist across days.
+            // Note: consecutiveLosses, runningMaxSimConsLossesEver,
+            //       safetyBrakeTripped persist across days.
         }
 
         // =====================================================================
         // ============================================================
         //   EVENT GENERATOR — QEMA-SPECIFIC CODE BEGINS HERE
-        //   To adapt this strategy to another indicator (RSI, VWAP, etc.):
-        //     1. Replace methods CheckForNewEMACross, UpdatePendingTradeIfAny,
-        //        and the indicator initialization in State.DataLoaded.
-        //     2. Keep the same contract: call OnNewOutcomeBit(bit, ...) when a
-        //        trade resolves; call TryEnterLiveOrder(...) when a new trade
-        //        opens and isAlerted is true.
-        //     3. Leave ALERT SUBSYSTEM and ORDER SUBSYSTEM sections unchanged.
-        //     4. Update class name, Name property, CSV file prefixes.
         // ============================================================
         // =====================================================================
 
@@ -733,6 +771,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // Resolve the current pending trade: append outcome bit, write CSV,
         // force-flat any live order, return to Free state.
+        //
+        // [v1.0.2] Note: consecutiveLosses bookkeeping is NO LONGER performed
+        // here. It has moved to OnNewOutcomeBit (after the capturedPostAlert
+        // decision has been made) so it only counts simulated real-order
+        // outcomes — see Change 1 in the header.
         private void ResolvePending(int bit, string resolutionType, double resolutionPrice)
         {
             Print(string.Format("[QEMA] PENDING #{0} RESOLVED at {1} ({2}). Direction={3}, Entry={4:F2}, Resolution={5}@{6:F2}, Bars={7}, MaxFav={8:F2}, MaxAdv={9:F2}, Bit={10}",
@@ -751,7 +794,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Snapshot resolution info for the CSV row
             DateTime resolutionTime = Time[0];
 
-            // Hand off to the universal alert subsystem
+            // Hand off to the universal alert subsystem.
+            // OnNewOutcomeBit will (a) decide capturedPostAlert,
+            // (b) update consecutiveLosses iff captured, (c) trip brake iff
+            // threshold reached, (d) write CSV row.
             OnNewOutcomeBit(
                 bit: bit,
                 isLong: pendingIsLong,
@@ -772,47 +818,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 rawCrossNumber: pendingDailyCrossNumber,
                 qualifiedNumber: pendingDailyQualifiedNumber,
                 liveOrderNumber: pendingLiveOrderNumber);
-
-            // [v1.0.1] UNIFIED consecutiveLosses TRACKING
-            // Counts ANY losing bit (bit=0) regardless of which close trigger
-            // produced it: STOP, WINDOW_LOSS, HOURS_LOSS, NEW_QEMA_LOSS all
-            // count equally. ANY winning bit (bit=1) resets the counter to 0.
-            //
-            // Note: this counter does NOT distinguish historical replay outcomes
-            // from real-time live outcomes. A streak during NT's historical
-            // replay can trip the safety brake before any real live trading.
-            // Workarounds: raise MaxConsecutiveLosses, or disable+re-enable
-            // the strategy to reset.
-            if (EnableOrders)
-            {
-                if (bit == 0)
-                {
-                    consecutiveLosses++;
-                    Print(string.Format("[BRAKE] Loss recorded ({0}). Consecutive losses now = {1} of {2}.",
-                        resolutionType, consecutiveLosses, MaxConsecutiveLosses));
-                    if (consecutiveLosses >= MaxConsecutiveLosses && !safetyBrakeTripped)
-                    {
-                        safetyBrakeTripped = true;
-                        Print(string.Format("[CRITICAL] *** SAFETY BRAKE TRIPPED *** {0} consecutive losses >= {1}. STRATEGY AUTO-DISABLING. Re-enable manually to reset.",
-                            consecutiveLosses, MaxConsecutiveLosses));
-                        WriteOrderRow("SAFETY_BRAKE_TRIPPED", pendingLiveOrderNumber, "n/a", 0, 0, 0,
-                            string.Format("consecutive_losses={0} reason={1}", consecutiveLosses, resolutionType));
-                        try { PlayOrderSound("Alert2.wav", "Safety brake tripped — strategy auto-disabling"); } catch { }
-
-                        // [v1.0.1] Auto-disable so the user sees the failure in NT's
-                        // Strategies tab immediately rather than discovering it later
-                        // by reading Output logs.
-                        DisableStrategyDueToSafetyBrake();
-                    }
-                }
-                else
-                {
-                    if (consecutiveLosses > 0)
-                        Print(string.Format("[BRAKE] Win ({0}) resets consecutive losses (was {1}).",
-                            resolutionType, consecutiveLosses));
-                    consecutiveLosses = 0;
-                }
-            }
 
             // Chart marker for outcome
             if (EnableChartMarkers && ShowOutcomeLabels)
@@ -911,9 +916,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // ---- 2. Detect a new EMA cross on this bar ----
-        // If pending: a qualified cross is the 5th close trigger (killer).
-        // If free: a qualified cross opens a new trade (subject to gates).
-        // An unqualified cross is logged but does nothing else.
         private void CheckForNewEMACross(DateTime barTimeNy)
         {
             if (emaFastIndicator == null || emaSlowIndicator == null) return;
@@ -925,8 +927,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             double emaFastPrev = emaFastIndicator[1];
             double emaSlowPrev = emaSlowIndicator[1];
 
-            // Cross detection: previous bar's fast was on one side; current bar's fast is on the other.
-            // Equivalent to NT's CrossAbove(emaFast, emaSlow, 1) and CrossBelow(...).
             bool rawGolden = (emaFastPrev <= emaSlowPrev) && (emaFastNow > emaSlowNow);
             bool rawDeath  = (emaFastPrev >= emaSlowPrev) && (emaFastNow < emaSlowNow);
 
@@ -941,12 +941,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             double slopeFast = emaFastNow - emaFastIndicator[SlopePeriod];
             double slopeSlow = emaSlowNow - emaSlowIndicator[SlopePeriod];
 
-            // Slope qualification (same definition as the QualifiedEMA_CrossOver indicator)
             bool slopeQualifiedLong  = (slopeFast >  SlopeThresholdFast) && (slopeSlow >  SlopeThresholdSlow);
             bool slopeQualifiedShort = (slopeFast < -SlopeThresholdFast) && (slopeSlow < -SlopeThresholdSlow);
             bool slopeQualified = isLong ? slopeQualifiedLong : slopeQualifiedShort;
 
-            // ----- UNQUALIFIED CROSS: log and exit. Does NOT kill pending, does NOT open. -----
+            // ----- UNQUALIFIED CROSS -----
             if (!slopeQualified)
             {
                 Print(string.Format("[QEMA] {0} cross @ {1} SKIPPED_UNQUALIFIED  slopeFast={2:F3} (req {3:F3})  slopeSlow={4:F3} (req {5:F3})  Daily#{6}",
@@ -959,18 +958,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // ----- QUALIFIED CROSS — but what role does it play? -----
-            // CASE A: We are in a pending trade. This qualified cross is a KILLER.
-            // Close the trade now, do NOT open a new one this bar.
+            // ----- QUALIFIED CROSS — what role? -----
+            // CASE A: Pending trade. This qualified cross is a KILLER.
             if (pendingState == PendingState.Pending)
             {
                 Print(string.Format("[QEMA] {0} qualified cross @ {1} is KILLER for pending trade #{2}.  Closing trade.",
                     direction, Time[0].ToString("HH:mm:ss"), pendingDailyQualifiedNumber));
-
-                // Update excursions to include this killer bar (we may not have done it yet
-                // if UpdatePendingTradeIfAny ran and didn't resolve, then we got here)
-                // Actually UpdatePendingTradeIfAny already incremented barsWatched and ran
-                // excursions for this bar. Safe to skip re-running. But the BAR is the same.
 
                 int bit;
                 string resType;
@@ -985,14 +978,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     resType = bit == 1 ? "NEW_QEMA_WIN" : "NEW_QEMA_LOSS";
                 }
                 ResolvePending(bit, resType, Close[0]);
-
-                // The cross was CONSUMED as a killer. Do NOT open a new trade on this same bar.
-                // The next qualified cross (later) is the next entry candidate.
                 return;
             }
 
-            // CASE B: We are in Free state. This qualified cross is an OPENER candidate.
-            // Run gates and either open or skip.
+            // CASE B: Free state. OPENER candidate.
 
             // Gate 1: Trading hours
             if (!IsWithinTradingHours(barTimeNy))
@@ -1032,7 +1021,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // ----- All gates passed. OPEN a new trade. -----
+            // ----- OPEN trade -----
             dailyQualifiedNumber++;
             pendingState        = PendingState.Pending;
             pendingIsLong       = isLong;
@@ -1078,7 +1067,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (EnableOrders && safetyBrakeTripped)
             {
-                Print(string.Format("[ORDER] Qualified QEMA cross detected but SAFETY BRAKE is tripped ({0} consecutive losses >= {1}). No order. Disable+re-enable to reset.",
+                Print(string.Format("[ORDER] Qualified QEMA cross detected but SAFETY BRAKE is tripped ({0} consecutive sim losses >= {1}). No order. Disable+re-enable to reset.",
                     consecutiveLosses, MaxConsecutiveLosses));
             }
             else if (EnableOrders && !isAlerted)
@@ -1096,8 +1085,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // =====================================================================
         // ============================================================
-        //   ALERT SUBSYSTEM — UNIVERSAL, COPY/PASTE-ABLE
-        //   (identical to Renko v1.4.4 alert subsystem)
+        //   ALERT SUBSYSTEM — UNIVERSAL
         // ============================================================
         // =====================================================================
 
@@ -1139,7 +1127,47 @@ namespace NinjaTrader.NinjaScript.Strategies
                     capturedBit, postAlertOutcomeString.ToString(), pendingPostAlertCaptures));
             }
 
-            // 3. Check for alert: does ANY pattern in the list match the tail?
+            // 3. [v1.0.2] BRAKE COUNTER — only on captured (simulated real-order) outcomes.
+            //    Active regardless of EnableOrders so that historical replay is diagnostic.
+            //    bit=0 + captured -> increment.  bit=1 + captured -> reset.
+            //    Non-captured rows leave consecutiveLosses unchanged.
+            if (capturedPostAlert)
+            {
+                if (bit == 0)
+                {
+                    consecutiveLosses++;
+                    if (consecutiveLosses > runningMaxSimConsLossesEver)
+                        runningMaxSimConsLossesEver = consecutiveLosses;
+
+                    Print(string.Format("[BRAKE] Sim loss recorded ({0}). Consecutive sim losses = {1} of {2}. RunningMaxEver = {3}.",
+                        resolutionType, consecutiveLosses, MaxConsecutiveLosses, runningMaxSimConsLossesEver));
+
+                    if (consecutiveLosses >= MaxConsecutiveLosses && !safetyBrakeTripped)
+                    {
+                        safetyBrakeTripped = true;
+                        Print(string.Format("[CRITICAL] *** SAFETY BRAKE TRIPPED *** {0} consecutive sim losses >= {1}. STRATEGY AUTO-DISABLING. Re-enable manually to reset.",
+                            consecutiveLosses, MaxConsecutiveLosses));
+                        Print(string.Format("[CRITICAL] State at trip: {0}. Open scalper_QEMA_occ.csv and look for RunningMaxSimConsLossesEver = {1} near this timestamp.",
+                            State == State.Historical ? "HISTORICAL REPLAY" : "REALTIME",
+                            runningMaxSimConsLossesEver));
+                        WriteOrderRow("SAFETY_BRAKE_TRIPPED", liveOrderNumber, "n/a", 0, 0, 0,
+                            string.Format("consecutive_sim_losses={0} reason={1} state={2}",
+                                consecutiveLosses, resolutionType,
+                                State == State.Historical ? "historical" : "realtime"));
+                        try { PlayOrderSound("Alert2.wav", "Safety brake tripped — strategy auto-disabling"); } catch { }
+                        DisableStrategyDueToSafetyBrake();
+                    }
+                }
+                else
+                {
+                    if (consecutiveLosses > 0)
+                        Print(string.Format("[BRAKE] Sim win ({0}) resets consecutive sim losses (was {1}). RunningMaxEver remains {2}.",
+                            resolutionType, consecutiveLosses, runningMaxSimConsLossesEver));
+                    consecutiveLosses = 0;
+                }
+            }
+
+            // 4. Check for alert: does ANY pattern in the list match the tail?
             bool firedAlert = false;
             if (AnyAlertPatternMatchesTail())
             {
@@ -1147,13 +1175,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 firedAlert = true;
             }
 
-            // 4. Recompute isAlerted (used by event generator to gate live orders)
+            // 5. Recompute isAlerted
             bool prev = isAlerted;
             isAlerted = AnyAlertPatternMatchesTail();
             if (prev != isAlerted)
                 Print(string.Format("[ALERTSTATE] isAlerted: {0} -> {1}", prev, isAlerted ? "YES" : "no"));
 
-            // 5. Write CSV row for this QUALIFIED cross
+            // 6. Write CSV row for this QUALIFIED cross
             WriteQualifiedCrossRow(
                 crossTime: crossTime,
                 isLong: isLong,
@@ -1180,7 +1208,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 liveOrderNumber: liveOrderNumber);
         }
 
-        // Returns true iff ANY pattern in compiledAlertPatterns is a suffix of QualifiedEMAOutcomeString.
         private bool AnyAlertPatternMatchesTail()
         {
             string tail = qualifiedEmaOutcomeString.ToString();
@@ -1202,7 +1229,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             return false;
         }
 
-        // FireAlert — sound, diamond, CSV row, counter increment
         private void FireAlert()
         {
             dailyAlertNumber++;
@@ -1242,22 +1268,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // =====================================================================
         // ============================================================
-        //   ORDER SUBSYSTEM — UNIVERSAL, COPY/PASTE-ABLE
-        //   (adapted from Renko v1.4.3 — Bricks → Points substitution)
+        //   ORDER SUBSYSTEM — UNIVERSAL
         // ============================================================
         // =====================================================================
 
-        // Called by event generator when a qualified cross occurs AND isAlerted is true.
         private void TryEnterLiveOrder(bool isLong, double currentPrice, DateTime barTimeNy)
         {
-            // Gate: order subsystem must be Idle
             if (orderState != OrderSubState.Idle)
             {
                 Print(string.Format("[ORDER] Qualified cross detected but orderState={0} (not Idle). No new order.", orderState));
                 return;
             }
 
-            // Gate: strategy position must be flat
             if (Position.MarketPosition != MarketPosition.Flat)
             {
                 Print(string.Format("[ORDER] Qualified cross detected but strategy Position={0} (not Flat). No order.",
@@ -1265,7 +1287,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // All gates passed. Submit entry order.
             dailyOrderNumber++;
             entryOrderNumber = dailyOrderNumber;
             lastEntryOrderNumber = entryOrderNumber;
@@ -1280,8 +1301,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             liveOrderEntryBarIdx = CurrentBar;
             liveOrderEventWindowBars = EventWindowBars;
 
-            // Pre-set OCO bracket via SetStopLoss / SetProfitTarget (server-side)
-            // Use Ticks mode (NT computes from fill price).
             int stopTicks   = (int)Math.Round(StopPoints   / TickSize);
             int targetTicks = (int)Math.Round(TargetPoints / TickSize);
             string entrySignal = isLong ? "EntryQEMA" : "EntryQEMAShort";
@@ -1350,7 +1369,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // Per-bar tick housekeeping for working/position states
         private void OrderSubsystemPerBarTick(DateTime barTimeNy)
         {
             if (orderState == OrderSubState.Working && workingEntryOrder != null)
@@ -1398,7 +1416,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 else
                 {
-                    // Market: wall-clock heartbeat, NEVER cancel
                     TimeSpan elapsed = DateTime.Now - marketSubmitWallClock;
                     if (elapsed.TotalSeconds > 30 && !marketTimeoutLogged)
                     {
@@ -1411,7 +1428,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 
-            // Heartbeat for non-idle states
             if (orderState != OrderSubState.Idle)
             {
                 bricksInCurrentState++;
@@ -1428,7 +1444,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 bricksInCurrentState = 0;
             }
 
-            // Trading-hours end force-flat
             if (!forceFlatInProgress && IsBeyondTradingHours(barTimeNy))
             {
                 if (orderState == OrderSubState.Working)
@@ -1475,7 +1490,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // OnOrderUpdate — entry order lifecycle
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice,
             int quantity, int filled, double averageFillPrice,
             OrderState orderUpdateState, DateTime time, ErrorCode error, string comment)
@@ -1510,7 +1524,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // OnExecutionUpdate — entry fill and exit fills
         protected override void OnExecutionUpdate(Execution execution, string executionId, double price,
             int quantity, MarketPosition marketPosition, string orderId, DateTime time)
         {
@@ -1519,7 +1532,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             string oName = execution.Order.Name ?? "";
 
-            // Entry fills
             if ((oName == "EntryQEMA" || oName == "EntryQEMAShort")
                 && (execution.Order.OrderState == NinjaTrader.Cbi.OrderState.Filled
                  || execution.Order.OrderState == NinjaTrader.Cbi.OrderState.PartFilled))
@@ -1555,7 +1567,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // Exit fills — identified by NT default bracket names
             bool isStopFill   = oName.IndexOf("Stop", StringComparison.OrdinalIgnoreCase) >= 0;
             bool isTargetFill = oName.IndexOf("Profit", StringComparison.OrdinalIgnoreCase) >= 0
                              || oName.IndexOf("Target", StringComparison.OrdinalIgnoreCase) >= 0;
@@ -1574,10 +1585,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (isStopFill)
                 {
                     PlayOrderSound("Glass Break.wav", "Stop loss hit");
-                    // [v1.0.1] consecutiveLosses bookkeeping moved to ResolvePending,
-                    // so it counts ALL losing bits (any close trigger), not just
-                    // bracket stops. Sound still fires here at the actual moment
-                    // the broker confirms the stop fill.
+                    // [v1.0.2] consecutiveLosses is now updated in OnNewOutcomeBit on
+                    // capturedPostAlert==true rows, not here. Sound still fires at the
+                    // actual moment the broker confirms the stop fill.
                 }
                 else
                 {
@@ -1588,12 +1598,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // [v1.0.1 FIX] Recognize our own self-submitted force-flat exit fills.
-            // These come from ExitLong/ExitShort calls with names like "ExitWindow",
-            // "ExitHours", "ExitDesync", and (QEMA-specific) "ExitNewCross". Without
-            // this block, the strategy's orderState would remain Position after a
-            // force-flat exit, blocking all subsequent entries until the defensive
-            // CheckPositionSync() rescued the state ~1 bar later.
             bool isOurForceFlat =
                    oName == "ExitWindow"            || oName == "ExitWindowShort"
                 || oName == "ExitHours"             || oName == "ExitHoursShort"
@@ -1611,15 +1615,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 WriteOrderRow("EXIT_FORCE_FLAT_FILLED", entryOrderNumber, "n/a",
                     price, computedStopPrice, computedTargetPrice, oName);
 
-                // Note: do NOT touch consecutiveLosses here. Window/hours/new-cross exits are
-                // neither true target hits nor true stop hits. The safety brake
-                // only counts genuine STOP fills as losses.
-
                 ResetOrderSubsystemToIdle("force_flat_filled_" + oName);
             }
         }
 
-        // Defensive position-sync check at top of every OnBarUpdate
         private void CheckPositionSync()
         {
             try
@@ -1710,13 +1709,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             marketTimeoutLogged = false;
             liveOrderEntryBarIdx = -1;
             liveOrderEventWindowBars = 0;
-            // NOTE: consecutiveLosses and safetyBrakeTripped persist.
+            // NOTE: consecutiveLosses, runningMaxSimConsLossesEver, and
+            // safetyBrakeTripped persist.
         }
 
         // [v1.0.1] Auto-disable the strategy after the safety brake trips.
-        // SetState(State.Finalized) must run on NT's UI thread, not the bar-
-        // processing thread, hence the TriggerCustomEvent wrapper. Pattern
-        // borrowed from ShortScalper_FixedLimitEntry.
+        // [v1.0.2] Now reachable during historical replay too.
         private void DisableStrategyDueToSafetyBrake()
         {
             Print(string.Format("[DISABLE] Triggering strategy disable at {0}",
@@ -1757,7 +1755,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             int endMin   = TradingEndHourNY   * 60 + TradingEndMinuteNY;
             if (startMin <= endMin)
                 return curMin >= startMin && curMin <= endMin;
-            // Wraps midnight (e.g. 22:00 - 02:00)
             return curMin >= startMin || curMin <= endMin;
         }
 
@@ -1771,7 +1768,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             return curMin > endMin && curMin < startMin;
         }
 
-        // Check if account has ANY position on this instrument (manual, other strategy, etc.)
         private bool HasAnyPositionOnInstrument()
         {
             try
@@ -1813,7 +1809,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void WriteCommonOccHeader(StreamWriter sw)
         {
-            sw.WriteLine("# schema_version=1.0.1");
+            sw.WriteLine("# schema_version=1.0.2");
             sw.WriteLine(string.Format("# file_created_NY={0}",
                 TimeZoneInfo.ConvertTime(DateTime.Now, nyTz).ToString("yyyy-MM-dd HH:mm:ss")));
             sw.WriteLine(string.Format("# file_created_UTC={0}",
@@ -1835,8 +1831,19 @@ namespace NinjaTrader.NinjaScript.Strategies
             sw.WriteLine(string.Format("# AlertPattern={0}", AlertPattern));
             sw.WriteLine(string.Format("# AlertPatternParsed=[{0}]", string.Join(", ", compiledAlertPatterns)));
             sw.WriteLine(string.Format("# EnableOrders={0}", EnableOrders));
+            sw.WriteLine(string.Format("# MaxConsecutiveLosses={0}", MaxConsecutiveLosses));
             sw.WriteLine("# encoding: SUCCESS=1, FAILURE=0");
             sw.WriteLine("# all timestamps NY time");
+            sw.WriteLine("#");
+            sw.WriteLine("# [v1.0.2] BRAKE COLUMNS (new):");
+            sw.WriteLine("#   SimConsecutiveLossesAfter   - consecutive sim-order losses after this row");
+            sw.WriteLine("#                                 (only changes on CapturedPostAlert=YES rows;");
+            sw.WriteLine("#                                  bit=0 increments, bit=1 resets to 0)");
+            sw.WriteLine("#   RunningMaxSimConsLossesEver - all-time peak of SimConsecutiveLossesAfter");
+            sw.WriteLine("#                                 up to and including this row. READ THE LAST");
+            sw.WriteLine("#                                 ROW to see the worst sim-loss streak ever.");
+            sw.WriteLine("# WARNING: brake counts SIMULATED outcomes (bit values). Live order P&L may");
+            sw.WriteLine("#          differ slightly due to slippage. See strategy header comments.");
             sw.WriteLine("#");
         }
 
@@ -1851,10 +1858,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 + "AlertPattern,QualifiedEMAOutcomeString,"
                 + "FiredAlertOnThisRow,CapturedPostAlert,CapturedBit,"
                 + "PostAlertOutcomeString,PendingPostAlertCapturesAfter,"
-                + "IsAlertedAfter,OrderStateAfter,LiveOrderNumber");
+                + "IsAlertedAfter,OrderStateAfter,LiveOrderNumber,"
+                + "SimConsecutiveLossesAfter,RunningMaxSimConsLossesEver");
         }
 
-        // Write a row for a QUALIFIED + RESOLVED cross
         private void WriteQualifiedCrossRow(
             DateTime crossTime, bool isLong, string eventType,
             double emaFastValue, double emaSlowValue, double slopeFast, double slopeSlow,
@@ -1884,7 +1891,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     string apForCsv = AlertPattern.Contains(",") ? "\"" + AlertPattern + "\"" : AlertPattern;
 
                     sw.WriteLine(string.Format(
-                        "{0},{1},{2},{3:F4},{4:F4},{5:F4},{6:F4},{7:F2},{8:F2},{9:F2},{10},{11},{12},{13:F2},{14:F2},{15:F2},{16},{17},{18},{19},{20},{21},{22},{23},{24},{25},{26},{27},{28}",
+                        "{0},{1},{2},{3:F4},{4:F4},{5:F4},{6:F4},{7:F2},{8:F2},{9:F2},{10},{11},{12},{13:F2},{14:F2},{15:F2},{16},{17},{18},{19},{20},{21},{22},{23},{24},{25},{26},{27},{28},{29},{30}",
                         TimeZoneInfo.ConvertTime(crossTime, nyTz).ToString("yyyy-MM-dd HH:mm:ss"),
                         isLong ? "LONG" : "SHORT",
                         eventType,
@@ -1913,7 +1920,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                         pendingPostAlertCaptures,
                         isAlerted ? "YES" : "NO",
                         orderState,
-                        liveOrderNumber > 0 ? liveOrderNumber.ToString() : ""));
+                        liveOrderNumber > 0 ? liveOrderNumber.ToString() : "",
+                        consecutiveLosses,
+                        runningMaxSimConsLossesEver));
                 }
             }
             catch (Exception ex)
@@ -1944,20 +1953,21 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                     string apForCsv = AlertPattern.Contains(",") ? "\"" + AlertPattern + "\"" : AlertPattern;
 
-                    // SKIPPED rows: only fill in cross-detection info; resolution/outcome columns blank.
-                    // Column layout (29 fields):
-                    // CrossTime_NY, Direction, EventType,
-                    // EmaFastValue, EmaSlowValue, SlopeFast, SlopeSlow,
-                    // EntryPrice, StopPrice, TargetPrice,
-                    // ResolutionTime_NY, BarsToResolve, ResolutionType, ResolutionPrice,
-                    // MaxFavorable, MaxAdverse, OutcomeBit,
-                    // DailyCrossNumber, DailyQualifiedNumber,
-                    // AlertPattern, QualifiedEMAOutcomeString,
-                    // FiredAlertOnThisRow, CapturedPostAlert, CapturedBit,
-                    // PostAlertOutcomeString, PendingPostAlertCapturesAfter,
-                    // IsAlertedAfter, OrderStateAfter, LiveOrderNumber
+                    // SKIPPED rows: cross-detection info only; resolution/outcome columns blank.
+                    // Two trailing brake columns ALWAYS present (carry forward unchanged values).
+                    // Column layout (31 fields):
+                    //  1-7   CrossTime, Direction, EventType, Ema*, Slope*
+                    //  8-10  EntryPrice, StopPrice, TargetPrice  (blank)
+                    //  11-14 ResolutionTime, Bars, ResType, ResPrice  (blank)
+                    //  15-17 MaxFav, MaxAdv, OutcomeBit  (blank)
+                    //  18-19 DailyCross#, DailyQualified#
+                    //  20-21 AlertPattern, QualifiedEMAOutcomeString
+                    //  22-24 FiredAlert(NO), CapturedPostAlert(NO), CapturedBit(blank)
+                    //  25-26 PostAlertOutcomeString, PendingPostAlertCapturesAfter
+                    //  27-29 IsAlertedAfter, OrderStateAfter, LiveOrderNumber(blank)
+                    //  30-31 SimConsecutiveLossesAfter, RunningMaxSimConsLossesEver
                     sw.WriteLine(string.Format(
-                        "{0},{1},{2},{3:F4},{4:F4},{5:F4},{6:F4},,,,,,,,,,,{7},{8},{9},{10},NO,NO,,{11},{12},{13},{14},",
+                        "{0},{1},{2},{3:F4},{4:F4},{5:F4},{6:F4},,,,,,,,,,,{7},{8},{9},{10},NO,NO,,{11},{12},{13},{14},,{15},{16}",
                         TimeZoneInfo.ConvertTime(crossTime, nyTz).ToString("yyyy-MM-dd HH:mm:ss"),
                         isLong ? "LONG" : "SHORT",
                         eventType,
@@ -1972,7 +1982,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                         postAlertOutcomeString.ToString(),
                         pendingPostAlertCaptures,
                         isAlerted ? "YES" : "NO",
-                        orderState));
+                        orderState,
+                        consecutiveLosses,
+                        runningMaxSimConsLossesEver));
                 }
             }
             catch (Exception ex)
@@ -1995,7 +2007,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.0.1");
+                        sw.WriteLine("# schema_version=1.0.2");
                         sw.WriteLine(string.Format("# instrument={0}", Instrument.FullName));
                         sw.WriteLine(string.Format("# tick_size={0}", TickSize));
                         sw.WriteLine(string.Format("# AlertPattern={0}", AlertPattern));
@@ -2004,13 +2016,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                         sw.WriteLine("#");
                         sw.WriteLine("AlertTime_NY,DailyAlertNumber,AlertPattern,CurrentPrice,"
                             + "QualifiedEMAOutcomeString,PostAlertOutcomeString,"
-                            + "PendingPostAlertCapturesAfter,IsAlertedAfter,OrderStateAtAlert");
+                            + "PendingPostAlertCapturesAfter,IsAlertedAfter,OrderStateAtAlert,"
+                            + "SimConsecutiveLossesAtAlert,RunningMaxSimConsLossesEver");
                     }
 
                     string apForCsv = AlertPattern.Contains(",") ? "\"" + AlertPattern + "\"" : AlertPattern;
 
                     sw.WriteLine(string.Format(
-                        "{0},{1},{2},{3:F2},{4},{5},{6},{7},{8}",
+                        "{0},{1},{2},{3:F2},{4},{5},{6},{7},{8},{9},{10}",
                         TimeZoneInfo.ConvertTime(Time[0], nyTz).ToString("yyyy-MM-dd HH:mm:ss"),
                         dailyAlertNumber,
                         apForCsv,
@@ -2019,7 +2032,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                         postAlertOutcomeString.ToString(),
                         pendingPostAlertCaptures,
                         isAlerted ? "YES" : "NO",
-                        orderState));
+                        orderState,
+                        consecutiveLosses,
+                        runningMaxSimConsLossesEver));
                 }
             }
             catch (Exception ex)
@@ -2043,7 +2058,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (!fileExists)
                     {
-                        sw.WriteLine("# schema_version=1.0.1");
+                        sw.WriteLine("# schema_version=1.0.2");
                         sw.WriteLine(string.Format("# instrument={0}", Instrument.FullName));
                         sw.WriteLine(string.Format("# tick_size={0}", TickSize));
                         sw.WriteLine(string.Format("# StopPoints={0}", StopPoints));
@@ -2070,12 +2085,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                         sw.WriteLine("#   DESYNC_FORCE_FLAT              - state=Idle but broker has position");
                         sw.WriteLine("#   DESYNC_RESET_IDLE              - state=Working/Position but broker Flat");
                         sw.WriteLine("#   MARKET_HEARTBEAT_WARN          - market order no fill confirm after 30s");
-                        sw.WriteLine("#   SAFETY_BRAKE_TRIPPED           - consecutive losses limit reached");
+                        sw.WriteLine("#   SAFETY_BRAKE_TRIPPED           - [v1.0.2] consecutive SIM-loss limit reached; strategy auto-disables");
                         sw.WriteLine("#   REJECTED                       - entry order rejected");
                         sw.WriteLine("#");
-                        sw.WriteLine("EventTime_NY,EventType,EntryOrderNumber,OrderTypeStr,Price,StopPrice,TargetPrice,OrderState,Extra");
+                        sw.WriteLine("EventTime_NY,EventType,EntryOrderNumber,OrderTypeStr,Price,StopPrice,TargetPrice,OrderState,SimConsecutiveLosses,RunningMaxSimConsLossesEver,Extra");
                     }
-                    sw.WriteLine(string.Format("{0},{1},{2},{3},{4:F2},{5:F2},{6:F2},{7},{8}",
+                    sw.WriteLine(string.Format("{0},{1},{2},{3},{4:F2},{5:F2},{6:F2},{7},{8},{9},{10}",
                         TimeZoneInfo.ConvertTime(Time[0], nyTz).ToString("yyyy-MM-dd HH:mm:ss"),
                         eventType,
                         orderNumber,
@@ -2084,6 +2099,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                         stopPx,
                         targetPx,
                         orderState,
+                        consecutiveLosses,
+                        runningMaxSimConsLossesEver,
                         extra));
                 }
             }
@@ -2251,7 +2268,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Range(1, 100)]
         [Display(Name = "Max Consecutive Losses (Halt)",
-            Description = "Halt new orders after this many losing trades in a row. Default 3 (conservative for new strategy). Set to 99 to effectively disable. Disable+re-enable strategy to reset.",
+            Description = "[v1.0.2] Halt new orders after this many SIM-ORDER losses in a row. The brake counts only post-alert captured outcomes (the trades the order subsystem would actually take), NOT all qualified crosses. Counter active in both historical and realtime. Default 3 (conservative). Set to 99 to effectively disable. Disable+re-enable strategy to reset. To find your historical worst streak: open scalper_QEMA_occ.csv and read RunningMaxSimConsLossesEver in the last row.",
             Order = 6, GroupName = "5. Order Execution")]
         public int MaxConsecutiveLosses { get; set; }
 
