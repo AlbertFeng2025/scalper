@@ -235,6 +235,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double actualFillPrice = 0.0;
         private double computedStopPrice = 0.0;
         private double computedTargetPrice = 0.0;
+        private double actualExitPrice = 0.0;   // [v1.4.6] actual fill price of stop/target exit (for slippage analysis)
 
         private bool forceFlatInProgress = false;
 
@@ -258,20 +259,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                 EntriesPerDirection                       = 1;
                 EntryHandling                             = EntryHandling.AllEntries;
                 IsExitOnSessionCloseStrategy              = true;
-                BarsRequiredToTrade                       = 20;
+                BarsRequiredToTrade                       = 5;
                 IsInstantiatedOnEachOptimizationIteration = true;
 
                 // ---- Pattern parameters ----
-                PatternToMatch   = "011";
-                FollowUpPattern  = "1";
+                PatternToMatch   = "10";
+                FollowUpPattern  = "0";
 
                 // ---- Alert ----
-                AlertPattern     = "01,011,0111";
+                AlertPattern     = "0,1";
 
                 // ---- EMA filter ----
                 EMA1Period       = 20;
                 EMA2Period       = 9;
-                EmaFilterMode    = EmaFilterModeEnum.OpenAbove;   // [v1.4.5] default = v1.4.4 behavior
+                EmaFilterMode    = EmaFilterModeEnum.NoFilter;   // [v1.4.5] default = v1.4.4 behavior
 
                 // ---- Beep ----
                 AlertSoundCount   = 3;
@@ -289,13 +290,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 // ---- Order Execution defaults ----
                 EnableOrders         = false;
-                TradeDirection       = TradeDirectionEnum.Long;   // [v1.4.5] default = long-only (back-compat)
+                TradeDirection       = TradeDirectionEnum.Short;   // [v1.4.5] default = long-only (back-compat)
                 OrderQuantity        = 1;
-                OrderType            = OrderEntryType.Limit;
+                OrderType            = OrderEntryType.Market;
                 LimitUnderPoints     = 5.0;
                 UnfilledCancelBricks = 1;
-                StopLossBricks       = 1.0;
-                ProfitTargetBricks   = 1.0;
+                StopLossBricks       = 0.2;
+                ProfitTargetBricks   = 0.9;
                 MaxConsecutiveLosses = 99;
 
                 // ---- Working Hours & Expiry defaults ----
@@ -1177,6 +1178,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 && orderState == OrderSubState.Position)
             {
                 string which = isStopFill ? "STOP" : "TARGET";
+                actualExitPrice = price;   // [v1.4.6] record actual fill price for slippage analysis
                 // PnL sign depends on direction:
                 //   Long:  pnl = exit - entry
                 //   Short: pnl = entry - exit
@@ -1184,7 +1186,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(string.Format("[ORDER] *** {0} HIT *** ({1}) order #{2} ({3}) exit @ {4:F2}. Entry={5:F2}. PnL/contract={6:+0.00;-0.00} pt.",
                     which, entryIsLong ? "LONG" : "SHORT",
                     entryOrderNumber, oName, price, actualFillPrice, pnl));
-                WriteOrderRow(isStopFill ? "EXIT_STOP" : "EXIT_TARGET", entryOrderNumber, "n/a", 0, computedStopPrice, computedTargetPrice, entryIsLong ? "LONG" : "SHORT");
+                WriteOrderRow(isStopFill ? "EXIT_STOP" : "EXIT_TARGET", entryOrderNumber, "n/a", actualExitPrice, computedStopPrice, computedTargetPrice, entryIsLong ? "LONG" : "SHORT");
 
                 if (isStopFill)
                 {
@@ -1306,6 +1308,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             actualFillPrice = 0.0;
             computedStopPrice = 0.0;
             computedTargetPrice = 0.0;
+            actualExitPrice = 0.0;
             forceFlatInProgress = false;
             cancelRequested = false;
             bricksInCurrentState = 0;
