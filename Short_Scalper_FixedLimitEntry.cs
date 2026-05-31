@@ -24,7 +24,7 @@ using NinjaTrader.NinjaScript.DrawingTools;
 #endregion
 
 // =============================================================================
-//  STRATEGY:    ShortScalper v2.6
+//  STRATEGY:    ShortScalper_FixedLimitEntry v2.6
 //  AUTHOR:      Drafted with help from Claude
 //  REPLACES:    ShortScalper v2.5
 // =============================================================================
@@ -74,6 +74,18 @@ using NinjaTrader.NinjaScript.DrawingTools;
 //
 //  Enum renamed:
 //    ShortStopLossMode.AtrBased -> ShortStopLossMode.OffsetFromFilledPrice
+//
+//  CHANGE 3 (post v2.6 patch): StopTargetHandling explicitly set
+//  -------------------------------------------------------------
+//  StopTargetHandling = StopTargetHandling.PerEntryExecution is now
+//  explicitly declared in SetDefaults. NT8 default is already
+//  PerEntryExecution, so this is a zero-behavior-change clarification.
+//  Purpose: makes the intended behavior explicit and immune to any
+//  future NT default changes. With PerEntryExecution, each partial fill
+//  execution gets its own bracket immediately — no unprotected window.
+//  If a late fill causes bracket rejection, RealtimeErrorHandling =
+//  StopCancelClose flattens everything. Forced flat beats unprotected
+//  position.
 //
 // =============================================================================
 //  KEY DIRECTIONAL LOGIC (UNCHANGED FROM v2.5)
@@ -131,7 +143,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         FixedPoints
     }
 
-    public class ShortScalper : Strategy
+    public class ShortScalper_FixedLimitEntry : Strategy
     {
         #region Variables
 
@@ -168,7 +180,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double initialStopDistance   = 0;
 
         private const int MinuteBarsIndex = 1;
-        private const string EntrySignalName = "ShortScalperEntry";
+        private const string EntrySignalName = "ShortScalper_FixedLimitEntry";
 
         #endregion
 
@@ -177,7 +189,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (State == State.SetDefaults)
             {
                 Description                                 = "Short-only scalper with trailing stop, fixed-limit-price option, and bar-size-based adaptive stops (v2.6).";
-                Name                                        = "ShortScalper";
+                Name                                        = "ShortScalper_FixedLimitEntry";
                 Calculate                                   = Calculate.OnEachTick;
                 EntriesPerDirection                         = 1;
                 EntryHandling                               = EntryHandling.AllEntries;
@@ -191,6 +203,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TimeInForce                                 = TimeInForce.Day;
                 TraceOrders                                 = false;
                 RealtimeErrorHandling                       = RealtimeErrorHandling.StopCancelClose;
+                // [v2.6 patch] Explicit declaration — NT8 default is already
+                // PerEntryExecution. Declaring it here locks the behavior and
+                // documents the intent: each partial fill execution gets its own
+                // bracket immediately. If a late fill causes bracket rejection,
+                // RealtimeErrorHandling=StopCancelClose flattens everything.
+                // Forced flat beats an unprotected position.
                 StopTargetHandling                          = StopTargetHandling.PerEntryExecution;
                 BarsRequiredToTrade                         = 20;
                 IsInstantiatedOnEachOptimizationIteration   = true;
@@ -232,7 +250,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Realtime)
             {
                 Print("================================================================");
-                Print(string.Format("[INIT] ShortScalper v2.6 armed at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
+                Print(string.Format("[INIT] ShortScalper_FixedLimitEntry v2.6 armed at {0}", DateTime.Now.ToString("HH:mm:ss.fff")));
                 Print(string.Format("[INIT] LimitMode={0}, FixedLimitPrice={1}",
                     LimitMode, FixedLimitPrice));
                 Print(string.Format("[INIT] StopMode={0}", StopMode));
@@ -246,6 +264,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Print(string.Format("[INIT]   HardStop={0}pts, Trail={1}pts",
                         HardStopPoints, TrailDistancePoints));
                 }
+                Print(string.Format("[INIT] StopTargetHandling=PerEntryExecution (explicit): each partial fill gets its own bracket immediately."));
+                Print(string.Format("[INIT] RealtimeErrorHandling=StopCancelClose: bracket rejection -> forced flat -> strategy disabled."));
                 Print(string.Format("[INIT] Other: OrderLife={0}s, Monitor={1}s, Target={2}pts, Tolerance={3}pts, DisableDelay={4}s",
                     OrderLifeSeconds, MonitorIntervalSeconds, ProfitTargetPoints,
                     PullbackTolerancePoints, DisableDelaySeconds));
@@ -923,7 +943,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // WriteAuditLog: writes to ShortScalper.csv with v2.6 columns.
+        // WriteAuditLog: writes to ShortScalper_FixedLimitEntry.csv with v2.6 columns.
         // =====================================================================
         private void WriteAuditLog(string outcome, double fillPrice, double exitPrice, double pnlPoints)
         {
@@ -932,7 +952,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (!Directory.Exists(AuditLogPath))
                     Directory.CreateDirectory(AuditLogPath);
 
-                string logFile = Path.Combine(AuditLogPath, "ShortScalper.csv");
+                string logFile = Path.Combine(AuditLogPath, "ShortScalper_FixedLimitEntry");
                 bool fileExists = File.Exists(logFile);
 
                 using (StreamWriter sw = new StreamWriter(logFile, true))
