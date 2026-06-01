@@ -34,6 +34,38 @@ using NinjaTrader.NinjaScript.Strategies;
 //   * Win/loss detection: OnExecutionUpdate watches for exit fills and
 //     classifies by exit order name ("Stop loss" vs "Profit target").
 //   * All parameters, CSV logging, DiagLog, and shutdown logic preserved.
+//
+// PATCH 1 — ReadyForNewEntry() broker-side working order check
+// ------------------------------------------------------------
+//   Added an Account.Orders scan inside ReadyForNewEntry().
+//   Previously the gate relied only on entryInFlight / awaitingClose flags
+//   and Position.MarketPosition. After a strategy restart, reconnect, or
+//   Sync=False situation those flags reset to false while a real working
+//   order or open position may still exist at the broker. The new scan
+//   prevents placing a new entry on top of an existing broker-side order.
+//   Guards: Working, Accepted, Submitted, PartFilled states.
+//   Any matching order on this instrument blocks the new entry.
+//
+// PATCH 2 — Trading hours rework
+// --------------------------------
+//   Replaced StartTimeProp / EndTimeProp (DateTime pickers, broken for
+//   overnight windows) with a clean enable/disable toggle plus four
+//   integer parameters (hour + minute for start and end, NY time, 24h).
+//
+//   EnableTradingHours (bool, default false):
+//     false → no time filter at all. Strategy trades within NT session
+//             template (RTH/ETH governed by the chart).
+//     true  → only place new entries within the NY window defined by
+//             TradingStartHour/TradingStartMinute .. TradingEndHour/
+//             TradingEndMinute. Window is always same-day (start < end).
+//             No overnight crossing — use EnableTradingHours=false and
+//             set the chart session template for overnight trading.
+//
+//   Defaults: 09:30 .. 16:00 NY (standard RTH window).
+//   Existing trades always finish naturally when outside the window.
+//   StrategyLifeMinutes timer handles the eventual flat+shutdown.
+//
+//   Removed: StartTimeProp, EndTimeProp (and their PropertyEditor attributes).
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
@@ -89,20 +121,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TimeInForce                  = TimeInForce.Gtc;
                 TraceOrders                  = false;
                 RealtimeErrorHandling        = RealtimeErrorHandling.StopCancelClose;
-
-                // [MANAGED] StopTargetHandling.PerEntryExecution means NT
-                // submits a separate bracket per execution fill.  For qty=1
-                // this is identical to PerStrategy.  For larger qty with
-                // partial fills, each filled lot gets its own bracket legs —
-                // avoiding the single-bracket resize problem entirely.
                 StopTargetHandling           = StopTargetHandling.PerEntryExecution;
-
                 BarsRequiredToTrade          = 0;
-                IsUnmanaged                  = false;   // [MANAGED]
+                IsUnmanaged                  = false;
 
-                // ---- defaults (unchanged from unmanaged version) ----
-                StartTimeProp        = DateTime.Parse("09:30", System.Globalization.CultureInfo.InvariantCulture);
-                EndTimeProp          = DateTime.Parse("16:00", System.Globalization.CultureInfo.InvariantCulture);
+                // ---- defaults ----
+                // [PATCH 2] Trading hours toggle + NY time integers
+                EnableTradingHours   = false;  // off = use chart session template
+                TradingStartHour     = 9;
+                TradingStartMinute   = 30;
+                TradingEndHour       = 16;
+                TradingEndMinute     = 0;
                 StrategyLifeMinutes  = 3;
                 CheckIntervalSeconds = 1;
                 UseMarketEntry       = true;
@@ -116,11 +145,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Configure)
             {
-                // [MANAGED] Set bracket parameters once here.
-                // NT applies these to every EnterLong fill automatically.
-                // With StopTargetHandling.PerEntryExecution, each partial fill
-                // execution gets its own independent stop + target pair,
-                // so NT never needs to resize a single bracket across fills.
                 SetStopLoss   (ENTRY_SIGNAL, CalculationMode.Ticks,
                     (int)Math.Round(StopLossPoints    / TickSize), false);
                 SetProfitTarget(ENTRY_SIGNAL, CalculationMode.Ticks,
@@ -139,7 +163,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + ", Qty=" + BaseQuantity
                         + ", Stop=" + StopLossPoints + "pt"
                         + ", Target=" + ProfitTargetPoints + "pt"
-                        + ", StopTargetHandling=PerEntryExecution");
+                        + ", StopTargetHandling=PerEntryExecution"
+                        + ", EnableTradingHours=" + EnableTradingHours
+                        + (EnableTradingHours
+                            ? string.Format(", Window={0:D2}:{1:D2}-{2:D2}:{3:D2} NY",
+                                TradingStartHour, TradingStartMinute,
+                                TradingEndHour,   TradingEndMinute)
+                            : " (chart session governs)"));
                 }
             }
         }
@@ -149,7 +179,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (State != State.Realtime) return;
             if (!lifeStarted) return;
 
-            // Drive shutdown to completion first; do nothing else while shutting down.
             if (disabledSelf || pendingFlatten)
             {
                 ProcessShutdown();
@@ -158,15 +187,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             DateTime nowUtc = DateTime.UtcNow;
 
-            // ---- shutdown: strategy life expired ----
             if ((nowUtc - strategyStartUtc).TotalMinutes >= StrategyLifeMinutes)
             {
                 BeginShutdown("strategy life of " + StrategyLifeMinutes + " min reached");
                 return;
             }
 
-            // ---- max orders reached ----
-            // Stop placing NEW entries. Let any open trade finish via its bracket.
             if (ordersPlaced >= MaxOrders)
             {
                 if (awaitingClose || Position.MarketPosition != MarketPosition.Flat)
@@ -175,7 +201,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // ---- max consecutive losses reached ----
             if (HasReachedConsecutiveLossLimit())
             {
                 if (awaitingClose || Position.MarketPosition != MarketPosition.Flat)
@@ -185,16 +210,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // ---- throttle ----
             if ((DateTime.Now - lastCheckTime).TotalSeconds < CheckIntervalSeconds)
                 return;
             lastCheckTime = DateTime.Now;
 
-            // ---- trading hours gate ----
             if (!WithinTradingHours())
                 return;
 
-            // ---- entry gate: flat, no working orders, not already in a trade ----
             if (!ReadyForNewEntry())
                 return;
 
@@ -238,25 +260,52 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // =====================================================================
         // ReadyForNewEntry
-        // In managed mode NT tracks working orders internally.  We guard on:
-        //   - not already waiting for an entry fill (entryInFlight)
-        //   - not already in a trade (awaitingClose)
-        //   - broker position is Flat
+        // [PATCH 1] Added broker-side Account.Orders scan.
+        // Prevents placing a new entry after reconnect / restart / Sync=False
+        // when flags have reset but broker still has a working order or position.
         // =====================================================================
         private bool ReadyForNewEntry()
         {
+            // Flag-based gates (fast path)
             if (entryInFlight) return false;
             if (awaitingClose) return false;
             if (Position.MarketPosition != MarketPosition.Flat) return false;
+
+            // [PATCH 1] Broker-side working order scan (safety net)
+            try
+            {
+                if (Account != null)
+                {
+                    lock (Account.Orders)
+                    {
+                        foreach (var ord in Account.Orders)
+                        {
+                            if (ord.Instrument == Instrument
+                                && (ord.OrderState == OrderState.Working
+                                    || ord.OrderState == OrderState.Accepted
+                                    || ord.OrderState == OrderState.Submitted
+                                    || ord.OrderState == OrderState.PartFilled))
+                            {
+                                DiagLog(string.Format(
+                                    "ReadyForNewEntry: BLOCKED by broker-side order name='{0}' state={1}. Flags may be desynced.",
+                                    ord.Name ?? "", ord.OrderState));
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                DiagLog("ReadyForNewEntry: Account.Orders scan error: " + ex.Message + ". Blocking entry.");
+                return false;
+            }
+
             return true;
         }
 
         // =====================================================================
         // OnExecutionUpdate
-        // [MANAGED] NT submits and manages the bracket automatically.
-        // We only need to:
-        //   1. Detect entry fill -> record fill price, clear entryInFlight.
-        //   2. Detect bracket exit fill -> record outcome, clear awaitingClose.
         // =====================================================================
         protected override void OnExecutionUpdate(Execution execution, string executionId,
             double price, int quantity, MarketPosition marketPosition,
@@ -271,10 +320,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             // ---- entry fill (full or partial) ----
             if (oName == ENTRY_SIGNAL && (isFull || isPart))
             {
-                // Record the first fill price as our reference for PnL.
-                // With PerEntryExecution each lot gets its own bracket from
-                // its own fill price — so each lot's PnL is self-contained.
-                // We capture the first fill here for the overall trade log row.
                 if (entryFillPrice == 0.0)
                     entryFillPrice = price;
 
@@ -286,53 +331,42 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (isFull)
                 {
-                    // Full fill — entry complete, bracket attached by NT.
                     entryInFlight = false;
                     DiagLog(string.Format("Entry complete. Fill={0:F2} qty={1}. Bracket active (PerEntryExecution).",
                         entryFillPrice, entryFillQty));
                 }
                 else
                 {
-                    // Partial fill — NT will attach a bracket for this lot
-                    // via PerEntryExecution.  Entry order remains working for
-                    // the remainder.  entryInFlight stays true until full fill.
                     DiagLog(string.Format("Partial fill {0} of {1}. NT attaches bracket for this lot. Remainder still working.",
                         entryFillQty, BaseQuantity));
                 }
                 return;
             }
 
-            // ---- entry order cancelled with no fills (e.g. limit expired) ----
+            // ---- entry order cancelled with no fills ----
             if (oName == ENTRY_SIGNAL
                 && execution.Order.OrderState == OrderState.Cancelled
                 && entryFillQty == 0)
             {
                 DiagLog(string.Format("Entry #{0} cancelled with no fills. Resetting.", ordersPlaced));
-                ordersPlaced--;   // don't count a cancelled-with-no-fill as a placed order
-                entryInFlight = false;
-                awaitingClose = false;
+                ordersPlaced--;
+                entryInFlight  = false;
+                awaitingClose  = false;
                 entryFillPrice = 0.0;
                 entryFillQty   = 0;
                 return;
             }
 
-            // ---- bracket exit fill: stop loss or profit target ----
-            // NT names these "Stop loss" and "Profit target" (managed bracket).
+            // ---- bracket exit fill ----
             bool isStopFill   = oName.IndexOf("Stop",   StringComparison.OrdinalIgnoreCase) >= 0;
             bool isTargetFill = oName.IndexOf("Profit", StringComparison.OrdinalIgnoreCase) >= 0
                              || oName.IndexOf("Target", StringComparison.OrdinalIgnoreCase) >= 0;
 
             if ((isStopFill || isTargetFill) && isFull)
             {
-                // With PerEntryExecution each lot has its own bracket.
-                // RecordOutcome is called once per exit fill.
-                // For qty=1 this fires once; for qty=N it fires N times.
-                // We only log the overall trade summary once the full
-                // position returns to Flat.
                 DiagLog(string.Format("{0} fill: qty={1} @ {2:F2} name={3}",
                     isStopFill ? "STOP" : "TARGET", quantity, price, oName));
 
-                // Position went Flat: record overall outcome and reset.
                 if (Position.MarketPosition == MarketPosition.Flat)
                 {
                     double pnl = isStopFill
@@ -347,7 +381,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                         isStopFill ? "STOP" : "TARGET",
                         entryFillPrice, price, entryFillQty, pnl, bit, TailOfHistory(10)));
 
-                    // Reset trade state for next entry.
                     awaitingClose  = false;
                     entryInFlight  = false;
                     entryFillPrice = 0.0;
@@ -357,8 +390,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // OnOrderUpdate — diagnostic logging only in managed mode.
-        // NT handles all state transitions internally.
+        // OnOrderUpdate — diagnostic logging only
         // =====================================================================
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice,
             int quantity, int filled, double averageFillPrice, OrderState orderState,
@@ -366,7 +398,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (order == null) return;
 
-            // Log errors and rejections prominently.
             if (error != ErrorCode.NoError || orderState == OrderState.Rejected)
             {
                 DiagLog(string.Format("ORDER WARN: {0} state={1} err={2} native={3}",
@@ -382,16 +413,24 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // =====================================================================
         // WithinTradingHours
+        // [PATCH 2] EnableTradingHours toggle + integer hour/minute parameters.
+        // When disabled: always returns true (no time filter — chart session governs).
+        // When enabled:  single-day NY window only (start < end, no overnight).
         // =====================================================================
         private bool WithinTradingHours()
         {
+            if (!EnableTradingHours) return true;
+
             TimeZoneInfo et;
             try   { et = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"); }
             catch { try { et = TimeZoneInfo.FindSystemTimeZoneById("America/New_York"); } catch { return true; } }
 
-            DateTime nyNow = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, et);
-            TimeSpan t     = nyNow.TimeOfDay;
-            return t >= StartTimeProp.TimeOfDay && t <= EndTimeProp.TimeOfDay;
+            DateTime nyNow    = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, et);
+            int      curMin   = nyNow.Hour * 60 + nyNow.Minute;
+            int      startMin = TradingStartHour * 60 + TradingStartMinute;
+            int      endMin   = TradingEndHour   * 60 + TradingEndMinute;
+
+            return curMin >= startMin && curMin <= endMin;
         }
 
         // =====================================================================
@@ -415,30 +454,23 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // =====================================================================
         // Shutdown
-        // [MANAGED] ExitLong closes the position at market.
-        // NT cancels the working bracket legs automatically when position closes.
         // =====================================================================
         private void BeginShutdown(string reason)
         {
             if (disabledSelf || pendingFlatten) return;
             pendingReason  = reason;
             pendingFlatten = true;
-            DiagLog(Name + " shutdown requested: " + reason
-                + " | orders=" + ordersPlaced);
+            DiagLog(Name + " shutdown requested: " + reason + " | orders=" + ordersPlaced);
         }
 
         private void ProcessShutdown()
         {
-            // If already flat and no entry in flight — terminate cleanly.
             if (Position.MarketPosition == MarketPosition.Flat && !entryInFlight)
             {
                 FinalizeTermination();
                 return;
             }
 
-            // If holding a position, submit ExitLong at market (once per tick
-            // until NT confirms flat — NT is idempotent on duplicate exit calls
-            // for the same signal in managed mode).
             if (Position.MarketPosition == MarketPosition.Long)
             {
                 try
@@ -452,12 +484,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     DiagLog("Shutdown ExitLong error: " + ex.Message);
                 }
             }
-
-            // If an entry limit is still working (no fill yet) — NT will cancel
-            // it on the next bar via the managed approach's auto-cancel behavior
-            // or we can explicitly call ExitLong with qty=0 to cancel all pending.
-            // Since managed mode auto-cancels unfilled entry orders at bar end
-            // when we stop calling EnterLong, we just wait for flat here.
         }
 
         private void FinalizeTermination()
@@ -522,66 +548,89 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // Properties — identical to unmanaged version
+        // Properties
         // =====================================================================
         #region Properties
 
+        // [PATCH 2] Trading hours — toggle + NY integer hour/minute
         [NinjaScriptProperty]
-        [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
-        [Display(Name = "A: Start time (NY)", Order = 1, GroupName = "Hours")]
-        public DateTime StartTimeProp { get; set; }
+        [Display(Name = "Enable Trading Hours filter", Order = 1, GroupName = "Hours",
+            Description = "When false (default): no time filter, strategy trades within NT session template (RTH/ETH). "
+                        + "When true: only place new entries within the NY window below. "
+                        + "Window is same-day only (no overnight). Existing trades always finish naturally.")]
+        public bool EnableTradingHours { get; set; }
 
         [NinjaScriptProperty]
-        [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
-        [Display(Name = "B: End time (NY)", Order = 2, GroupName = "Hours")]
-        public DateTime EndTimeProp { get; set; }
+        [Range(0, 23)]
+        [Display(Name = "Start hour (NY, 24h)", Order = 2, GroupName = "Hours",
+            Description = "Trading window start hour, New York time, 24-hour format. Default 9.")]
+        public int TradingStartHour { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 59)]
+        [Display(Name = "Start minute (NY)", Order = 3, GroupName = "Hours",
+            Description = "Trading window start minute. Default 30.")]
+        public int TradingStartMinute { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 23)]
+        [Display(Name = "End hour (NY, 24h)", Order = 4, GroupName = "Hours",
+            Description = "Trading window end hour, New York time, 24-hour format. Default 16.")]
+        public int TradingEndHour { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 59)]
+        [Display(Name = "End minute (NY)", Order = 5, GroupName = "Hours",
+            Description = "Trading window end minute. Default 0. "
+                        + "Outside this window: no new entries. Open trades finish naturally via bracket.")]
+        public int TradingEndMinute { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
-        [Display(Name = "C: Strategy life (minutes)", Order = 3, GroupName = "Timing")]
+        [Display(Name = "C: Strategy life (minutes)", Order = 6, GroupName = "Timing")]
         public int StrategyLifeMinutes { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 3600)]
-        [Display(Name = "D: Check interval (seconds)", Order = 4, GroupName = "Timing")]
+        [Display(Name = "D: Check interval (seconds)", Order = 7, GroupName = "Timing")]
         public int CheckIntervalSeconds { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "E: Use market entry (else limit)", Order = 5, GroupName = "Entry")]
+        [Display(Name = "E: Use market entry (else limit)", Order = 8, GroupName = "Entry")]
         public bool UseMarketEntry { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, double.MaxValue)]
-        [Display(Name = "Limit offset (points)", Order = 6, GroupName = "Entry")]
+        [Display(Name = "Limit offset (points)", Order = 9, GroupName = "Entry")]
         public double LimitOffsetPoints { get; set; }
 
         [NinjaScriptProperty]
         [Range(0.0, double.MaxValue)]
-        [Display(Name = "F: Stop loss (points)", Order = 7, GroupName = "Bracket")]
+        [Display(Name = "F: Stop loss (points)", Order = 10, GroupName = "Bracket")]
         public double StopLossPoints { get; set; }
 
         [NinjaScriptProperty]
         [Range(0.0, double.MaxValue)]
-        [Display(Name = "G/H: Profit target (points)", Order = 8, GroupName = "Bracket")]
+        [Display(Name = "G/H: Profit target (points)", Order = 11, GroupName = "Bracket")]
         public double ProfitTargetPoints { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
-        [Display(Name = "Base quantity (fixed)", Order = 9, GroupName = "Quantity")]
+        [Display(Name = "Base quantity (fixed)", Order = 12, GroupName = "Quantity")]
         public int BaseQuantity { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
-        [Display(Name = "Max orders (then disable)", Order = 10, GroupName = "Limits")]
+        [Display(Name = "Max orders (then disable)", Order = 13, GroupName = "Limits")]
         public int MaxOrders { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
-        [Display(Name = "Max consecutive losses (then disable)", Order = 11, GroupName = "Limits")]
+        [Display(Name = "Max consecutive losses (then disable)", Order = 14, GroupName = "Limits")]
         public int MaxConsecutiveLosses { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Log file path", Order = 12, GroupName = "Logging")]
+        [Display(Name = "Log file path", Order = 15, GroupName = "Logging")]
         public string LogFilePath { get; set; }
 
         #endregion
