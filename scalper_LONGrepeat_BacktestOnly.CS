@@ -47,7 +47,7 @@ using NinjaTrader.NinjaScript.Strategies;
 //   6. DiagLog skips disk writes in Historical — print only.
 //      Avoids huge log files during backtesting thousands of bars.
 //
-//   7. EnsureLogHeader and WriteLogRow skip in Historical.
+//   7. EnsureLogHeader and WriteLogRow: write CSV in BOTH Historical and Realtime.
 //      No CSV written during backtest. Results come from NT Strategy Analyzer.
 //
 //   8. lifeStarted initialized in State.DataLoaded (not State.Realtime).
@@ -146,6 +146,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Live version does this in State.Realtime which blocks backtest.
                 // strategyStartBarTime set on first bar in OnBarUpdate.
                 lifeStarted = true;
+                EnsureLogHeader();  // create CSV now so backtest rows are written
             }
             else if (State == State.Realtime)
             {
@@ -380,9 +381,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     int bit = isStopFill ? 0 : 1;
                     outcomeHistory.Append(bit.ToString());
 
-                    // [BACKTEST FIX] Only write CSV in Realtime
-                    if (State == State.Realtime)
-                        WriteLogRow(price, pnl, bit, entryFillQty, time);
+                    // [BACKTEST FIX] Write CSV in both Historical and Realtime
+                    WriteLogRow(price, pnl, bit, entryFillQty, time);
 
                     DiagLog(string.Format("CLOSED {0}: entry={1:F2} exit={2:F2} qty={3} pnl={4:0.00} bit={5} hist(last10)={6}",
                         isStopFill ? "STOP" : "TARGET",
@@ -521,12 +521,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // =====================================================================
         // Logging
-        // [BACKTEST FIX] DiagLog: print always, disk write only in Realtime.
-        // EnsureLogHeader / WriteLogRow: only in Realtime.
+        // [BACKTEST FIX] DiagLog, EnsureLogHeader, WriteLogRow: all write in both Historical and Realtime.
+        // CSV is written during backtest so win/loss sequence is available for analysis.
         // =====================================================================
         private void EnsureLogHeader()
         {
-            if (State != State.Realtime) return;
+            // [BACKTEST FIX] Removed Realtime guard — write header in both Historical and Realtime
             try
             {
                 string dir = Path.GetDirectoryName(LogFilePath);
@@ -558,8 +558,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             string line = DateTime.Now.ToString("HH:mm:ss.fff") + "  " + msg;
             Print(line);
 
-            // [BACKTEST FIX] Skip disk write in Historical — print only
-            if (State != State.Realtime) return;
+            // [BACKTEST FIX] Always write to disk (backtest + realtime)
+            // DiagLog writes every tick — acceptable for backtest, same as realtime.
 
             try
             {
