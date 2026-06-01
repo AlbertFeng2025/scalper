@@ -493,9 +493,29 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (disabledSelf) return;
             disabledSelf   = true;
             pendingFlatten = false;
+
+            // Count wins and losses from outcome string
+            string hist = outcomeHistory.ToString();
+            int wins   = 0;
+            int losses = 0;
+            foreach (char c in hist) { if (c == '1') wins++; else if (c == '0') losses++; }
+            int total  = wins + losses;
+            double winPct = total > 0 ? (wins * 100.0 / total) : 0;
+
+            // Always print summary — visible in Strategy Analyzer Output tab
+            // and NT Output window during backtest.
+            Print("================================================================");
+            Print(string.Format("[BACKTEST SUMMARY] {0}", Name));
+            Print(string.Format("[BACKTEST SUMMARY] Reason  : {0}", pendingReason));
+            Print(string.Format("[BACKTEST SUMMARY] Orders  : {0}", ordersPlaced));
+            Print(string.Format("[BACKTEST SUMMARY] Trades  : {0}  (Wins={1}  Losses={2}  WinPct={3:F1}%)",
+                total, wins, losses, winPct));
+            Print(string.Format("[BACKTEST SUMMARY] Sequence: {0}", hist));
+            Print("================================================================");
+
             DiagLog(Name + " terminated. Reason: " + pendingReason
                 + " | orders=" + ordersPlaced
-                + " | history=" + outcomeHistory.ToString());
+                + " | history=" + hist);
             try { SetState(State.Terminated); } catch { }
         }
 
