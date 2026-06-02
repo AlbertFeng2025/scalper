@@ -904,22 +904,23 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "G/H: Profit target (points)", Order = 11, GroupName = "Bracket")]
         public double ProfitTargetPoints { get; set; }
 
-        // [PATCH 5] Fake mode + pattern
+        // [PATCH 5] Real order enable + pattern filter
         [NinjaScriptProperty]
-        [Display(Name = "Enable Fake Mode", Order = 1, GroupName = "Pattern (Fake Mode)",
-            Description = "[PATCH 5] When true: trades run as fake (paper) until EntryPattern "
-                        + "matches outcomeHistory tail — then ONE real order fires. "
-                        + "Fake and real outcomes build the same sequence. "
-                        + "When false: all trades are real (original behavior).")]
+        [Display(Name = "Enable Real Order", Order = 1, GroupName = "Pattern & Real Order",
+            Description = "When FALSE (default): observation mode only. No real orders placed. "
+                        + "Fake trades run silently recording every outcome into the sequence. "
+                        + "Use this to study the pattern before risking real money. "
+                        + "When TRUE: real orders placed, gated by Entry Pattern. "
+                        + "The sequence records ALL trades (fake + real) regardless of this setting.")]
         public bool EnableRealOrder { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Entry Pattern (comma-separated)", Order = 2, GroupName = "Pattern (Fake Mode)",
-            Description = "[PATCH 5] Comma-separated binary patterns. After each trade (fake or real), "
-                        + "if the tail of outcomeHistory matches ANY pattern → next entry is REAL. "
-                        + "Examples: '0,1' (every outcome arms real — default), "
-                        + "'01' (only after loss+win), '01,011' (loss+win OR loss+win+win). "
-                        + "Empty sequence never matches → safe startup in fake mode.")]
+        [Display(Name = "Entry Pattern (comma-separated)", Order = 2, GroupName = "Pattern & Real Order",
+            Description = "Comma-separated binary patterns checked after EVERY trade (fake or real). "
+                        + "0=loss 1=win. When EnableRealOrder=true and tail matches → real order fires. "
+                        + "When EnableRealOrder=false → pattern checked but no order placed. "
+                        + "Default '0,1' = every outcome matches (no filter). "
+                        + "Examples: '01' = only after loss+win. '01,011' = loss+win OR loss+win+win.")]
         public string EntryPattern { get; set; }
 
         // [PATCH 4] Trailing stop
