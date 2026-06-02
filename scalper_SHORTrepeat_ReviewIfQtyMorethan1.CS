@@ -181,7 +181,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     lifeStarted       = true;
                     compiledPatterns  = ParsePatternList(EntryPattern);
                     isArmed           = false;
-                    enableRealOrder   = EnableRealOrder;
                     EnsureLogHeader();
                     DiagLog(Name + " enabled (MANAGED SHORT). Life=" + StrategyLifeMinutes
                         + "min, MaxOrders=" + MaxOrders
