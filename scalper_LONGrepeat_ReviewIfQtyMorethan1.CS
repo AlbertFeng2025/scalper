@@ -14,58 +14,37 @@ using NinjaTrader.NinjaScript.Strategies;
 
 // scalper_LONGrepeat_ReviewIfQtyMorethan1  (managed rewrite)
 //
-// CHANGES vs unmanaged version:
-//   * IsUnmanaged = false  -> full managed mode.
-//   * Entry via EnterLong / EnterLongLimit (signal name "LR_Entry").
-//   * Bracket via SetStopLoss + SetProfitTarget in State.Configure.
-//     NT attaches the bracket immediately on fill, resizes automatically
-//     if partial fills arrive, and OCO-cancels the surviving leg on exit.
-//   * If NT cannot resize the bracket (e.g. exchange rejects a stop
-//     modification on a late partial fill), NT's RealtimeErrorHandling
-//     = StopCancelClose will flatten the position.  That is an acceptable
-//     outcome — a forced flat beats an unprotected position.
-//   * Shutdown flatten via ExitLong (managed); NT cancels working bracket
-//     legs automatically when the position closes.
-//   * Manual OCO, stopOrder, targetOrder, flattenOrder, ocoId, and
-//     CancelAllWorkingOrders all removed — NT owns that now.
-//   * entryInFlight / awaitingClose flags retained but simplified:
-//       entryInFlight: true from EnterLong call until first execution fill.
-//       awaitingClose: true from first fill until position returns Flat.
-//   * Win/loss detection: OnExecutionUpdate watches for exit fills and
-//     classifies by exit order name ("Stop loss" vs "Profit target").
-//   * All parameters, CSV logging, DiagLog, and shutdown logic preserved.
-//
 // PATCH 1 — ReadyForNewEntry() broker-side working order check
-// ------------------------------------------------------------
-//   Added an Account.Orders scan inside ReadyForNewEntry().
-//   Previously the gate relied only on entryInFlight / awaitingClose flags
-//   and Position.MarketPosition. After a strategy restart, reconnect, or
-//   Sync=False situation those flags reset to false while a real working
-//   order or open position may still exist at the broker. The new scan
-//   prevents placing a new entry on top of an existing broker-side order.
-//   Guards: Working, Accepted, Submitted, PartFilled states.
-//   Any matching order on this instrument blocks the new entry.
+// PATCH 2 — Trading hours rework (EnableTradingHours toggle + NY integers)
 //
-// PATCH 2 — Trading hours rework
-// --------------------------------
-//   Replaced StartTimeProp / EndTimeProp (DateTime pickers, broken for
-//   overnight windows) with a clean enable/disable toggle plus four
-//   integer parameters (hour + minute for start and end, NY time, 24h).
+// PATCH 3 — Cancel unfilled limit entry on shutdown
+// -------------------------------------------------
+//   Problem: when StrategyLifeMinutes expires (or MaxOrders /
+//   MaxConsecutiveLosses triggers BeginShutdown), ProcessShutdown
+//   only called ExitLong — which exits an open position. It did NOT
+//   cancel a working unfilled limit entry order. The unfilled order
+//   would remain live at the broker indefinitely (until session close
+//   or manual cancel), and entryInFlight=true would block
+//   FinalizeTermination forever, leaving the strategy stuck.
 //
-//   EnableTradingHours (bool, default false):
-//     false → no time filter at all. Strategy trades within NT session
-//             template (RTH/ETH governed by the chart).
-//     true  → only place new entries within the NY window defined by
-//             TradingStartHour/TradingStartMinute .. TradingEndHour/
-//             TradingEndMinute. Window is always same-day (start < end).
-//             No overnight crossing — use EnableTradingHours=false and
-//             set the chart session template for overnight trading.
+//   Fix — three small changes:
 //
-//   Defaults: 09:30 .. 16:00 NY (standard RTH window).
-//   Existing trades always finish naturally when outside the window.
-//   StrategyLifeMinutes timer handles the eventual flat+shutdown.
+//   1. Added private Order workingEntryOrder field.
+//      Stores the Order reference returned by EnterLongLimit so we
+//      can call CancelOrder on it during shutdown.
+//      (Market entries also store the reference for consistency,
+//      though market orders fill near-instantly and rarely need cancel.)
 //
-//   Removed: StartTimeProp, EndTimeProp (and their PropertyEditor attributes).
+//   2. ProcessShutdown now cancels workingEntryOrder if entryInFlight.
+//      Checks OrderState is Working/Accepted/Submitted before cancelling.
+//      After cancel request, waits for OnOrderUpdate Cancelled callback
+//      to clear entryInFlight — does not force-clear it synchronously.
+//
+//   3. OnOrderUpdate now handles Cancelled state for ENTRY_SIGNAL.
+//      When the entry order is cancelled (by shutdown or any other reason)
+//      with zero fills, clears entryInFlight, awaitingClose, resets fill
+//      tracking fields, and nulls workingEntryOrder.
+//      This allows FinalizeTermination to proceed cleanly once flat.
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
@@ -79,12 +58,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime lastCheckTime = DateTime.MinValue;
         private int      ordersPlaced  = 0;
 
-        // append-only outcome string (study only — does not drive orders)
+        // append-only outcome string (study only)
         private StringBuilder outcomeHistory = new StringBuilder();
 
         // sequencing flags
-        private bool entryInFlight = false;  // EnterLong submitted, no fill yet
-        private bool awaitingClose = false;  // position open, waiting for bracket exit
+        private bool entryInFlight = false;
+        private bool awaitingClose = false;
+
+        // [PATCH 3] Store entry order reference for cancel-on-shutdown
+        private Order workingEntryOrder = null;
 
         // captured at entry fill for PnL calculation
         private double entryFillPrice = 0.0;
@@ -94,7 +76,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   pendingFlatten = false;
         private string pendingReason  = string.Empty;
 
-        // signal name — used consistently for entry + bracket + exit calls
         private const string ENTRY_SIGNAL = "LR_Entry";
 
         protected override void OnStateChange()
@@ -126,8 +107,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 IsUnmanaged                  = false;
 
                 // ---- defaults ----
-                // [PATCH 2] Trading hours toggle + NY time integers
-                EnableTradingHours   = false;  // off = use chart session template
+                EnableTradingHours   = false;
                 TradingStartHour     = 9;
                 TradingStartMinute   = 30;
                 TradingEndHour       = 16;
@@ -224,27 +204,29 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // PlaceEntry — managed EnterLong / EnterLongLimit
+        // PlaceEntry
+        // [PATCH 3] Stores workingEntryOrder reference for cancel-on-shutdown.
         // =====================================================================
         private void PlaceEntry()
         {
             int qty = BaseQuantity;
             ordersPlaced++;
-            entryInFlight = true;
-            awaitingClose = true;
+            entryInFlight       = true;
+            awaitingClose       = true;
+            workingEntryOrder   = null;   // [PATCH 3] clear before submitting
 
             try
             {
                 if (UseMarketEntry)
                 {
-                    EnterLong(qty, ENTRY_SIGNAL);
+                    workingEntryOrder = EnterLong(qty, ENTRY_SIGNAL);  // [PATCH 3]
                     DiagLog(string.Format("ENTRY #{0} MARKET qty={1}", ordersPlaced, qty));
                 }
                 else
                 {
                     double limitPx = GetCurrentBid() - LimitOffsetPoints;
                     limitPx = Instrument.MasterInstrument.RoundToTickSize(limitPx);
-                    EnterLongLimit(0, true, qty, limitPx, ENTRY_SIGNAL);
+                    workingEntryOrder = EnterLongLimit(0, true, qty, limitPx, ENTRY_SIGNAL);  // [PATCH 3]
                     DiagLog(string.Format("ENTRY #{0} LIMIT qty={1} limit={2:F2}",
                         ordersPlaced, qty, limitPx));
                 }
@@ -253,25 +235,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 DiagLog("PlaceEntry error: " + ex.Message);
                 ordersPlaced--;
-                entryInFlight = false;
-                awaitingClose = false;
+                entryInFlight     = false;
+                awaitingClose     = false;
+                workingEntryOrder = null;
             }
         }
 
         // =====================================================================
-        // ReadyForNewEntry
-        // [PATCH 1] Added broker-side Account.Orders scan.
-        // Prevents placing a new entry after reconnect / restart / Sync=False
-        // when flags have reset but broker still has a working order or position.
+        // ReadyForNewEntry — PATCH 1 broker-side scan
         // =====================================================================
         private bool ReadyForNewEntry()
         {
-            // Flag-based gates (fast path)
             if (entryInFlight) return false;
             if (awaitingClose) return false;
             if (Position.MarketPosition != MarketPosition.Flat) return false;
 
-            // [PATCH 1] Broker-side working order scan (safety net)
             try
             {
                 if (Account != null)
@@ -287,7 +265,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                     || ord.OrderState == OrderState.PartFilled))
                             {
                                 DiagLog(string.Format(
-                                    "ReadyForNewEntry: BLOCKED by broker-side order name='{0}' state={1}. Flags may be desynced.",
+                                    "ReadyForNewEntry: BLOCKED by broker-side order name='{0}' state={1}.",
                                     ord.Name ?? "", ord.OrderState));
                                 return false;
                             }
@@ -297,7 +275,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             catch (Exception ex)
             {
-                DiagLog("ReadyForNewEntry: Account.Orders scan error: " + ex.Message + ". Blocking entry.");
+                DiagLog("ReadyForNewEntry: scan error: " + ex.Message + ". Blocking.");
                 return false;
             }
 
@@ -331,29 +309,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (isFull)
                 {
-                    entryInFlight = false;
-                    DiagLog(string.Format("Entry complete. Fill={0:F2} qty={1}. Bracket active (PerEntryExecution).",
+                    entryInFlight     = false;
+                    workingEntryOrder = null;  // [PATCH 3] fully filled, no longer needs cancel
+                    DiagLog(string.Format("Entry complete. Fill={0:F2} qty={1}. Bracket active.",
                         entryFillPrice, entryFillQty));
                 }
                 else
                 {
-                    DiagLog(string.Format("Partial fill {0} of {1}. NT attaches bracket for this lot. Remainder still working.",
+                    DiagLog(string.Format("Partial fill {0} of {1}. NT attaches bracket for this lot.",
                         entryFillQty, BaseQuantity));
                 }
-                return;
-            }
-
-            // ---- entry order cancelled with no fills ----
-            if (oName == ENTRY_SIGNAL
-                && execution.Order.OrderState == OrderState.Cancelled
-                && entryFillQty == 0)
-            {
-                DiagLog(string.Format("Entry #{0} cancelled with no fills. Resetting.", ordersPlaced));
-                ordersPlaced--;
-                entryInFlight  = false;
-                awaitingClose  = false;
-                entryFillPrice = 0.0;
-                entryFillQty   = 0;
                 return;
             }
 
@@ -381,16 +346,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                         isStopFill ? "STOP" : "TARGET",
                         entryFillPrice, price, entryFillQty, pnl, bit, TailOfHistory(10)));
 
-                    awaitingClose  = false;
-                    entryInFlight  = false;
-                    entryFillPrice = 0.0;
-                    entryFillQty   = 0;
+                    awaitingClose     = false;
+                    entryInFlight     = false;
+                    workingEntryOrder = null;
+                    entryFillPrice    = 0.0;
+                    entryFillQty      = 0;
                 }
             }
         }
 
         // =====================================================================
-        // OnOrderUpdate — diagnostic logging only
+        // OnOrderUpdate
+        // [PATCH 3] Handles Cancelled state for ENTRY_SIGNAL.
+        // Clears entryInFlight so ProcessShutdown can reach FinalizeTermination.
         // =====================================================================
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice,
             int quantity, int filled, double averageFillPrice, OrderState orderState,
@@ -398,24 +366,53 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (order == null) return;
 
+            string oName = order.Name ?? "";
+
+            // [PATCH 3] Entry order cancelled — reset state so shutdown can complete
+            if (oName == ENTRY_SIGNAL
+                && (orderState == OrderState.Cancelled || orderState == OrderState.Rejected))
+            {
+                DiagLog(string.Format("Entry order {0} (filled={1}). Resetting entry flags.",
+                    orderState, filled));
+
+                if (filled == 0)
+                {
+                    // No fill at all — full reset, don't count as a placed order
+                    ordersPlaced--;
+                    entryInFlight     = false;
+                    awaitingClose     = false;
+                    workingEntryOrder = null;
+                    entryFillPrice    = 0.0;
+                    entryFillQty      = 0;
+                    DiagLog("Entry cancelled with zero fills. ordersPlaced decremented.");
+                }
+                else
+                {
+                    // Partial fills already occurred — position may be open
+                    // entryInFlight cleared so shutdown can proceed
+                    entryInFlight     = false;
+                    workingEntryOrder = null;
+                    DiagLog(string.Format("Entry cancelled with {0} partial fill(s). Position still managed.", filled));
+                }
+                return;
+            }
+
+            // Diagnostic logging for all other order events
             if (error != ErrorCode.NoError || orderState == OrderState.Rejected)
             {
                 DiagLog(string.Format("ORDER WARN: {0} state={1} err={2} native={3}",
-                    order.Name, orderState, error,
+                    oName, orderState, error,
                     string.IsNullOrEmpty(nativeError) ? "-" : nativeError));
             }
             else
             {
                 DiagLog(string.Format("ORDER {0} state={1} qty={2} filled={3} avg={4:F2}",
-                    order.Name, orderState, quantity, filled, averageFillPrice));
+                    oName, orderState, quantity, filled, averageFillPrice));
             }
         }
 
         // =====================================================================
-        // WithinTradingHours
-        // [PATCH 2] EnableTradingHours toggle + integer hour/minute parameters.
-        // When disabled: always returns true (no time filter — chart session governs).
-        // When enabled:  single-day NY window only (start < end, no overnight).
+        // WithinTradingHours — PATCH 2
         // =====================================================================
         private bool WithinTradingHours()
         {
@@ -454,6 +451,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // =====================================================================
         // Shutdown
+        // [PATCH 3] ProcessShutdown now cancels unfilled entry order if present.
         // =====================================================================
         private void BeginShutdown(string reason)
         {
@@ -465,12 +463,43 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ProcessShutdown()
         {
+            // [PATCH 3] Cancel unfilled entry order if working
+            // This handles: limit order submitted but never filled when shutdown fires.
+            // After CancelOrder(), we wait for OnOrderUpdate Cancelled callback
+            // to clear entryInFlight — do NOT force-clear here synchronously.
+            if (entryInFlight && workingEntryOrder != null)
+            {
+                OrderState os = workingEntryOrder.OrderState;
+                if (os == OrderState.Working
+                    || os == OrderState.Accepted
+                    || os == OrderState.Submitted)
+                {
+                    try
+                    {
+                        DiagLog(string.Format("Shutdown: cancelling unfilled entry order (state={0}).", os));
+                        CancelOrder(workingEntryOrder);
+                    }
+                    catch (Exception ex)
+                    {
+                        DiagLog("Shutdown: CancelOrder error: " + ex.Message);
+                        // Force-clear flags as fallback if cancel throws
+                        entryInFlight     = false;
+                        awaitingClose     = false;
+                        workingEntryOrder = null;
+                    }
+                }
+                // Wait for the Cancelled callback in OnOrderUpdate to clear entryInFlight
+                return;
+            }
+
+            // If already flat and no entry in flight — terminate cleanly
             if (Position.MarketPosition == MarketPosition.Flat && !entryInFlight)
             {
                 FinalizeTermination();
                 return;
             }
 
+            // If holding a position — submit ExitLong at market
             if (Position.MarketPosition == MarketPosition.Long)
             {
                 try
@@ -552,37 +581,31 @@ namespace NinjaTrader.NinjaScript.Strategies
         // =====================================================================
         #region Properties
 
-        // [PATCH 2] Trading hours — toggle + NY integer hour/minute
         [NinjaScriptProperty]
         [Display(Name = "Enable Trading Hours filter", Order = 1, GroupName = "Hours",
-            Description = "When false (default): no time filter, strategy trades within NT session template (RTH/ETH). "
-                        + "When true: only place new entries within the NY window below. "
-                        + "Window is same-day only (no overnight). Existing trades always finish naturally.")]
+            Description = "When false: no time filter, trades within NT session template. "
+                        + "When true: only new entries within NY window below (same-day only).")]
         public bool EnableTradingHours { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 23)]
-        [Display(Name = "Start hour (NY, 24h)", Order = 2, GroupName = "Hours",
-            Description = "Trading window start hour, New York time, 24-hour format. Default 9.")]
+        [Display(Name = "Start hour (NY, 24h)", Order = 2, GroupName = "Hours")]
         public int TradingStartHour { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 59)]
-        [Display(Name = "Start minute (NY)", Order = 3, GroupName = "Hours",
-            Description = "Trading window start minute. Default 30.")]
+        [Display(Name = "Start minute (NY)", Order = 3, GroupName = "Hours")]
         public int TradingStartMinute { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 23)]
-        [Display(Name = "End hour (NY, 24h)", Order = 4, GroupName = "Hours",
-            Description = "Trading window end hour, New York time, 24-hour format. Default 16.")]
+        [Display(Name = "End hour (NY, 24h)", Order = 4, GroupName = "Hours")]
         public int TradingEndHour { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 59)]
         [Display(Name = "End minute (NY)", Order = 5, GroupName = "Hours",
-            Description = "Trading window end minute. Default 0. "
-                        + "Outside this window: no new entries. Open trades finish naturally via bracket.")]
+            Description = "Outside this window: no new entries. Open trades finish naturally.")]
         public int TradingEndMinute { get; set; }
 
         [NinjaScriptProperty]
