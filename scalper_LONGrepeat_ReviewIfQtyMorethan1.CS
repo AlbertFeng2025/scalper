@@ -20,6 +20,45 @@ using NinjaTrader.NinjaScript.Strategies;
 // PATCH 3 — Cancel unfilled limit entry on shutdown
 //
 // PATCH 4 — Enable trailing stop
+//
+// PATCH 5 — Fake order mode + pattern-armed real orders
+// ------------------------------------------------------
+//   Two new parameters:
+//
+//   EnableFakeMode (bool, default true):
+//     true  → strategy runs fake (paper) trades continuously, building
+//             outcomeHistory. Real orders fire only when EntryPattern
+//             matches the tail of outcomeHistory.
+//     false → every trade is real (original behavior).
+//
+//   EntryPattern (string, default "0,1"):
+//     Comma-separated list of binary patterns. After each trade closes
+//     (fake or real), the tail of outcomeHistory is checked against
+//     every pattern. If ANY pattern matches → next entry is REAL.
+//     Default "0,1" means every outcome arms a real order (effectively
+//     always-real — same as EnableFakeMode=false).
+//     Example: "01,011" → real order only after loss-then-win or
+//     loss-then-win-then-win sequence.
+//
+//   Key design rules:
+//   - Empty / too-short sequence never matches → starts in fake mode (safe).
+//   - Fake trades use FIXED bracket only (no trailing stop).
+//   - Real trades use full logic including trailing stop if enabled.
+//   - Fake and real outcomes go into the SAME outcomeHistory string.
+//   - All session gates (MaxOrders, StrategyLifeMinutes, TradingHours,
+//     MaxConsecutiveLosses) apply equally to fake and real trades.
+//   - MaxOrders counts fake + real combined.
+//   - After real order closes, pattern is re-checked immediately —
+//     may arm another real order right away if pattern still matches.
+//   - isArmed resets to false after each real order is submitted.
+//
+//   Fake trade tracking (tick by tick):
+//   - fakeEntryPrice: bid at moment entry condition fires
+//   - fakeStopPrice:  fakeEntryPrice - StopLossPoints
+//   - fakeTargetPrice: fakeEntryPrice + ProfitTargetPoints
+//   - Each tick: if bid <= fakeStopPrice → fake loss (0)
+//                if ask >= fakeTargetPrice → fake win (1)
+//   - No actual orders submitted during fake trade.
 // --------------------------------
 //   Added EnableTrailingStop (bool, default true) and TrailDistancePoints
 //   (double, default = StopLossPoints).
@@ -92,6 +131,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double entryFillPrice = 0.0;
         private int    entryFillQty   = 0;
 
+        // ---- Fake order mode state [PATCH 5] ----
+        private bool   inFakeTrade      = false;   // currently tracking a fake trade
+        private double fakeEntryPrice   = 0.0;
+        private double fakeStopPrice    = 0.0;
+        private double fakeTargetPrice  = 0.0;
+        private bool   isArmed          = false;   // next entry should be real
+        private List<string> compiledPatterns = null;  // parsed EntryPattern list
+
         // trailing stop state
         private double currentStopPrice   = 0.0;   // [PATCH 4] tracks current stop level
 
@@ -143,6 +190,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ProfitTargetPoints   = 20;
                 EnableTrailingStop   = true;
                 TrailDistancePoints  = 5;    // [PATCH 4] default mirrors StopLossPoints
+                EnableFakeMode       = true;
+                EntryPattern         = "0,1";
                 BaseQuantity         = 1;
                 MaxOrders            = 10;
                 MaxConsecutiveLosses = 3;
@@ -159,8 +208,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (!lifeStarted)
                 {
-                    strategyStartUtc = DateTime.UtcNow;
-                    lifeStarted      = true;
+                    strategyStartUtc  = DateTime.UtcNow;
+                    lifeStarted       = true;
+                    compiledPatterns  = ParsePatternList(EntryPattern);
+                    isArmed           = false;
                     EnsureLogHeader();
                     DiagLog(Name + " enabled (MANAGED). Life=" + StrategyLifeMinutes
                         + "min, MaxOrders=" + MaxOrders
@@ -171,6 +222,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + ", StopTargetHandling=PerEntryExecution"
                         + ", EnableTrailingStop=" + EnableTrailingStop
                         + (EnableTrailingStop ? ", TrailDist=" + TrailDistancePoints + "pt" : "")
+                        + ", EnableFakeMode=" + EnableFakeMode
+                        + (EnableFakeMode ? ", EntryPattern=[" + EntryPattern + "]" : " (all real)")
                         + ", EnableTradingHours=" + EnableTradingHours
                         + (EnableTradingHours
                             ? string.Format(", Window={0:D2}:{1:D2}-{2:D2}:{3:D2} NY",
@@ -190,6 +243,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 ProcessShutdown();
                 return;
+            }
+
+            // [PATCH 5] Fake trade tick-by-tick resolution
+            // Runs on every tick regardless of CheckIntervalSeconds throttle
+            if (EnableFakeMode && inFakeTrade)
+            {
+                CheckFakeTrade();
+                return;  // while in fake trade, don't process anything else
             }
 
             DateTime nowUtc = DateTime.UtcNow;
@@ -274,6 +335,104 @@ namespace NinjaTrader.NinjaScript.Strategies
                 awaitingClose     = false;
                 workingEntryOrder = null;
             }
+        }
+
+        // =====================================================================
+        // CheckFakeTrade
+        // [PATCH 5] Called every tick while inFakeTrade=true.
+        // Checks if fake stop or fake target has been hit.
+        // LONG: stop hit when bid <= fakeStopPrice
+        //        target hit when ask >= fakeTargetPrice
+        // =====================================================================
+        private void CheckFakeTrade()
+        {
+            try
+            {
+                double bid = GetCurrentBid();
+                double ask = GetCurrentAsk();
+                if (bid <= 0 || ask <= 0) return;
+
+                bool stopHit   = bid <= fakeStopPrice;
+                bool targetHit = ask >= fakeTargetPrice;
+
+                if (!stopHit && !targetHit) return;
+
+                // Fake trade resolved
+                int    bit      = stopHit ? 0 : 1;
+                double exitPrice = stopHit ? fakeStopPrice : fakeTargetPrice;
+                double pnl      = stopHit
+                    ? -(StopLossPoints    * Instrument.MasterInstrument.PointValue)
+                    : +(ProfitTargetPoints * Instrument.MasterInstrument.PointValue);
+
+                outcomeHistory.Append(bit.ToString());
+                inFakeTrade = false;
+
+                DiagLog(string.Format("FAKE {0}: entry={1:F2} exit={2:F2} pnl={3:0.00} seq={4}",
+                    stopHit ? "LOSS" : "WIN",
+                    fakeEntryPrice, exitPrice, pnl,
+                    outcomeHistory.ToString()));
+
+                // Check pattern — arm real order if match
+                bool prevArmed = isArmed;
+                isArmed = AnyPatternMatchesTail();
+                if (isArmed && !prevArmed)
+                    DiagLog(string.Format("[ARMED] Pattern matched tail '{0}' → next entry is REAL.",
+                        TailForLog(8)));
+
+                // Write to CSV (fake trades logged with FAKE prefix)
+                WriteLogRowFake(exitPrice, pnl, bit);
+
+                // Reset fake fields
+                fakeEntryPrice  = 0.0;
+                fakeStopPrice   = 0.0;
+                fakeTargetPrice = 0.0;
+                awaitingClose   = false;  // ready for next entry
+            }
+            catch (Exception ex)
+            {
+                DiagLog("[FAKE] CheckFakeTrade error: " + ex.Message);
+                inFakeTrade   = false;
+                awaitingClose = false;
+            }
+        }
+
+        // =====================================================================
+        // Pattern helpers [PATCH 5]
+        // =====================================================================
+        private List<string> ParsePatternList(string raw)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrWhiteSpace(raw)) return result;
+            foreach (var part in raw.Split(','))
+            {
+                string p = part.Trim();
+                if (p.Length == 0) continue;
+                bool ok = true;
+                foreach (char c in p)
+                    if (c != '0' && c != '1') { ok = false; break; }
+                if (ok && !result.Contains(p))
+                    result.Add(p);
+            }
+            return result;
+        }
+
+        private bool AnyPatternMatchesTail()
+        {
+            if (compiledPatterns == null || compiledPatterns.Count == 0) return false;
+            string tail = outcomeHistory.ToString();
+            foreach (var p in compiledPatterns)
+            {
+                if (tail.Length < p.Length) continue;
+                string t = tail.Substring(tail.Length - p.Length);
+                if (t == p) return true;
+            }
+            return false;
+        }
+
+        private string TailForLog(int n)
+        {
+            string s = outcomeHistory.ToString();
+            return s.Length <= n ? s : "..." + s.Substring(s.Length - n);
         }
 
         // =====================================================================
@@ -428,6 +587,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                     entryFillPrice    = 0.0;
                     entryFillQty      = 0;
                     currentStopPrice  = 0.0;   // [PATCH 4] reset trail tracking
+
+                    // [PATCH 5] Re-check pattern after real trade closes
+                    if (EnableFakeMode)
+                    {
+                        bool prevArmed = isArmed;
+                        isArmed = AnyPatternMatchesTail();
+                        if (isArmed && !prevArmed)
+                            DiagLog(string.Format("[ARMED] Real trade closed. Pattern matched '{0}' → next entry is REAL.",
+                                TailForLog(8)));
+                        else if (!isArmed)
+                            DiagLog("[FAKE] Real trade closed. Pattern not matched → back to fake mode.");
+                    }
                 }
             }
         }
@@ -634,6 +805,20 @@ namespace NinjaTrader.NinjaScript.Strategies
             catch (Exception ex) { Print("Log write error: " + ex.Message); }
         }
 
+        private void WriteLogRowFake(double exitPrice, double pnl, int bit)
+        {
+            try
+            {
+                string row = string.Format(
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6:0.00},{7},{8}\n",
+                    DateTime.Now, ordersPlaced, "FAKE_Long", 0,
+                    fakeEntryPrice, exitPrice, pnl, bit, outcomeHistory.ToString());
+                File.AppendAllText(LogFilePath, row);
+            }
+            catch (Exception ex) { Print("Log write error (fake): " + ex.Message); }
+        }
+
         private void DiagLog(string msg)
         {
             string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + msg;
@@ -715,6 +900,24 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Range(0.0, double.MaxValue)]
         [Display(Name = "G/H: Profit target (points)", Order = 11, GroupName = "Bracket")]
         public double ProfitTargetPoints { get; set; }
+
+        // [PATCH 5] Fake mode + pattern
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Fake Mode", Order = 1, GroupName = "Pattern (Fake Mode)",
+            Description = "[PATCH 5] When true: trades run as fake (paper) until EntryPattern "
+                        + "matches outcomeHistory tail — then ONE real order fires. "
+                        + "Fake and real outcomes build the same sequence. "
+                        + "When false: all trades are real (original behavior).")]
+        public bool EnableFakeMode { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Entry Pattern (comma-separated)", Order = 2, GroupName = "Pattern (Fake Mode)",
+            Description = "[PATCH 5] Comma-separated binary patterns. After each trade (fake or real), "
+                        + "if the tail of outcomeHistory matches ANY pattern → next entry is REAL. "
+                        + "Examples: '0,1' (every outcome arms real — default), "
+                        + "'01' (only after loss+win), '01,011' (loss+win OR loss+win+win). "
+                        + "Empty sequence never matches → safe startup in fake mode.")]
+        public string EntryPattern { get; set; }
 
         // [PATCH 4] Trailing stop
         [NinjaScriptProperty]
