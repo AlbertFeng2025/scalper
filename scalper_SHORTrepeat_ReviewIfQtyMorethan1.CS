@@ -20,6 +20,17 @@ using NinjaTrader.NinjaScript.Strategies;
 // PATCH 3 — Cancel unfilled limit entry on shutdown
 //
 // PATCH 4 — Enable trailing stop
+//
+// PATCH 5 — Fake order mode + pattern-armed real orders
+// ------------------------------------------------------
+//   Identical logic to scalper_LONGrepeat PATCH 5, SHORT direction.
+//
+//   SHORT-specific fake trade resolution:
+//   - fakeStopPrice   = fakeEntryPrice + StopLossPoints  (ABOVE entry)
+//   - fakeTargetPrice = fakeEntryPrice - ProfitTargetPoints (BELOW entry)
+//   - Stop hit when ask >= fakeStopPrice
+//   - Target hit when bid <= fakeTargetPrice
+//   - fakeEntryPrice = ask at moment entry fires (SHORT sells at ask)
 // --------------------------------
 //   Added EnableTrailingStop (bool, default true) and TrailDistancePoints
 //   (double, default = StopLossPoints).
@@ -88,6 +99,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double entryFillPrice = 0.0;
         private int    entryFillQty   = 0;
 
+        // ---- Fake order mode state [PATCH 5] ----
+        private bool   inFakeTrade      = false;
+        private double fakeEntryPrice   = 0.0;
+        private double fakeStopPrice    = 0.0;
+        private double fakeTargetPrice  = 0.0;
+        private bool   isArmed          = false;
+        private List<string> compiledPatterns = null;
+
         // trailing stop state
         private double currentStopPrice   = 0.0;   // [PATCH 4] tracks current stop level
 
@@ -140,6 +159,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ProfitTargetPoints   = 20;
                 EnableTrailingStop   = true;
                 TrailDistancePoints  = 5;    // [PATCH 4] default mirrors StopLossPoints
+                EnableFakeMode       = true;
+                EntryPattern         = "0,1";
                 BaseQuantity         = 1;
                 MaxOrders            = 10;
                 MaxConsecutiveLosses = 3;
@@ -156,8 +177,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (!lifeStarted)
                 {
-                    strategyStartUtc = DateTime.UtcNow;
-                    lifeStarted      = true;
+                    strategyStartUtc  = DateTime.UtcNow;
+                    lifeStarted       = true;
+                    compiledPatterns  = ParsePatternList(EntryPattern);
+                    isArmed           = false;
                     EnsureLogHeader();
                     DiagLog(Name + " enabled (MANAGED SHORT). Life=" + StrategyLifeMinutes
                         + "min, MaxOrders=" + MaxOrders
@@ -168,6 +191,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + ", StopTargetHandling=PerEntryExecution"
                         + ", EnableTrailingStop=" + EnableTrailingStop
                         + (EnableTrailingStop ? ", TrailDist=" + TrailDistancePoints + "pt" : "")
+                        + ", EnableFakeMode=" + EnableFakeMode
+                        + (EnableFakeMode ? ", EntryPattern=[" + EntryPattern + "]" : " (all real)")
                         + ", EnableTradingHours=" + EnableTradingHours
                         + (EnableTradingHours
                             ? string.Format(", Window={0:D2}:{1:D2}-{2:D2}:{3:D2} NY",
@@ -186,6 +211,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (disabledSelf || pendingFlatten)
             {
                 ProcessShutdown();
+                return;
+            }
+
+            // [PATCH 5] Fake trade tick-by-tick resolution
+            if (EnableFakeMode && inFakeTrade)
+            {
+                CheckFakeTrade();
                 return;
             }
 
@@ -237,31 +269,55 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // =====================================================================
         // PlaceEntry
-        // [PATCH 3] Stores workingEntryOrder reference for cancel-on-shutdown.
+        // [PATCH 5] Branches to fake or real based on EnableFakeMode + isArmed.
         // =====================================================================
         private void PlaceEntry()
         {
-            int qty = BaseQuantity;
+            bool goReal = !EnableFakeMode || isArmed;
+
+            if (!goReal)
+            {
+                // ---- FAKE trade (SHORT) ----
+                ordersPlaced++;
+                double refPrice = GetCurrentAsk();
+                if (refPrice <= 0) { ordersPlaced--; return; }
+
+                if (!UseMarketEntry)
+                    refPrice = Instrument.MasterInstrument.RoundToTickSize(refPrice + LimitOffsetPoints);
+
+                fakeEntryPrice  = refPrice;
+                // SHORT: stop ABOVE entry, target BELOW entry
+                fakeStopPrice   = Instrument.MasterInstrument.RoundToTickSize(fakeEntryPrice + StopLossPoints);
+                fakeTargetPrice = Instrument.MasterInstrument.RoundToTickSize(fakeEntryPrice - ProfitTargetPoints);
+                inFakeTrade     = true;
+                awaitingClose   = true;
+
+                DiagLog(string.Format("FAKE SHORT ENTRY #{0} @ {1:F2} stop={2:F2}(above) target={3:F2}(below)",
+                    ordersPlaced, fakeEntryPrice, fakeStopPrice, fakeTargetPrice));
+                return;
+            }
+
+            // ---- REAL trade ----
+            isArmed           = false;
+            int qty           = BaseQuantity;
             ordersPlaced++;
             entryInFlight     = true;
             awaitingClose     = true;
-            workingEntryOrder = null;   // [PATCH 3] clear before submitting
+            workingEntryOrder = null;
 
             try
             {
                 if (UseMarketEntry)
                 {
-                    workingEntryOrder = EnterShort(qty, ENTRY_SIGNAL);  // [PATCH 3]
-                    DiagLog(string.Format("ENTRY #{0} MARKET SHORT qty={1}",
-                        ordersPlaced, qty));
+                    workingEntryOrder = EnterShort(qty, ENTRY_SIGNAL);
+                    DiagLog(string.Format("REAL SHORT ENTRY #{0} MARKET qty={1}", ordersPlaced, qty));
                 }
                 else
                 {
-                    // SHORT limit: sell ABOVE current ask
                     double limitPx = GetCurrentAsk() + LimitOffsetPoints;
                     limitPx = Instrument.MasterInstrument.RoundToTickSize(limitPx);
-                    workingEntryOrder = EnterShortLimit(0, true, qty, limitPx, ENTRY_SIGNAL);  // [PATCH 3]
-                    DiagLog(string.Format("ENTRY #{0} LIMIT SHORT qty={1} limit={2:F2}",
+                    workingEntryOrder = EnterShortLimit(0, true, qty, limitPx, ENTRY_SIGNAL);
+                    DiagLog(string.Format("REAL SHORT ENTRY #{0} LIMIT qty={1} limit={2:F2}",
                         ordersPlaced, qty, limitPx));
                 }
             }
@@ -272,7 +328,102 @@ namespace NinjaTrader.NinjaScript.Strategies
                 entryInFlight     = false;
                 awaitingClose     = false;
                 workingEntryOrder = null;
+                isArmed           = true;  // restore armed — entry failed
             }
+        }
+
+        // =====================================================================
+        // CheckFakeTrade
+        // [PATCH 5] SHORT-specific fake trade resolution.
+        // Stop hit when ask >= fakeStopPrice (price went UP against short).
+        // Target hit when bid <= fakeTargetPrice (price went DOWN for short).
+        // =====================================================================
+        private void CheckFakeTrade()
+        {
+            try
+            {
+                double bid = GetCurrentBid();
+                double ask = GetCurrentAsk();
+                if (bid <= 0 || ask <= 0) return;
+
+                bool stopHit   = ask >= fakeStopPrice;
+                bool targetHit = bid <= fakeTargetPrice;
+
+                if (!stopHit && !targetHit) return;
+
+                int    bit       = stopHit ? 0 : 1;
+                double exitPrice = stopHit ? fakeStopPrice : fakeTargetPrice;
+                // SHORT PnL: profit when price falls
+                double pnl = stopHit
+                    ? -(StopLossPoints    * Instrument.MasterInstrument.PointValue)
+                    : +(ProfitTargetPoints * Instrument.MasterInstrument.PointValue);
+
+                outcomeHistory.Append(bit.ToString());
+                inFakeTrade   = false;
+                awaitingClose = false;
+
+                DiagLog(string.Format("FAKE SHORT {0}: entry={1:F2} exit={2:F2} pnl={3:0.00} seq={4}",
+                    stopHit ? "LOSS" : "WIN",
+                    fakeEntryPrice, exitPrice, pnl,
+                    outcomeHistory.ToString()));
+
+                bool prevArmed = isArmed;
+                isArmed = AnyPatternMatchesTail();
+                if (isArmed && !prevArmed)
+                    DiagLog(string.Format("[ARMED] Pattern matched tail '{0}' → next entry is REAL.",
+                        TailForLog(8)));
+
+                WriteLogRowFake(exitPrice, pnl, bit);
+
+                fakeEntryPrice  = 0.0;
+                fakeStopPrice   = 0.0;
+                fakeTargetPrice = 0.0;
+            }
+            catch (Exception ex)
+            {
+                DiagLog("[FAKE] CheckFakeTrade error: " + ex.Message);
+                inFakeTrade   = false;
+                awaitingClose = false;
+            }
+        }
+
+        // =====================================================================
+        // Pattern helpers [PATCH 5]
+        // =====================================================================
+        private List<string> ParsePatternList(string raw)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrWhiteSpace(raw)) return result;
+            foreach (var part in raw.Split(','))
+            {
+                string p = part.Trim();
+                if (p.Length == 0) continue;
+                bool ok = true;
+                foreach (char c in p)
+                    if (c != '0' && c != '1') { ok = false; break; }
+                if (ok && !result.Contains(p))
+                    result.Add(p);
+            }
+            return result;
+        }
+
+        private bool AnyPatternMatchesTail()
+        {
+            if (compiledPatterns == null || compiledPatterns.Count == 0) return false;
+            string tail = outcomeHistory.ToString();
+            foreach (var p in compiledPatterns)
+            {
+                if (tail.Length < p.Length) continue;
+                string t = tail.Substring(tail.Length - p.Length);
+                if (t == p) return true;
+            }
+            return false;
+        }
+
+        private string TailForLog(int n)
+        {
+            string s = outcomeHistory.ToString();
+            return s.Length <= n ? s : "..." + s.Substring(s.Length - n);
         }
 
         // =====================================================================
@@ -432,6 +583,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                     entryFillPrice    = 0.0;
                     entryFillQty      = 0;
                     currentStopPrice  = 0.0;   // [PATCH 4] reset trail tracking
+
+                    // [PATCH 5] Re-check pattern after real trade closes
+                    if (EnableFakeMode)
+                    {
+                        bool prevArmed = isArmed;
+                        isArmed = AnyPatternMatchesTail();
+                        if (isArmed && !prevArmed)
+                            DiagLog(string.Format("[ARMED] Real trade closed. Pattern matched '{0}' → next entry is REAL.",
+                                TailForLog(8)));
+                        else if (!isArmed)
+                            DiagLog("[FAKE] Real trade closed. Pattern not matched → back to fake mode.");
+                    }
                 }
             }
         }
@@ -637,6 +800,20 @@ namespace NinjaTrader.NinjaScript.Strategies
             catch (Exception ex) { Print("Log write error: " + ex.Message); }
         }
 
+        private void WriteLogRowFake(double exitPrice, double pnl, int bit)
+        {
+            try
+            {
+                string row = string.Format(
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6:0.00},{7},{8}\n",
+                    DateTime.Now, ordersPlaced, "FAKE_Short", 0,
+                    fakeEntryPrice, exitPrice, pnl, bit, outcomeHistory.ToString());
+                File.AppendAllText(LogFilePath, row);
+            }
+            catch (Exception ex) { Print("Log write error (fake): " + ex.Message); }
+        }
+
         private void DiagLog(string msg)
         {
             string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + msg;
@@ -718,6 +895,22 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Range(0.0, double.MaxValue)]
         [Display(Name = "G/H: Profit target (points)", Order = 11, GroupName = "Bracket")]
         public double ProfitTargetPoints { get; set; }
+
+        // [PATCH 5] Fake mode + pattern
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Fake Mode", Order = 1, GroupName = "Pattern (Fake Mode)",
+            Description = "[PATCH 5] When true: trades run as fake (paper) until EntryPattern "
+                        + "matches outcomeHistory tail — then ONE real order fires. "
+                        + "When false: all trades are real (original behavior).")]
+        public bool EnableFakeMode { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Entry Pattern (comma-separated)", Order = 2, GroupName = "Pattern (Fake Mode)",
+            Description = "[PATCH 5] Comma-separated binary patterns. After each trade (fake or real), "
+                        + "if tail of outcomeHistory matches ANY pattern → next entry is REAL. "
+                        + "Examples: '0,1' (default — every outcome arms real), "
+                        + "'01' (only after loss+win), '01,011' (loss+win OR loss+win+win).")]
+        public string EntryPattern { get; set; }
 
         // [PATCH 4] Trailing stop
         [NinjaScriptProperty]
