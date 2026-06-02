@@ -159,7 +159,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ProfitTargetPoints   = 20;
                 EnableTrailingStop   = true;
                 TrailDistancePoints  = 5;    // [PATCH 4] default mirrors StopLossPoints
-                EnableFakeMode       = true;
+                EnableRealOrder      = false;  // default: observation only until user enables
                 EntryPattern         = "0,1";
                 BaseQuantity         = 1;
                 MaxOrders            = 10;
@@ -181,6 +181,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     lifeStarted       = true;
                     compiledPatterns  = ParsePatternList(EntryPattern);
                     isArmed           = false;
+                    enableRealOrder   = EnableRealOrder;
                     EnsureLogHeader();
                     DiagLog(Name + " enabled (MANAGED SHORT). Life=" + StrategyLifeMinutes
                         + "min, MaxOrders=" + MaxOrders
@@ -191,8 +192,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + ", StopTargetHandling=PerEntryExecution"
                         + ", EnableTrailingStop=" + EnableTrailingStop
                         + (EnableTrailingStop ? ", TrailDist=" + TrailDistancePoints + "pt" : "")
-                        + ", EnableFakeMode=" + EnableFakeMode
-                        + (EnableFakeMode ? ", EntryPattern=[" + EntryPattern + "]" : " (all real)")
+                        + ", EnableRealOrder=" + EnableRealOrder
+                        + ", EntryPattern=[" + EntryPattern + "]"
+                        + (EnableRealOrder ? "" : " (observation only — no real orders)")
                         + ", EnableTradingHours=" + EnableTradingHours
                         + (EnableTradingHours
                             ? string.Format(", Window={0:D2}:{1:D2}-{2:D2}:{3:D2} NY",
@@ -214,8 +216,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // [PATCH 5] Fake trade tick-by-tick resolution
-            if (EnableFakeMode && inFakeTrade)
+            // [PATCH 5] Fake trade tick-by-tick resolution (always runs regardless of EnableRealOrder)
+            if (inFakeTrade)
             {
                 CheckFakeTrade();
                 return;
@@ -273,7 +275,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         // =====================================================================
         private void PlaceEntry()
         {
-            bool goReal = !EnableFakeMode || isArmed;
+            // [PATCH 5] Real order only when EnableRealOrder=true AND pattern matched
+            bool goReal = EnableRealOrder && isArmed;
 
             if (!goReal)
             {
@@ -370,7 +373,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 bool prevArmed = isArmed;
                 isArmed = AnyPatternMatchesTail();
                 if (isArmed && !prevArmed)
-                    DiagLog(string.Format("[ARMED] Pattern matched tail '{0}' → next entry is REAL.",
+                    DiagLog(string.Format("[ARMED] Pattern matched tail '{0}'" + (EnableRealOrder ? " → next entry is REAL." : " → (observation mode, no order)"),
                         TailForLog(8)));
 
                 WriteLogRowFake(exitPrice, pnl, bit);
@@ -585,15 +588,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                     currentStopPrice  = 0.0;   // [PATCH 4] reset trail tracking
 
                     // [PATCH 5] Re-check pattern after real trade closes
-                    if (EnableFakeMode)
+                    // [PATCH 5] Re-check pattern after real trade closes (always)
                     {
                         bool prevArmed = isArmed;
                         isArmed = AnyPatternMatchesTail();
                         if (isArmed && !prevArmed)
-                            DiagLog(string.Format("[ARMED] Real trade closed. Pattern matched '{0}' → next entry is REAL.",
+                            DiagLog(string.Format("[ARMED] Real trade closed. Pattern matched '{0}'" + (EnableRealOrder ? " → next entry is REAL." : " → (observation mode)"),
                                 TailForLog(8)));
                         else if (!isArmed)
-                            DiagLog("[FAKE] Real trade closed. Pattern not matched → back to fake mode.");
+                            DiagLog("[SEQUENCE] Real trade closed. Pattern not matched → fake trades continue.");
                     }
                 }
             }
@@ -896,20 +899,24 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "G/H: Profit target (points)", Order = 11, GroupName = "Bracket")]
         public double ProfitTargetPoints { get; set; }
 
-        // [PATCH 5] Fake mode + pattern
+        // [PATCH 5] Real order enable + pattern filter
         [NinjaScriptProperty]
-        [Display(Name = "Enable Fake Mode", Order = 1, GroupName = "Pattern (Fake Mode)",
-            Description = "[PATCH 5] When true: trades run as fake (paper) until EntryPattern "
-                        + "matches outcomeHistory tail — then ONE real order fires. "
-                        + "When false: all trades are real (original behavior).")]
-        public bool EnableFakeMode { get; set; }
+        [Display(Name = "Enable Real Order", Order = 1, GroupName = "Pattern & Real Order",
+            Description = "When FALSE (default): observation mode only. No real orders placed. "
+                        + "Fake trades run silently, recording every outcome into the sequence. "
+                        + "Use this to study the pattern before risking real money. "
+                        + "When TRUE: real orders are placed. EntryPattern controls when. "
+                        + "Pattern is always checked against ALL trades (fake + real). "
+                        + "The sequence records every trade regardless of this setting.")]
+        public bool EnableRealOrder { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Entry Pattern (comma-separated)", Order = 2, GroupName = "Pattern (Fake Mode)",
-            Description = "[PATCH 5] Comma-separated binary patterns. After each trade (fake or real), "
-                        + "if tail of outcomeHistory matches ANY pattern → next entry is REAL. "
-                        + "Examples: '0,1' (default — every outcome arms real), "
-                        + "'01' (only after loss+win), '01,011' (loss+win OR loss+win+win).")]
+        [Display(Name = "Entry Pattern (comma-separated)", Order = 2, GroupName = "Pattern & Real Order",
+            Description = "Comma-separated binary patterns checked after EVERY trade (fake or real). "
+                        + "0=loss, 1=win. When EnableRealOrder=true and tail matches → real order fires. "
+                        + "When EnableRealOrder=false → pattern is checked but no order placed (observation). "
+                        + "Default '0,1' = every outcome matches (no filter). "
+                        + "Examples: '01' = only after loss+win. '01,011' = loss+win OR loss+win+win.")]
         public string EntryPattern { get; set; }
 
         // [PATCH 4] Trailing stop
