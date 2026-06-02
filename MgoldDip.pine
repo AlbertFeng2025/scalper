@@ -1,0 +1,51 @@
+//@version=5
+indicator(title="Michelle_Golddip", shorttitle="GoldDip", overlay=false)
+
+// ---- Parameters ----
+barThickness  = input.int(5,  "Bar Thickness",       minval=1, maxval=15,
+    tooltip="Thickness of the oscillator bars. Range 1-15, default 5.")
+showWashout   = input.bool(false, "Show Washout Bars",
+    tooltip="Show green bars when oscillator is falling. Off by default.")
+
+// ---- Core calculation ----
+var1 = (low[1] + open[1] + close[1] + high[1]) / 4.0
+var2Num = math.abs(low - var1)
+var2Den = math.max(low - var1, 0.0)
+var2NumEMA = ta.ema(var2Num, 25)
+var2DenEMA = ta.ema(var2Den, 19)
+var2 = var2DenEMA != 0 ? var2NumEMA / var2DenEMA : 0.0
+var3 = ta.ema(var2, 10)
+var4 = ta.lowest(low, 33)
+condValue = low <= var4 ? var3 : 0.0
+var5 = ta.ema(condValue, 3)
+
+// ---- Signal detection ----
+isRising   = var5 > var5[1]
+isFirstRise = isRising and (var5[1] <= var5[2] or var5[1] == 0)
+
+// ---- Plots ----
+plot(isRising ? var5 : na,
+    title="Main Force Entry", color=color.red,
+    style=plot.style_columns, linewidth=barThickness)
+
+plot(showWashout and not isRising ? var5 : na,
+    title="Washout", color=color.green,
+    style=plot.style_columns, linewidth=barThickness)
+
+hline(0, "Zero", color=color.new(color.gray, 70), linestyle=hline.style_dotted)
+
+// ---- Signal markers on price chart ----
+if isFirstRise and bar_index >= 34
+    label.new(bar_index, low - syminfo.mintick * 30,
+        text="▲", xloc=xloc.bar_index, yloc=yloc.price,
+        color=color.new(color.lime, 0), textcolor=color.lime,
+        style=label.style_none, size=size.normal)
+    label.new(bar_index, low - syminfo.mintick * 60,
+        text="ENTRY", xloc=xloc.bar_index, yloc=yloc.price,
+        color=color.new(color.white, 100), textcolor=color.white,
+        style=label.style_none, size=size.small)
+
+// ---- Alert ----
+alertcondition(isFirstRise and bar_index >= 34,
+    title="GoldDip Entry Signal",
+    message="Michelle_Golddip: ENTRY signal fired on {{ticker}} {{interval}}")
