@@ -18,6 +18,26 @@ using NinjaTrader.NinjaScript.Strategies;
 // PATCH 2 — Trading hours rework (EnableTradingHours toggle + NY integers)
 //
 // PATCH 3 — Cancel unfilled limit entry on shutdown
+//
+// PATCH 4 — Enable trailing stop
+// --------------------------------
+//   Added EnableTrailingStop (bool, default true) and TrailDistancePoints
+//   (double, default = StopLossPoints).
+//
+//   When EnableTrailingStop = false:
+//     Fixed stop only. Behavior identical to patch 1-3.
+//
+//   When EnableTrailingStop = true:
+//     On entry fill: initial hard stop set at StopLossPoints ABOVE fill (SHORT).
+//     Every CheckIntervalSeconds (same timer as entry check, label updated):
+//       proposedStop = GetCurrentAsk() + TrailDistancePoints
+//       if proposedStop < currentStopPrice → move stop DOWN (SHORT trail ratchets down)
+//       if proposedStop >= currentStopPrice → do nothing (stop never moves up)
+//     Trail only moves DOWN for Short — ratchets with price, never retreats.
+//
+//   TrailDistancePoints defaults to StopLossPoints value for back-compat.
+//   User may set a tighter trail (e.g. stop=20pt initial, trail=10pt once in profit).
+//   Uses existing CheckIntervalSeconds timer — no new timer parameter needed.
 // -------------------------------------------------
 //   Identical fix to scalper_LONGrepeat PATCH 3, SHORT direction.
 //
@@ -68,6 +88,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double entryFillPrice = 0.0;
         private int    entryFillQty   = 0;
 
+        // trailing stop state
+        private double currentStopPrice   = 0.0;   // [PATCH 4] tracks current stop level
+
         // shutdown control
         private bool   pendingFlatten = false;
         private string pendingReason  = string.Empty;
@@ -115,6 +138,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 LimitOffsetPoints    = 5;
                 StopLossPoints       = 5;
                 ProfitTargetPoints   = 20;
+                EnableTrailingStop   = true;
+                TrailDistancePoints  = 5;    // [PATCH 4] default mirrors StopLossPoints
                 BaseQuantity         = 1;
                 MaxOrders            = 10;
                 MaxConsecutiveLosses = 3;
@@ -141,6 +166,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + ", Stop=" + StopLossPoints + "pt (above entry)"
                         + ", Target=" + ProfitTargetPoints + "pt (below entry)"
                         + ", StopTargetHandling=PerEntryExecution"
+                        + ", EnableTrailingStop=" + EnableTrailingStop
+                        + (EnableTrailingStop ? ", TrailDist=" + TrailDistancePoints + "pt" : "")
                         + ", EnableTradingHours=" + EnableTradingHours
                         + (EnableTradingHours
                             ? string.Format(", Window={0:D2}:{1:D2}-{2:D2}:{3:D2} NY",
@@ -194,6 +221,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!WithinTradingHours())
                 return;
 
+            // [PATCH 4] Trailing stop update — runs on same CheckIntervalSeconds timer
+            // SHORT: stop ratchets DOWN as price falls.
+            if (EnableTrailingStop && awaitingClose
+                && Position.MarketPosition == MarketPosition.Short)
+            {
+                DoTrailingStop();
+            }
+
             if (!ReadyForNewEntry())
                 return;
 
@@ -237,6 +272,46 @@ namespace NinjaTrader.NinjaScript.Strategies
                 entryInFlight     = false;
                 awaitingClose     = false;
                 workingEntryOrder = null;
+            }
+        }
+
+        // =====================================================================
+        // DoTrailingStop
+        // [PATCH 4] Called every CheckIntervalSeconds while in a short position.
+        // SHORT: stop ratchets DOWN as price falls — never moves UP.
+        // proposedStop = ask + TrailDistancePoints
+        // Move stop only when proposedStop < currentStopPrice (stop moves down = tighter).
+        // =====================================================================
+        private void DoTrailingStop()
+        {
+            try
+            {
+                double currentPrice = GetCurrentAsk();
+                if (currentPrice <= 0) return;
+                if (currentStopPrice <= 0) return;
+
+                double proposedStop = currentPrice + TrailDistancePoints;
+                proposedStop = Instrument.MasterInstrument.RoundToTickSize(proposedStop);
+
+                // SHORT: stop only moves DOWN (lower stop = tighter = closer to current price)
+                if (proposedStop < currentStopPrice)
+                {
+                    DiagLog(string.Format("[TRAIL] Stop DOWN: {0:F2} -> {1:F2} (ask={2:F2}, dist={3}pt)",
+                        currentStopPrice, proposedStop, currentPrice, TrailDistancePoints));
+                    try
+                    {
+                        SetStopLoss(ENTRY_SIGNAL, CalculationMode.Price, proposedStop, false);
+                        currentStopPrice = proposedStop;
+                    }
+                    catch (Exception ex)
+                    {
+                        DiagLog("[TRAIL] SetStopLoss error: " + ex.Message);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                DiagLog("[TRAIL] DoTrailingStop error: " + ex.Message);
             }
         }
 
@@ -310,8 +385,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     entryInFlight     = false;
                     workingEntryOrder = null;  // [PATCH 3] fully filled, no longer needs cancel
-                    DiagLog(string.Format("Entry complete. Fill={0:F2} qty={1}. Bracket active.",
-                        entryFillPrice, entryFillQty));
+                    // [PATCH 4] Record initial stop price for trail tracking
+                    // SHORT: stop is ABOVE fill price
+                    currentStopPrice  = entryFillPrice + StopLossPoints;
+                    currentStopPrice  = Instrument.MasterInstrument.RoundToTickSize(currentStopPrice);
+                    DiagLog(string.Format("Entry complete. Fill={0:F2} qty={1}. InitialStop={2:F2} (above). Trail={3}.",
+                        entryFillPrice, entryFillQty, currentStopPrice,
+                        EnableTrailingStop ? "ENABLED" : "disabled"));
                 }
                 else
                 {
@@ -351,6 +431,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     workingEntryOrder = null;
                     entryFillPrice    = 0.0;
                     entryFillQty      = 0;
+                    currentStopPrice  = 0.0;   // [PATCH 4] reset trail tracking
                 }
             }
         }
@@ -614,7 +695,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Range(1, 3600)]
-        [Display(Name = "D: Check interval (seconds)", Order = 7, GroupName = "Timing")]
+        [Display(Name = "D: Check interval (seconds)", Order = 7, GroupName = "Timing",
+            Description = "Seconds between entry checks. Also used as the trailing stop "
+                        + "update interval when EnableTrailingStop=true.")]
         public int CheckIntervalSeconds { get; set; }
 
         [NinjaScriptProperty]
@@ -636,23 +719,39 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "G/H: Profit target (points)", Order = 11, GroupName = "Bracket")]
         public double ProfitTargetPoints { get; set; }
 
+        // [PATCH 4] Trailing stop
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Trailing Stop", Order = 12, GroupName = "Bracket",
+            Description = "[PATCH 4] When true: SHORT stop ratchets DOWN as price falls, "
+                        + "checked every CheckIntervalSeconds. "
+                        + "When false: fixed stop only (original behavior). Default true.")]
+        public bool EnableTrailingStop { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.01, double.MaxValue)]
+        [Display(Name = "Trail distance (points)", Order = 13, GroupName = "Bracket",
+            Description = "[PATCH 4] Distance in points between current ask and trailing stop. "
+                        + "Default mirrors StopLossPoints. Can be set tighter than StopLossPoints. "
+                        + "Only used when EnableTrailingStop=true.")]
+        public double TrailDistancePoints { get; set; }
+
         [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
-        [Display(Name = "Base quantity (fixed)", Order = 12, GroupName = "Quantity")]
+        [Display(Name = "Base quantity (fixed)", Order = 14, GroupName = "Quantity")]
         public int BaseQuantity { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
-        [Display(Name = "Max orders (then disable)", Order = 13, GroupName = "Limits")]
+        [Display(Name = "Max orders (then disable)", Order = 15, GroupName = "Limits")]
         public int MaxOrders { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
-        [Display(Name = "Max consecutive losses (then disable)", Order = 14, GroupName = "Limits")]
+        [Display(Name = "Max consecutive losses (then disable)", Order = 16, GroupName = "Limits")]
         public int MaxConsecutiveLosses { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Log file path", Order = 15, GroupName = "Logging")]
+        [Display(Name = "Log file path", Order = 17, GroupName = "Logging")]
         public string LogFilePath { get; set; }
 
         #endregion
