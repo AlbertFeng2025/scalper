@@ -304,29 +304,57 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // =====================================================================
         // PlaceEntry
-        // [PATCH 3] Stores workingEntryOrder reference for cancel-on-shutdown.
+        // [PATCH 5] Branches to fake or real based on EnableRealOrder + isArmed.
+        // EnableRealOrder=false → always fake (observation only, no orders).
+        // EnableRealOrder=true  → real only when isArmed (pattern matched).
         // =====================================================================
         private void PlaceEntry()
         {
-            int qty = BaseQuantity;
+            // Real order only when EnableRealOrder=true AND pattern matched
+            bool goReal = EnableRealOrder && isArmed;
+
+            if (!goReal)
+            {
+                // ---- FAKE trade (LONG) ----
+                ordersPlaced++;
+                double refPrice = GetCurrentBid();
+                if (refPrice <= 0) { ordersPlaced--; return; }
+
+                if (!UseMarketEntry)
+                    refPrice = Instrument.MasterInstrument.RoundToTickSize(refPrice - LimitOffsetPoints);
+
+                fakeEntryPrice  = refPrice;
+                fakeStopPrice   = Instrument.MasterInstrument.RoundToTickSize(fakeEntryPrice - StopLossPoints);
+                fakeTargetPrice = Instrument.MasterInstrument.RoundToTickSize(fakeEntryPrice + ProfitTargetPoints);
+                inFakeTrade     = true;
+                awaitingClose   = true;
+
+                DiagLog(string.Format("FAKE ENTRY #{0} @ {1:F2} stop={2:F2} target={3:F2}",
+                    ordersPlaced, fakeEntryPrice, fakeStopPrice, fakeTargetPrice));
+                return;
+            }
+
+            // ---- REAL trade (LONG) ----
+            isArmed           = false;  // consume armed state
+            int qty           = BaseQuantity;
             ordersPlaced++;
-            entryInFlight       = true;
-            awaitingClose       = true;
-            workingEntryOrder   = null;   // [PATCH 3] clear before submitting
+            entryInFlight     = true;
+            awaitingClose     = true;
+            workingEntryOrder = null;
 
             try
             {
                 if (UseMarketEntry)
                 {
-                    workingEntryOrder = EnterLong(qty, ENTRY_SIGNAL);  // [PATCH 3]
-                    DiagLog(string.Format("ENTRY #{0} MARKET qty={1}", ordersPlaced, qty));
+                    workingEntryOrder = EnterLong(qty, ENTRY_SIGNAL);
+                    DiagLog(string.Format("REAL ENTRY #{0} MARKET qty={1}", ordersPlaced, qty));
                 }
                 else
                 {
                     double limitPx = GetCurrentBid() - LimitOffsetPoints;
                     limitPx = Instrument.MasterInstrument.RoundToTickSize(limitPx);
-                    workingEntryOrder = EnterLongLimit(0, true, qty, limitPx, ENTRY_SIGNAL);  // [PATCH 3]
-                    DiagLog(string.Format("ENTRY #{0} LIMIT qty={1} limit={2:F2}",
+                    workingEntryOrder = EnterLongLimit(0, true, qty, limitPx, ENTRY_SIGNAL);
+                    DiagLog(string.Format("REAL ENTRY #{0} LIMIT qty={1} limit={2:F2}",
                         ordersPlaced, qty, limitPx));
                 }
             }
@@ -337,6 +365,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 entryInFlight     = false;
                 awaitingClose     = false;
                 workingEntryOrder = null;
+                isArmed           = true;  // restore armed — entry failed, retry next tick
             }
         }
 
