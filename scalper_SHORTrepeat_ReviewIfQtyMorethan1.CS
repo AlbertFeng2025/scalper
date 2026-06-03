@@ -538,10 +538,30 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     entryInFlight     = false;
                     workingEntryOrder = null;  // [PATCH 3] fully filled, no longer needs cancel
+
                     // [PATCH 4] Record initial stop price for trail tracking
                     // SHORT: stop is ABOVE fill price
                     currentStopPrice  = entryFillPrice + StopLossPoints;
                     currentStopPrice  = Instrument.MasterInstrument.RoundToTickSize(currentStopPrice);
+
+                    // [PATCH 6] Force-reset stop using Ticks on every entry fill.
+                    // Prevents NT reusing the stale trailed stop price from the
+                    // previous trade's bracket (OCO ID reuse bug). Ticks mode
+                    // makes NT always recalculate from fill price rather than
+                    // using any cached absolute Price from the previous trail.
+                    try
+                    {
+                        SetStopLoss(ENTRY_SIGNAL, CalculationMode.Ticks,
+                            (int)Math.Round(StopLossPoints / TickSize), false);
+                        DiagLog(string.Format("[PATCH6] Stop reset via Ticks={0} @ fill={1:F2} → stop={2:F2} (above)",
+                            (int)Math.Round(StopLossPoints / TickSize),
+                            entryFillPrice, currentStopPrice));
+                    }
+                    catch (Exception ex)
+                    {
+                        DiagLog("[PATCH6] SetStopLoss reset error: " + ex.Message);
+                    }
+
                     DiagLog(string.Format("Entry complete. Fill={0:F2} qty={1}. InitialStop={2:F2} (above). Trail={3}.",
                         entryFillPrice, entryFillQty, currentStopPrice,
                         EnableTrailingStop ? "ENABLED" : "disabled"));
