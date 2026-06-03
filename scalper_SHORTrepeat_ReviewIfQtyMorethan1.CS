@@ -108,8 +108,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         private List<string> compiledPatterns = null;
 
         // trailing stop state
-        private double currentStopPrice   = 0.0;   // [PATCH 4] tracks current stop level
-
         // shutdown control
         private bool   pendingFlatten = false;
         private string pendingReason  = string.Empty;
@@ -121,11 +119,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (State == State.SetDefaults)
             {
                 Description  = "Simple fast one-at-a-time SHORT scalper — MANAGED mode. "
-                             + "NT attaches OCO bracket (SetStopLoss + SetProfitTarget) on fill. "
-                             + "SHORT: stop ABOVE entry, target BELOW entry. "
-                             + "If bracket resize is rejected by exchange on a partial fill, "
-                             + "NT RealtimeErrorHandling=StopCancelClose flattens the position. "
-                             + "Forced flat beats an unprotected short position.";
+                             + "NT attaches OCO bracket on fill. SHORT: stop ABOVE entry, target BELOW. "
+                             + "When EnableTrailingStop=true uses SetTrailStop (NT native) — "
+                             + "avoids OCO ID reuse errors caused by SetStopLoss(Price) caching. "
+                             + "RealtimeErrorHandling=StopCancelClose flattens on any bracket error.";
                 Name         = "scalper_SHORTrepeat_ReviewIfQtyMorethan1";
 
                 Calculate                    = Calculate.OnEachTick;
@@ -168,8 +165,20 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Configure)
             {
-                SetStopLoss   (ENTRY_SIGNAL, CalculationMode.Ticks,
-                    (int)Math.Round(StopLossPoints    / TickSize), false);
+                // [PATCH 4 revised] Use SetTrailStop when trail enabled — avoids
+                // OCO ID reuse caused by SetStopLoss(Price) caching stale absolute
+                // prices across trades. SetTrailStop(Ticks) never caches a price.
+                // SHORT: trail ratchets DOWN as price falls.
+                if (EnableTrailingStop)
+                {
+                    SetTrailStop  (ENTRY_SIGNAL, CalculationMode.Ticks,
+                        (int)Math.Round(TrailDistancePoints / TickSize), false);
+                }
+                else
+                {
+                    SetStopLoss   (ENTRY_SIGNAL, CalculationMode.Ticks,
+                        (int)Math.Round(StopLossPoints / TickSize), false);
+                }
                 SetProfitTarget(ENTRY_SIGNAL, CalculationMode.Ticks,
                     (int)Math.Round(ProfitTargetPoints / TickSize));
             }
@@ -253,14 +262,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (!WithinTradingHours())
                 return;
-
-            // [PATCH 4] Trailing stop update — runs on same CheckIntervalSeconds timer
-            // SHORT: stop ratchets DOWN as price falls.
-            if (EnableTrailingStop && awaitingClose
-                && Position.MarketPosition == MarketPosition.Short)
-            {
-                DoTrailingStop();
-            }
 
             if (!ReadyForNewEntry())
                 return;
@@ -429,46 +430,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // DoTrailingStop
-        // [PATCH 4] Called every CheckIntervalSeconds while in a short position.
-        // SHORT: stop ratchets DOWN as price falls — never moves UP.
-        // proposedStop = ask + TrailDistancePoints
-        // Move stop only when proposedStop < currentStopPrice (stop moves down = tighter).
-        // =====================================================================
-        private void DoTrailingStop()
-        {
-            try
-            {
-                double currentPrice = GetCurrentAsk();
-                if (currentPrice <= 0) return;
-                if (currentStopPrice <= 0) return;
-
-                double proposedStop = currentPrice + TrailDistancePoints;
-                proposedStop = Instrument.MasterInstrument.RoundToTickSize(proposedStop);
-
-                // SHORT: stop only moves DOWN (lower stop = tighter = closer to current price)
-                if (proposedStop < currentStopPrice)
-                {
-                    DiagLog(string.Format("[TRAIL] Stop DOWN: {0:F2} -> {1:F2} (ask={2:F2}, dist={3}pt)",
-                        currentStopPrice, proposedStop, currentPrice, TrailDistancePoints));
-                    try
-                    {
-                        SetStopLoss(ENTRY_SIGNAL, CalculationMode.Price, proposedStop, false);
-                        currentStopPrice = proposedStop;
-                    }
-                    catch (Exception ex)
-                    {
-                        DiagLog("[TRAIL] SetStopLoss error: " + ex.Message);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                DiagLog("[TRAIL] DoTrailingStop error: " + ex.Message);
-            }
-        }
-
-        // =====================================================================
         // ReadyForNewEntry — PATCH 1 broker-side scan
         // =====================================================================
         private bool ReadyForNewEntry()
@@ -538,33 +499,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     entryInFlight     = false;
                     workingEntryOrder = null;  // [PATCH 3] fully filled, no longer needs cancel
-
-                    // [PATCH 4] Record initial stop price for trail tracking
-                    // SHORT: stop is ABOVE fill price
-                    currentStopPrice  = entryFillPrice + StopLossPoints;
-                    currentStopPrice  = Instrument.MasterInstrument.RoundToTickSize(currentStopPrice);
-
-                    // [PATCH 6] Force-reset stop using Ticks on every entry fill.
-                    // Prevents NT reusing the stale trailed stop price from the
-                    // previous trade's bracket (OCO ID reuse bug). Ticks mode
-                    // makes NT always recalculate from fill price rather than
-                    // using any cached absolute Price from the previous trail.
-                    try
-                    {
-                        SetStopLoss(ENTRY_SIGNAL, CalculationMode.Ticks,
-                            (int)Math.Round(StopLossPoints / TickSize), false);
-                        DiagLog(string.Format("[PATCH6] Stop reset via Ticks={0} @ fill={1:F2} → stop={2:F2} (above)",
-                            (int)Math.Round(StopLossPoints / TickSize),
-                            entryFillPrice, currentStopPrice));
-                    }
-                    catch (Exception ex)
-                    {
-                        DiagLog("[PATCH6] SetStopLoss reset error: " + ex.Message);
-                    }
-
-                    DiagLog(string.Format("Entry complete. Fill={0:F2} qty={1}. InitialStop={2:F2} (above). Trail={3}.",
-                        entryFillPrice, entryFillQty, currentStopPrice,
-                        EnableTrailingStop ? "ENABLED" : "disabled"));
+                    DiagLog(string.Format("Entry complete. Fill={0:F2} qty={1}. Trail={2}.",
+                        entryFillPrice, entryFillQty,
+                        EnableTrailingStop ? "ENABLED (NT SetTrailStop SHORT)" : "disabled (fixed stop)"));
                 }
                 else
                 {
@@ -607,8 +544,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     workingEntryOrder = null;
                     entryFillPrice    = 0.0;
                     entryFillQty      = 0;
-                    currentStopPrice  = 0.0;   // [PATCH 4] reset trail tracking
-
                     // [PATCH 5] Re-check pattern after real trade closes
                     // [PATCH 5] Re-check pattern after real trade closes (always)
                     {
@@ -898,8 +833,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Range(1, 3600)]
         [Display(Name = "D: Check interval (seconds)", Order = 7, GroupName = "Timing",
-            Description = "Seconds between entry checks. Also used as the trailing stop "
-                        + "update interval when EnableTrailingStop=true.")]
+            Description = "Seconds between entry checks.")]
         public int CheckIntervalSeconds { get; set; }
 
         [NinjaScriptProperty]
@@ -944,16 +878,19 @@ namespace NinjaTrader.NinjaScript.Strategies
         // [PATCH 4] Trailing stop
         [NinjaScriptProperty]
         [Display(Name = "Enable Trailing Stop", Order = 12, GroupName = "Bracket",
-            Description = "[PATCH 4] When true: SHORT stop ratchets DOWN as price falls, "
-                        + "checked every CheckIntervalSeconds. "
-                        + "When false: fixed stop only (original behavior). Default true.")]
+            Description = "When true: NT native SetTrailStop — SHORT stop ratchets DOWN as price falls, "
+                        + "visible as moving stop line on chart. When false: fixed stop only. "
+                        + "WARNING: set TrailDistancePoints wide enough to absorb market noise — "
+                        + "too tight risks immediate stop-out on entry. "
+                        + "Recommended: ETH 8-10pt, RTH 15-20pt, News 25-30pt.")]
         public bool EnableTrailingStop { get; set; }
 
         [NinjaScriptProperty]
         [Range(0.01, double.MaxValue)]
         [Display(Name = "Trail distance (points)", Order = 13, GroupName = "Bracket",
-            Description = "[PATCH 4] Distance in points between current ask and trailing stop. "
-                        + "Default mirrors StopLossPoints. Can be set tighter than StopLossPoints. "
+            Description = "Distance in points for NT native trailing stop (SHORT: ratchets down). "
+                        + "WARNING: too tight = immediate stop-out on entry noise. "
+                        + "Recommended minimums: ETH 8-10pt | RTH 15-20pt | News 25-30pt. "
                         + "Only used when EnableTrailingStop=true.")]
         public double TrailDistancePoints { get; set; }
 
