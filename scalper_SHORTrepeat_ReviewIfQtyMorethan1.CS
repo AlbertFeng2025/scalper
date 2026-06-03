@@ -270,7 +270,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // =====================================================================
         // PlaceEntry
-        // [PATCH 5] Branches to fake or real based on EnableFakeMode + isArmed.
+        // [PATCH 5] Branches to fake or real based on EnableRealOrder + isArmed.
         // =====================================================================
         private void PlaceEntry()
         {
@@ -555,7 +555,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // ---- bracket exit fill ----
-            bool isStopFill   = oName.IndexOf("Stop",   StringComparison.OrdinalIgnoreCase) >= 0;
+            // StopCancelClose: NT forced exit when bracket was rejected by exchange.
+            // Position already protected/flat — we just log the outcome as a loss.
+            bool isStopFill   = oName.IndexOf("Stop",            StringComparison.OrdinalIgnoreCase) >= 0
+                             || oName.IndexOf("StopCancelClose", StringComparison.OrdinalIgnoreCase) >= 0;
             bool isTargetFill = oName.IndexOf("Profit", StringComparison.OrdinalIgnoreCase) >= 0
                              || oName.IndexOf("Target", StringComparison.OrdinalIgnoreCase) >= 0;
 
