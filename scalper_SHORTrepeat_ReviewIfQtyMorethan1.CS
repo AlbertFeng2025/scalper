@@ -317,7 +317,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 else
                 {
-                    double limitPx = GetCurrentAsk() + LimitOffsetPoints;
+                    double limitPx = GetCurrentAsk() - LimitOffsetPoints;
                     limitPx = Instrument.MasterInstrument.RoundToTickSize(limitPx);
                     workingEntryOrder = EnterShortLimit(0, true, qty, limitPx, ENTRY_SIGNAL);
                     DiagLog(string.Format("REAL SHORT ENTRY #{0} LIMIT qty={1} limit={2:F2}",
