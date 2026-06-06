@@ -185,25 +185,8 @@ def _format_report(raw, f1, f2, f1_str, f2_str, raw_st, f1_st, f2_st) -> str:
 # ── Run directly ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
 
-    # Example 1 — from our discussion
-    print(run(
-        market_string = "010011000001110",
-        f1 = "01",
-        f2 = "01",
-    )["report"])
-
-    print()
-
-    # Example 2 — longer string
-    print(run(
-        market_string = "011011011101110101110110",
-        f1 = "01",
-        f2 = "01",
-    )["report"])
-
-    print()
-
-    # Example 3 — big string from earlier session
+  
+    # Example  — big string from earlier session
     print(run(
         market_string = "1111000100100001111000100110011000000010110010010100001010000000001001100000110011100111110000011110010010010110000001001100000010111000011000110000101000000110111100100010110110111100011100000000010000010010011100011010000100010110111001101001111111001000100101010000",
         f1 = "01",
