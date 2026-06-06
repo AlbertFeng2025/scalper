@@ -4,7 +4,7 @@ pattern_analyzer.py
 Analyze a binary outcome string (1=win, 0=loss) to find:
   - Overall statistics
   - After a given pattern, what is the next outcome distribution?
-  - After next=WIN or next=LOSS, how many consecutive same digits follow?
+  - Consecutive win/loss streaks across all pattern occurrences (in order)
 
 Usage:
     from pattern_analyzer import analyze
@@ -16,25 +16,44 @@ Or run directly:
     python pattern_analyzer.py
 """
 
-from collections import Counter
 
+def _compute_streaks(next_digits: list[str]) -> dict:
+    """
+    Given an ordered list of next digits after each pattern match,
+    compute consecutive win and loss streaks.
 
-def _count_consecutive(seq: str, start: int) -> int:
+    e.g. ['1','1','0','1','0','0','1']
+    -> win_streaks  = [2, 1, 1]   max_consec_win  = 2
+    -> loss_streaks = [1, 2]      max_consec_loss = 2
     """
-    Count how many consecutive identical characters begin at seq[start].
-    e.g. seq="11100", start=0 → 3
-         seq="11100", start=3 → 2
-    Returns 0 if start is out of bounds.
-    """
-    if start >= len(seq):
-        return 0
-    ch = seq[start]
-    count = 0
-    i = start
-    while i < len(seq) and seq[i] == ch:
-        count += 1
-        i += 1
-    return count
+    win_streaks  = []
+    loss_streaks = []
+
+    cur_win  = 0
+    cur_loss = 0
+
+    for d in next_digits:
+        if d == '1':
+            cur_win += 1
+            if cur_loss > 0:
+                loss_streaks.append(cur_loss)
+                cur_loss = 0
+        else:
+            cur_loss += 1
+            if cur_win > 0:
+                win_streaks.append(cur_win)
+                cur_win = 0
+
+    # flush whatever streak is still open at the end
+    if cur_win  > 0: win_streaks.append(cur_win)
+    if cur_loss > 0: loss_streaks.append(cur_loss)
+
+    return {
+        "win_streaks"     : win_streaks,
+        "max_consec_win"  : max(win_streaks)  if win_streaks  else 0,
+        "loss_streaks"    : loss_streaks,
+        "max_consec_loss" : max(loss_streaks) if loss_streaks else 0,
+    }
 
 
 def analyze(sequence: str, patterns: list[str]) -> dict:
@@ -45,35 +64,30 @@ def analyze(sequence: str, patterns: list[str]) -> dict:
     ----------
     sequence : str
         Binary string of '0' and '1' characters.
-        e.g. "1101011010"
     patterns : list[str]
         List of binary pattern strings to search for.
-        e.g. ["01", "011"]
 
     Returns
     -------
     dict with keys:
-        sequence_length         : int
-        overall_wins            : int
-        overall_losses          : int
-        overall_win_pct         : float  (0-100)
-        overall_loss_pct        : float  (0-100)
-        patterns                : dict keyed by pattern string, each containing:
-            occurrences             : int
-            next_win_count          : int
-            next_loss_count         : int
-            next_win_pct            : float | None
-            next_loss_pct           : float | None
-            positions               : list[int]
-            consec_after_win        : dict  {run_length: count}  (distribution of
-                                            consecutive wins when next digit = 1)
-            consec_after_win_avg    : float | None
-            consec_after_loss       : dict  {run_length: count}  (distribution of
-                                            consecutive losses when next digit = 0)
-            consec_after_loss_avg   : float | None
+        sequence_length     : int
+        overall_wins        : int
+        overall_losses      : int
+        overall_win_pct     : float
+        overall_loss_pct    : float
+        patterns            : dict keyed by pattern string, each containing:
+            occurrences         : int
+            next_win_count      : int
+            next_loss_count     : int
+            next_win_pct        : float | None
+            next_loss_pct       : float | None
+            positions           : list[int]
+            win_streaks         : list[int]   e.g. [2, 1, 1]
+            max_consec_win      : int
+            loss_streaks        : list[int]   e.g. [1, 2]
+            max_consec_loss     : int
     """
 
-    # ---- Validate input ----
     seq = sequence.strip()
     if not seq:
         return {"error": "Empty sequence"}
@@ -83,7 +97,7 @@ def analyze(sequence: str, patterns: list[str]) -> dict:
     if not patterns:
         return {"error": "No patterns provided"}
 
-    n = len(seq)
+    n      = len(seq)
     wins   = seq.count('1')
     losses = seq.count('0')
 
@@ -107,55 +121,38 @@ def analyze(sequence: str, patterns: list[str]) -> dict:
         next_win    = 0
         next_loss   = 0
         positions   = []
+        next_digits = []   # ordered list of next digits for streak tracking
 
-        consec_win_runs  = []   # run lengths collected when next digit = 1
-        consec_loss_runs = []   # run lengths collected when next digit = 0
-
-        # Slide through sequence looking for pattern matches
         for i in range(n - plen + 1):
             if seq[i:i + plen] == pat:
                 occurrences += 1
                 positions.append(i)
-
                 next_idx = i + plen
                 if next_idx < n:
-                    run_len = _count_consecutive(seq, next_idx)
-                    if seq[next_idx] == '1':
+                    d = seq[next_idx]
+                    next_digits.append(d)
+                    if d == '1':
                         next_win += 1
-                        consec_win_runs.append(run_len)
                     else:
                         next_loss += 1
-                        consec_loss_runs.append(run_len)
 
         followable = next_win + next_loss
-
-        # Build distributions (sorted by run length for readability)
-        def _distribution(runs: list) -> dict:
-            return dict(sorted(Counter(runs).items()))
-
-        def _average(runs: list) -> float | None:
-            return round(sum(runs) / len(runs), 2) if runs else None
+        streaks    = _compute_streaks(next_digits)
 
         result["patterns"][pat] = {
-            "occurrences"          : occurrences,
-            "next_win_count"       : next_win,
-            "next_loss_count"      : next_loss,
-            "next_win_pct"         : round(next_win  / followable * 100, 2) if followable > 0 else None,
-            "next_loss_pct"        : round(next_loss / followable * 100, 2) if followable > 0 else None,
-            "positions"            : positions,
-            "consec_after_win"     : _distribution(consec_win_runs),
-            "consec_after_win_avg" : _average(consec_win_runs),
-            "consec_after_loss"    : _distribution(consec_loss_runs),
-            "consec_after_loss_avg": _average(consec_loss_runs),
+            "occurrences"    : occurrences,
+            "next_win_count" : next_win,
+            "next_loss_count": next_loss,
+            "next_win_pct"   : round(next_win  / followable * 100, 2) if followable > 0 else None,
+            "next_loss_pct"  : round(next_loss / followable * 100, 2) if followable > 0 else None,
+            "positions"      : positions,
+            **streaks,
         }
 
     return result
 
 
 def format_report(result: dict) -> str:
-    """
-    Format the analyze() result as a human-readable report string.
-    """
     if "error" in result:
         return f"ERROR: {result['error']}"
 
@@ -173,32 +170,15 @@ def format_report(result: dict) -> str:
         if "error" in stats:
             lines.append(f"    ERROR: {stats['error']}")
         else:
-            lines.append(f"    Occurrences         : {stats['occurrences']}")
-
+            lines.append(f"    Occurrences      : {stats['occurrences']}")
             if stats["next_win_pct"] is not None:
-                lines.append(f"    Next = WIN  (1)     : {stats['next_win_count']}  ({stats['next_win_pct']}%)")
-                # Consecutive wins distribution
-                if stats["consec_after_win"]:
-                    lines.append(f"      Consec WIN runs (avg {stats['consec_after_win_avg']}):")
-                    for run_len, count in stats["consec_after_win"].items():
-                        bar = "█" * count
-                        lines.append(f"        {run_len:>2} consecutive : {count:>3}x  {bar}")
-                else:
-                    lines.append(f"      Consec WIN runs : N/A")
-
-                lines.append(f"    Next = LOSS (0)     : {stats['next_loss_count']}  ({stats['next_loss_pct']}%)")
-                # Consecutive losses distribution
-                if stats["consec_after_loss"]:
-                    lines.append(f"      Consec LOSS runs (avg {stats['consec_after_loss_avg']}):")
-                    for run_len, count in stats["consec_after_loss"].items():
-                        bar = "█" * count
-                        lines.append(f"        {run_len:>2} consecutive : {count:>3}x  {bar}")
-                else:
-                    lines.append(f"      Consec LOSS runs : N/A")
+                lines.append(f"    Next = WIN  (1)  : {stats['next_win_count']}  ({stats['next_win_pct']}%)")
+                lines.append(f"    Next = LOSS (0)  : {stats['next_loss_count']}  ({stats['next_loss_pct']}%)")
+                lines.append(f"    Win  streaks     : {stats['win_streaks']}  → max = {stats['max_consec_win']}")
+                lines.append(f"    Loss streaks     : {stats['loss_streaks']}  → max = {stats['max_consec_loss']}")
             else:
-                lines.append(f"    Next digit          : N/A (pattern only appears at end of sequence)")
-
-            lines.append(f"    Positions           : {stats['positions']}")
+                lines.append(f"    Next digit       : N/A (pattern only appears at end of sequence)")
+            lines.append(f"    Positions        : {stats['positions']}")
         lines.append("")
 
     lines.append("=" * 60)
@@ -206,30 +186,17 @@ def format_report(result: dict) -> str:
 
 
 def analyze_and_print(sequence: str, patterns: list[str]) -> dict:
-    """Convenience: analyze + print report, return raw result."""
     result = analyze(sequence, patterns)
     print(format_report(result))
     return result
 
 
-# ---- Demo / self-test when run directly ----
 if __name__ == "__main__":
 
-    # Example 1 — basic usage
-    seq1 = "1101011010011101"
-    print(f"Sequence: {seq1}\n")
-    analyze_and_print(seq1, ["01", "011", "0", "1"])
-
-    print()
-
-    # Example 2 — longer sequence
-    seq2 = "11010110100111011101101011010011"
-    print(f"Sequence: {seq2}\n")
-    analyze_and_print(seq2, ["01", "011", "0111"])
-
-    print()
-
-    # Example 3 — edge cases
-    seq3 = "0000011111"
-    print(f"Sequence: {seq3}\n")
-    analyze_and_print(seq3, ["00", "11", "0011"])
+    # Verify the example from the conversation:
+    # next digits: 1,1,0,1,0,0,1 → win streaks (2,1,1) max=2 | loss streaks (1,2) max=2
+     
+    # The big sequence from earlier
+    seq3 = "1111000100100001111000100110011000000010110010010100001010000000001001100000110011100111110000011110010010010110000001001100000010111000011000110000101000000110111100100010110110111100011100000000010000010010011100011010000100010110111001101001111111001000100101010000"
+    print(f"Sequence: {seq3[:40]}...")
+    analyze_and_print(seq3, ["000111", "01","011","0111"])
