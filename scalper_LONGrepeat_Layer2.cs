@@ -12,78 +12,73 @@ using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.Strategies;
 #endregion
 
-// scalper_LONGrepeat_Layer2
+// scalper_LONGrepeat_Layer2  v2
 //
-// Based on scalper_LONGrepeat_ReviewIfQtyMorethan1 (Patch 7)
+// PIPELINE (matches Python trade_filter.py exactly):
 //
-// LAYER 2 UPGRADE
-// ---------------
-// Pipeline:
-//   Layer 0 (raw outcomeHistory)
-//       ↓  Filter1Pattern match on Layer 0 tail
-//   Layer 1 (filter1History)
-//       ↓  Filter2Pattern match on Layer 1 tail
-//   REAL trade fires
+//   Every slice (fake or real) closes:
+//     1. append bit to rawString
+//     2. rawString tail matches Filter1Pattern?
+//            YES → append bit to filter1Outcome
+//     3. filter1Outcome tail matches Filter2Pattern?
+//            YES → isArmed = true
+//            NO  → isArmed = false
+//     4. isArmed AND rawString tail matches Filter1Pattern?
+//            YES → NEXT slice = money trade
+//            NO  → NEXT slice = fake trade
 //
-// LIMITS UPGRADE
-// --------------
-// Two separate limits with clear labels:
+// TARGET = 1 = price UP (LONG)
+//   fake/real slice hits profit target (price UP)  → record 1
+//   fake/real slice hits stop loss    (price DOWN) → record 0
 //
-//   "Max Fake + Real Trade Count" (default 100)
-//       Counts ALL trades (fake + real combined).
-//       Controls session activity / length.
-//       Uses: ordersPlaced counter.
+// VARIABLE NAMES:
+//   rawString      = all slice outcomes (fake + real combined)
+//   filter1Outcome = digits collected after each Filter1Pattern match in rawString
+//   filter2Outcome = digits collected after each Filter2Pattern match in filter1Outcome
+//                    (not stored — used only to decide real trade in Python offline)
 //
-//   "Max Real Loss In A Row" (default 3)
-//       Counts REAL trade losses only, back to back.
-//       Controls real money drawdown risk.
-//       Uses: realLossesInARow counter, resets to 0 on any real WIN.
+// SAFETY at every slice end:
+//   cancel any pending order + close any open position before next slice
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
     public class scalper_LONGrepeat_Layer2 : Strategy
     {
-        // ---- strategy lifecycle ----
+        // ── strategy lifecycle ────────────────────────────────────────────────
         private DateTime strategyStartUtc;
         private bool     lifeStarted  = false;
         private bool     disabledSelf = false;
 
         private DateTime lastCheckTime = DateTime.MinValue;
-        private int      ordersPlaced  = 0;      // fake + real combined
+        private int      sliceCount    = 0;   // all slices (fake + real)
 
-        // Layer 0 — raw market outcome string (every fake + real trade)
-        private StringBuilder outcomeHistory = new StringBuilder();
+        // ── pipeline strings ─────────────────────────────────────────────────
+        private StringBuilder rawString      = new StringBuilder(); // Layer 0
+        private StringBuilder filter1Outcome = new StringBuilder(); // Layer 1
 
-        // Layer 1 — filtered outcome string (appended when Filter1Pattern matches Layer 0 tail)
-        private StringBuilder filter1History = new StringBuilder();
+        // ── pipeline state ───────────────────────────────────────────────────
+        private bool isArmed             = false;  // filter2Outcome tail matched Filter2Pattern
+        private bool waitingForF1Outcome = false;  // F1 matched → next bit feeds filter1Outcome
+        private bool nextIsMoney         = false;  // set end of UpdatePipeline: next slice = money trade
 
-        // sequencing flags
-        private bool entryInFlight = false;
-        private bool awaitingClose = false;
+        // ── slice state ──────────────────────────────────────────────────────
+        private bool   inSlice        = false;
+        private bool   isMoneySlice   = false;
+        private double sliceEntryPrice = 0.0;
+        private double sliceStopPrice  = 0.0;
+        private double sliceTargetPrice= 0.0;
 
-        // [PATCH 3] Store entry order reference for cancel-on-shutdown
-        private Order workingEntryOrder = null;
+        // ── real order state ─────────────────────────────────────────────────
+        private bool   entryInFlight      = false;
+        private bool   awaitingClose      = false;
+        private Order  workingEntryOrder  = null;
+        private double entryFillPrice     = 0.0;
+        private int    entryFillQty       = 0;
 
-        // captured at entry fill for PnL calculation
-        private double entryFillPrice = 0.0;
-        private int    entryFillQty   = 0;
-
-        // ---- Fake order mode state ----
-        private bool   inFakeTrade      = false;
-        private double fakeEntryPrice   = 0.0;
-        private double fakeStopPrice    = 0.0;
-        private double fakeTargetPrice  = 0.0;
-        private bool   waitingForL1     = false;  // F1 matched L0 → next raw digit → L1
-        private bool   waitingForTrade   = false;  // F2 matched L1 → next L1 digit → REAL TRADE
-        private bool   waitingForExpected = false;  // FIRE just happened → next fake trade = expected outcome
-        private bool   enableRealOrder  = true;
-        private List<string> compiledFilter1 = null;
-        private List<string> compiledFilter2 = null;
-
-        // ---- Real loss streak (real trades only) ----
+        // ── real loss streak ─────────────────────────────────────────────────
         private int realLossesInARow = 0;
 
-        // shutdown control
+        // ── shutdown ─────────────────────────────────────────────────────────
         private bool   pendingFlatten = false;
         private string pendingReason  = string.Empty;
 
@@ -93,12 +88,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Description  = "LONG scalper with two-layer pattern filter. "
-                             + "Pipeline: Layer0 (raw) → Filter1Pattern → Layer1 → Filter2Pattern → REAL trade. "
-                             + "Uses NT native SetTrailStop to avoid OCO ID reuse errors. "
-                             + "Max Fake + Real Trade Count controls session length (all trades). "
-                             + "Max Real Loss In A Row controls real money drawdown (real trades only).";
-                Name         = "scalper_LONGrepeat_Layer2";
+                Description = "LONG scalper v2. Pipeline matches Python trade_filter.py. "
+                            + "rawString=all slices, filter1Outcome=after F1 match, "
+                            + "isArmed=F2 tail match, next F1 match=money trade. "
+                            + "Target=1=price UP.";
+                Name        = "scalper_LONGrepeat_Layer2";
 
                 Calculate                    = Calculate.OnEachTick;
                 EntriesPerDirection          = 1;
@@ -117,40 +111,37 @@ namespace NinjaTrader.NinjaScript.Strategies
                 BarsRequiredToTrade          = 0;
                 IsUnmanaged                  = false;
 
-                // ---- defaults ----
-                EnableTradingHours      = false;
-                TradingStartHour        = 9;
-                TradingStartMinute      = 30;
-                TradingEndHour          = 16;
-                TradingEndMinute        = 0;
-                StrategyLifeMinutes     = 3;
-                CheckIntervalSeconds    = 1;
-                UseMarketEntry          = true;
-                LimitOffsetPoints       = 5;
-                StopLossPoints          = 10;
-                ProfitTargetPoints      = 10;
-                EnableTrailingStop      = true;
-                TrailDistancePoints     = 10;
-                EnableRealOrder         = false;
-                Filter1Pattern          = "01";
-                Filter2Pattern          = "01";
-                BaseQuantity            = 1;
-                MaxTotalTradeCount      = 100;   // fake + real combined
-                MaxRealLossInARow       = 3;     // real trades only
-                LogFilePath             = @"C:\temp\scalper_LONGrepeat_Layer2_log.csv";
+                // ── defaults ──────────────────────────────────────────────────
+                EnableTradingHours   = false;
+                TradingStartHour     = 9;
+                TradingStartMinute   = 30;
+                TradingEndHour       = 16;
+                TradingEndMinute     = 0;
+                StrategyLifeMinutes  = 3;
+                CheckIntervalSeconds = 1;
+                UseMarketEntry       = true;
+                LimitOffsetPoints    = 5;
+                StopLossPoints       = 10;
+                ProfitTargetPoints   = 10;
+                EnableTrailingStop   = false;
+                TrailDistancePoints  = 10;
+                EnableRealOrder      = false;
+                Filter1Pattern       = "01";
+                Filter2Pattern       = "11";
+                BaseQuantity         = 1;
+                MaxTotalSliceCount   = 100;
+                MaxRealLossInARow    = 3;
+                LogFilePath          = @"C:\temp\scalper_LONGrepeat_Layer2_log.csv";
             }
             else if (State == State.Configure)
             {
                 if (EnableTrailingStop)
-                {
                     SetTrailStop  (ENTRY_SIGNAL, CalculationMode.Ticks,
                         (int)Math.Round(TrailDistancePoints / TickSize), false);
-                }
                 else
-                {
                     SetStopLoss   (ENTRY_SIGNAL, CalculationMode.Ticks,
                         (int)Math.Round(StopLossPoints / TickSize), false);
-                }
+
                 SetProfitTarget(ENTRY_SIGNAL, CalculationMode.Ticks,
                     (int)Math.Round(ProfitTargetPoints / TickSize));
             }
@@ -158,18 +149,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (!lifeStarted)
                 {
-                    strategyStartUtc  = DateTime.UtcNow;
-                    lifeStarted       = true;
-                    compiledFilter1   = ParsePatternList(Filter1Pattern);
-                    compiledFilter2   = ParsePatternList(Filter2Pattern);
-                    waitingForL1      = false;
-                    waitingForTrade   = false;
-                    waitingForExpected = false;
-                    realLossesInARow  = 0;
-                    enableRealOrder   = EnableRealOrder;
+                    strategyStartUtc = DateTime.UtcNow;
+                    lifeStarted      = true;
+                    isArmed             = false;
+                    waitingForF1Outcome = false;
+                    nextIsMoney         = false;
+                    realLossesInARow    = 0;
                     EnsureLogHeader();
-                    DiagLog(Name + " enabled. Life=" + StrategyLifeMinutes
-                        + "min, MaxTotalTradeCount=" + MaxTotalTradeCount
+                    DiagLog(Name + " enabled (LONG). Life=" + StrategyLifeMinutes
+                        + "min, MaxTotalSliceCount=" + MaxTotalSliceCount
                         + ", MaxRealLossInARow=" + MaxRealLossInARow
                         + ", Qty=" + BaseQuantity
                         + ", Stop=" + StopLossPoints + "pt"
@@ -178,8 +166,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + (EnableTrailingStop ? ", TrailDist=" + TrailDistancePoints + "pt" : "")
                         + ", EnableRealOrder=" + EnableRealOrder
                         + ", Filter1=[" + Filter1Pattern + "]"
-                        + ", Filter2=[" + Filter2Pattern + "]"
-                        + (EnableRealOrder ? "" : " (observation only)"));
+                        + ", Filter2=[" + Filter2Pattern + "]");
                 }
             }
         }
@@ -195,37 +182,37 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // Fake trade tick-by-tick resolution
-            if (inFakeTrade)
+            // ── monitor current slice tick by tick ────────────────────────────
+            if (inSlice && !isMoneySlice)
             {
-                CheckFakeTrade();
+                CheckFakeSlice();
                 return;
             }
 
+            // ── if money slice in flight, wait for OnExecutionUpdate ──────────
+            if (inSlice && isMoneySlice)
+                return;
+
             DateTime nowUtc = DateTime.UtcNow;
 
-            // ── Session life limit ───────────────────────────────────────────
+            // ── strategy life limit ───────────────────────────────────────────
             if ((nowUtc - strategyStartUtc).TotalMinutes >= StrategyLifeMinutes)
             {
                 BeginShutdown("strategy life of " + StrategyLifeMinutes + " min reached");
                 return;
             }
 
-            // ── Max Fake + Real Trade Count (all trades) ─────────────────────
-            if (ordersPlaced >= MaxTotalTradeCount)
+            // ── max slice count ───────────────────────────────────────────────
+            if (sliceCount >= MaxTotalSliceCount)
             {
-                if (awaitingClose || Position.MarketPosition != MarketPosition.Flat)
-                    return;
-                BeginShutdown("Max Fake + Real Trade Count (" + MaxTotalTradeCount + ") reached");
+                BeginShutdown("MaxTotalSliceCount (" + MaxTotalSliceCount + ") reached");
                 return;
             }
 
-            // ── Max Real Loss In A Row (real trades only) ────────────────────
+            // ── max real loss in a row ────────────────────────────────────────
             if (realLossesInARow >= MaxRealLossInARow)
             {
-                if (awaitingClose || Position.MarketPosition != MarketPosition.Flat)
-                    return;
-                BeginShutdown("Max Real Loss In A Row (" + MaxRealLossInARow
+                BeginShutdown("MaxRealLossInARow (" + MaxRealLossInARow
                     + ") reached. realLossesInARow=" + realLossesInARow);
                 return;
             }
@@ -237,178 +224,92 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!WithinTradingHours())
                 return;
 
-            if (!ReadyForNewEntry())
+            if (!ReadyForNewSlice())
                 return;
 
-            PlaceEntry();
+            StartNextSlice();
         }
 
         // =====================================================================
-        // AppendOutcome — called after EVERY fake trade outcome
-        // Implements the two-flag state machine matching apply_filter logic:
-        //
-        //   waitingForL1   : F1 just matched L0 tail → next raw digit → L1
-        //   waitingForTrade: F2 just matched L1 tail → next L1 digit → REAL TRADE
-        //
-        // Flow per digit:
-        //   1. Append bit to L0 always.
-        //   2. If waitingForL1:
-        //        append bit to L1 always.
-        //        if waitingForTrade → fire REAL TRADE with this bit.
-        //        check F2 on L1 tail → set waitingForTrade.
-        //        clear waitingForL1.
-        //   3. Else check F1 on L0 tail → set waitingForL1.
+        // StartNextSlice — decides if next slice is fake or money
+        // Based on: isArmed AND rawString tail matches Filter1Pattern
         // =====================================================================
-        private void AppendOutcome(int bit)
+        private void StartNextSlice()
         {
-            // ── Layer 0 ──────────────────────────────────────────────────────
-            outcomeHistory.Append(bit.ToString());
-            string l0 = outcomeHistory.ToString();
+            // Is this slice a money trade?
+            // YES if nextIsMoney flag was set at end of previous slice
+            // (= isArmed AND rawString tail matched F1 at end of last slice)
+            bool startMoney = nextIsMoney;
+            nextIsMoney = false;  // reset after reading
 
-            if (waitingForL1)
-            {
-                // This digit always goes to L1
-                waitingForL1 = false;
-                filter1History.Append(bit.ToString());
-                string l1 = filter1History.ToString();
-
-                if (waitingForTrade && EnableRealOrder)
-                {
-                    // ── REAL TRADE ────────────────────────────────────────────
-                    // This L1 digit is the real trade outcome signal
-                    // Fire the real entry now
-                    waitingForTrade   = false;
-                    waitingForExpected = true;  // next fake trade = expected outcome
-                    DiagLog(string.Format(
-                        "[FIRE] F2 armed. L1 digit='{0}' → placing REAL trade. L1={1}",
-                        bit, l1));
-                    PlaceRealEntry();
-                }
-                else if (waitingForTrade && !EnableRealOrder)
-                {
-                    waitingForTrade = false;
-                    DiagLog(string.Format(
-                        "[FIRE obs] F2 armed but EnableRealOrder=false. L1 digit='{0}' (observation only). L1={1}",
-                        bit, l1));
-                }
-                else
-                {
-                    DiagLog(string.Format(
-                        "[L1] L1 gets '{0}' → L1={1}", bit, l1));
-                }
-
-                // Check F2 on L1 tail
-                if (MatchesTail(l1, compiledFilter2))
-                {
-                    waitingForTrade = true;
-                    DiagLog(string.Format(
-                        "[ARMED] F2 '{0}' matched L1 tail '{1}' → next L1 digit = REAL TRADE",
-                        Filter2Pattern, l1.Length >= compiledFilter2[0].Length
-                            ? l1.Substring(l1.Length - compiledFilter2[0].Length) : l1));
-                }
-            }
-            else
-            {
-                // Check F1 on L0 tail
-                if (MatchesTail(l0, compiledFilter1))
-                {
-                    waitingForL1 = true;
-                    DiagLog(string.Format(
-                        "[F1] F1 '{0}' matched L0 tail → next raw digit → L1",
-                        Filter1Pattern));
-                }
-                else
-                {
-                    DiagLog(string.Format(
-                        "[F1] no match. L0 tail='{0}'",
-                        l0.Length >= 4 ? l0.Substring(l0.Length - 4) : l0));
-                }
-            }
-
-            DiagLog(string.Format(
-                "[STATE] L0({0})={1} | L1({2})={3} | wL1={4} | wTrade={5} | realLossRow={6}",
-                outcomeHistory.Length, TailOf(outcomeHistory, 8),
-                filter1History.Length, TailOf(filter1History, 8),
-                waitingForL1, waitingForTrade, realLossesInARow));
-        }
-
-        // =====================================================================
-        // PlaceRealEntry — fires a real LONG order immediately
-        // Called from AppendOutcome when F2 armed and next L1 digit arrives
-        // =====================================================================
-        private void PlaceRealEntry()
-        {
-            if (awaitingClose || entryInFlight) 
-            {
-                DiagLog("[FIRE] Cannot place real entry — already in trade. Signal skipped.");
-                return;
-            }
-            if (!ReadyForNewEntry())
-            {
-                DiagLog("[FIRE] Cannot place real entry — ReadyForNewEntry=false. Signal skipped.");
-                return;
-            }
-
-            int qty = BaseQuantity;
-            ordersPlaced++;
-            entryInFlight     = true;
-            awaitingClose     = true;
-            workingEntryOrder = null;
-
-            try
-            {
-                if (UseMarketEntry)
-                {
-                    workingEntryOrder = EnterLong(qty, ENTRY_SIGNAL);
-                    DiagLog(string.Format("REAL ENTRY #{0} MARKET qty={1}", ordersPlaced, qty));
-                }
-                else
-                {
-                    double limitPx = GetCurrentBid() - LimitOffsetPoints;
-                    limitPx = Instrument.MasterInstrument.RoundToTickSize(limitPx);
-                    workingEntryOrder = EnterLongLimit(0, true, qty, limitPx, ENTRY_SIGNAL);
-                    DiagLog(string.Format("REAL ENTRY #{0} LIMIT qty={1} limit={2:F2}",
-                        ordersPlaced, qty, limitPx));
-                }
-            }
-            catch (Exception ex)
-            {
-                DiagLog("PlaceRealEntry error: " + ex.Message);
-                ordersPlaced--;
-                entryInFlight     = false;
-                awaitingClose     = false;
-                workingEntryOrder = null;
-            }
-        }
-
-        // =====================================================================
-        // PlaceEntry — always FAKE
-        // Real trades fire from PlaceRealEntry() via AppendOutcome()
-        // =====================================================================
-        private void PlaceEntry()
-        {
-            // Always fake — real trade fires from state machine in AppendOutcome
-            ordersPlaced++;
+            sliceCount++;
             double refPrice = GetCurrentBid();
-            if (refPrice <= 0) { ordersPlaced--; return; }
+            if (refPrice <= 0) { sliceCount--; return; }
 
             if (!UseMarketEntry)
                 refPrice = Instrument.MasterInstrument.RoundToTickSize(refPrice - LimitOffsetPoints);
 
-            fakeEntryPrice  = refPrice;
-            fakeStopPrice   = Instrument.MasterInstrument.RoundToTickSize(fakeEntryPrice - StopLossPoints);
-            fakeTargetPrice = Instrument.MasterInstrument.RoundToTickSize(fakeEntryPrice + ProfitTargetPoints);
-            inFakeTrade     = true;
-            awaitingClose   = true;
+            sliceEntryPrice  = refPrice;
+            sliceStopPrice   = Instrument.MasterInstrument.RoundToTickSize(sliceEntryPrice - StopLossPoints);
+            sliceTargetPrice = Instrument.MasterInstrument.RoundToTickSize(sliceEntryPrice + ProfitTargetPoints);
+            inSlice          = true;
+            isMoneySlice     = startMoney && EnableRealOrder;
 
-            DiagLog(string.Format("FAKE ENTRY #{0} @ {1:F2} stop={2:F2} target={3:F2}",
-                ordersPlaced, fakeEntryPrice, fakeStopPrice, fakeTargetPrice));
+            if (isMoneySlice)
+            {
+                // Place real money order
+                awaitingClose     = true;
+                entryInFlight     = true;
+                workingEntryOrder = null;
+                try
+                {
+                    if (UseMarketEntry)
+                    {
+                        workingEntryOrder = EnterLong(BaseQuantity, ENTRY_SIGNAL);
+                        DiagLog(string.Format(
+                            "MONEY SLICE #{0} MARKET qty={1} entry~{2:F2} stop={3:F2} target={4:F2} | rawString={5} | filter1Outcome={6}",
+                            sliceCount, BaseQuantity, sliceEntryPrice, sliceStopPrice, sliceTargetPrice,
+                            TailOf(rawString, 8), TailOf(filter1Outcome, 8)));
+                    }
+                    else
+                    {
+                        double limitPx = Instrument.MasterInstrument.RoundToTickSize(
+                            GetCurrentBid() - LimitOffsetPoints);
+                        workingEntryOrder = EnterLongLimit(0, true, BaseQuantity, limitPx, ENTRY_SIGNAL);
+                        DiagLog(string.Format(
+                            "MONEY SLICE #{0} LIMIT qty={1} limit={2:F2} | rawString={3} | filter1Outcome={4}",
+                            sliceCount, BaseQuantity, limitPx,
+                            TailOf(rawString, 8), TailOf(filter1Outcome, 8)));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    DiagLog("StartNextSlice money error: " + ex.Message);
+                    sliceCount--;
+                    inSlice           = false;
+                    isMoneySlice      = false;
+                    awaitingClose     = false;
+                    entryInFlight     = false;
+                    workingEntryOrder = null;
+                }
+            }
+            else
+            {
+                DiagLog(string.Format(
+                    "FAKE SLICE #{0} entry={1:F2} stop={2:F2} target={3:F2} | isArmed={4} | rawTail={5} | filter1Outcome={6}",
+                    sliceCount, sliceEntryPrice, sliceStopPrice, sliceTargetPrice,
+                    isArmed, TailOf(rawString, Filter1Pattern.Length),
+                    TailOf(filter1Outcome, 8)));
+            }
         }
 
         // =====================================================================
-        // CheckFakeTrade — called every tick while inFakeTrade=true
+        // CheckFakeSlice — tick by tick resolution for fake slices
+        // TARGET = 1 = price UP (LONG)
+        //   stop hit   when bid <= sliceStopPrice   → bit = 0
+        //   target hit when ask >= sliceTargetPrice → bit = 1
         // =====================================================================
-        private void CheckFakeTrade()
+        private void CheckFakeSlice()
         {
             try
             {
@@ -416,126 +317,136 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double ask = GetCurrentAsk();
                 if (bid <= 0 || ask <= 0) return;
 
-                bool stopHit   = bid <= fakeStopPrice;
-                bool targetHit = ask >= fakeTargetPrice;
+                bool stopHit   = bid <= sliceStopPrice;
+                bool targetHit = ask >= sliceTargetPrice;
                 if (!stopHit && !targetHit) return;
 
                 int    bit       = stopHit ? 0 : 1;
-                double exitPrice = stopHit ? fakeStopPrice : fakeTargetPrice;
+                double exitPrice = stopHit ? sliceStopPrice : sliceTargetPrice;
                 double pnl       = stopHit
-                    ? -(StopLossPoints    * Instrument.MasterInstrument.PointValue)
+                    ? -(StopLossPoints     * Instrument.MasterInstrument.PointValue)
                     : +(ProfitTargetPoints * Instrument.MasterInstrument.PointValue);
 
-                inFakeTrade   = false;
-                awaitingClose = false;
+                inSlice      = false;
+                isMoneySlice = false;
 
-                DiagLog(string.Format("FAKE {0}: entry={1:F2} exit={2:F2} pnl={3:0.00}",
-                    stopHit ? "LOSS" : "WIN", fakeEntryPrice, exitPrice, pnl));
+                DiagLog(string.Format(
+                    "FAKE SLICE #{0} {1}: entry={2:F2} exit={3:F2} pnl={4:0.00} bit={5}",
+                    sliceCount, stopHit ? "LOSS" : "WIN",
+                    sliceEntryPrice, exitPrice, pnl, bit));
 
-                // Log expected real trade outcome (digit right after FIRE)
-                if (waitingForExpected)
-                {
-                    waitingForExpected = false;
+                // save entry price before reset
+                double logEntryPrice = sliceEntryPrice;
+
+                // reset slice prices
+                sliceEntryPrice  = 0.0;
+                sliceStopPrice   = 0.0;
+                sliceTargetPrice = 0.0;
+
+                // ── update pipeline FIRST ─────────────────────────────────────
+                UpdatePipeline(bit);
+
+                // ── log AFTER pipeline updated — shows final state ────────────
+                WriteLogRowFake(logEntryPrice, exitPrice, pnl, bit);
+            }
+            catch (Exception ex)
+            {
+                DiagLog("CheckFakeSlice error: " + ex.Message);
+                inSlice      = false;
+                isMoneySlice = false;
+            }
+        }
+
+        // =====================================================================
+        // UpdatePipeline — called after EVERY slice closes (fake or real)
+        //
+        // Matches Python apply_filter logic exactly:
+        //   Python: find F1 pattern at position i → collect digit at position i+len(F1)
+        //   = the digit AFTER the pattern, not the last digit OF the pattern
+        //
+        //   Therefore we use waitingForF1Outcome flag:
+        //     - current bit completes F1 pattern → set waitingForF1Outcome=true
+        //     - NEXT bit arrives → append THAT bit to filter1Outcome
+        //
+        //   1. append bit to rawString
+        //   2. was waitingForF1Outcome=true from previous call?
+        //        YES → this bit is digit AFTER F1 → append to filter1Outcome
+        //              check filter1Outcome tail matches Filter2?
+        //              YES → isArmed = true
+        //              NO  → isArmed = false
+        //              clear waitingForF1Outcome
+        //   3. does current rawString tail match Filter1?
+        //        YES → waitingForF1Outcome = true (next bit feeds filter1Outcome)
+        //        NO  → waitingForF1Outcome = false
+        // =====================================================================
+        private void UpdatePipeline(int bit)
+        {
+            // Step 1: append to rawString
+            rawString.Append(bit.ToString());
+            string raw = rawString.ToString();
+
+            // Step 2: was previous rawString tail matching F1?
+            // i.e. waitingForF1Outcome set from last call?
+            if (waitingForF1Outcome)
+            {
+                waitingForF1Outcome = false;
+
+                // this bit is the digit RIGHT AFTER F1 pattern → feeds filter1Outcome
+                filter1Outcome.Append(bit.ToString());
+                string f1str = filter1Outcome.ToString();
+
+                DiagLog(string.Format(
+                    "[F1 COLLECT] digit after F1='{0}' is '{1}' → filter1Outcome={2}",
+                    Filter1Pattern, bit, f1str));
+
+                // Step 3: filter1Outcome tail matches Filter2Pattern?
+                isArmed = f1str.Length >= Filter2Pattern.Length
+                       && f1str.EndsWith(Filter2Pattern);
+
+                if (isArmed)
                     DiagLog(string.Format(
-                        "[EXPECTED OUTCOME] Real trade expected: {0} (bit={1}) — compare with CLOSED STOP/TARGET above",
-                        bit == 1 ? "WIN" : "LOSE", bit));
-                }
-
-                WriteLogRowFake(exitPrice, pnl, bit);
-
-                fakeEntryPrice  = 0.0;
-                fakeStopPrice   = 0.0;
-                fakeTargetPrice = 0.0;
-
-                AppendOutcome(bit);
+                        "[F2 MATCH] filter1Outcome tail='{0}' matches Filter2='{1}' → isArmed=true",
+                        f1str.Length >= Filter2Pattern.Length
+                            ? f1str.Substring(f1str.Length - Filter2Pattern.Length) : f1str,
+                        Filter2Pattern));
+                else
+                    DiagLog(string.Format(
+                        "[F2 NO MATCH] filter1Outcome tail='{0}' → isArmed=false",
+                        f1str.Length >= Filter2Pattern.Length
+                            ? f1str.Substring(f1str.Length - Filter2Pattern.Length) : f1str));
             }
-            catch (Exception ex)
+
+            // Check if CURRENT rawString tail matches F1
+            // → next bit will feed filter1Outcome
+            bool f1Match = raw.Length >= Filter1Pattern.Length
+                        && raw.EndsWith(Filter1Pattern);
+
+            if (f1Match)
             {
-                DiagLog("[FAKE] CheckFakeTrade error: " + ex.Message);
-                inFakeTrade   = false;
-                awaitingClose = false;
+                waitingForF1Outcome = true;
+                DiagLog(string.Format(
+                    "[F1 MATCH] rawString tail='{0}' matches Filter1='{1}' → next bit feeds filter1Outcome",
+                    raw.Length >= Filter1Pattern.Length
+                        ? raw.Substring(raw.Length - Filter1Pattern.Length) : raw,
+                    Filter1Pattern));
             }
+
+            // Set nextIsMoney flag for StartNextSlice:
+            // isArmed AND current rawString tail matches F1
+            // → next slice that starts will be a money trade
+            nextIsMoney = isArmed
+                       && rawString.Length >= Filter1Pattern.Length
+                       && rawString.ToString().EndsWith(Filter1Pattern);
+
+            DiagLog(string.Format(
+                "[PIPELINE] rawString({0})={1} | filter1Outcome({2})={3} | waitingForF1Outcome={4} | isArmed={5} | nextIsMoney={6} | realLossRow={7}",
+                rawString.Length,      TailOf(rawString,      8),
+                filter1Outcome.Length, TailOf(filter1Outcome, 8),
+                waitingForF1Outcome, isArmed, nextIsMoney, realLossesInARow));
         }
 
         // =====================================================================
-        // Pattern helpers
-        // =====================================================================
-        private List<string> ParsePatternList(string raw)
-        {
-            var result = new List<string>();
-            if (string.IsNullOrWhiteSpace(raw)) return result;
-            foreach (var part in raw.Split(','))
-            {
-                string p = part.Trim();
-                if (p.Length == 0) continue;
-                bool ok = true;
-                foreach (char c in p)
-                    if (c != '0' && c != '1') { ok = false; break; }
-                if (ok && !result.Contains(p))
-                    result.Add(p);
-            }
-            return result;
-        }
-
-        private bool MatchesTail(string history, List<string> patterns)
-        {
-            if (patterns == null || patterns.Count == 0) return false;
-            foreach (var p in patterns)
-            {
-                if (history.Length < p.Length) continue;
-                if (history.Substring(history.Length - p.Length) == p) return true;
-            }
-            return false;
-        }
-
-        private string TailOf(StringBuilder sb, int n)
-        {
-            string s = sb.ToString();
-            return s.Length <= n ? s : "..." + s.Substring(s.Length - n);
-        }
-
-        // =====================================================================
-        // ReadyForNewEntry
-        // =====================================================================
-        private bool ReadyForNewEntry()
-        {
-            if (entryInFlight) return false;
-            if (awaitingClose) return false;
-            if (Position.MarketPosition != MarketPosition.Flat) return false;
-
-            try
-            {
-                if (Account != null)
-                {
-                    lock (Account.Orders)
-                    {
-                        foreach (var ord in Account.Orders)
-                        {
-                            if (ord.Instrument == Instrument
-                                && (ord.OrderState == OrderState.Working
-                                    || ord.OrderState == OrderState.Accepted
-                                    || ord.OrderState == OrderState.Submitted
-                                    || ord.OrderState == OrderState.PartFilled))
-                            {
-                                DiagLog(string.Format(
-                                    "ReadyForNewEntry: BLOCKED by broker-side order name='{0}' state={1}.",
-                                    ord.Name ?? "", ord.OrderState));
-                                return false;
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                DiagLog("ReadyForNewEntry: scan error: " + ex.Message + ". Blocking.");
-                return false;
-            }
-            return true;
-        }
-
-        // =====================================================================
-        // OnExecutionUpdate
+        // OnExecutionUpdate — handles real money slice fills
         // =====================================================================
         protected override void OnExecutionUpdate(Execution execution, string executionId,
             double price, int quantity, MarketPosition marketPosition,
@@ -547,7 +458,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool   isFull = execution.Order.OrderState == OrderState.Filled;
             bool   isPart = execution.Order.OrderState == OrderState.PartFilled;
 
-            // ---- entry fill ----
+            // ── entry fill ────────────────────────────────────────────────────
             if (oName == ENTRY_SIGNAL && (isFull || isPart))
             {
                 if (entryFillPrice == 0.0)
@@ -562,42 +473,35 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     entryInFlight     = false;
                     workingEntryOrder = null;
-                    DiagLog(string.Format("Entry complete. Fill={0:F2} qty={1}. Trail={2}.",
-                        entryFillPrice, entryFillQty,
-                        EnableTrailingStop ? "ENABLED (NT SetTrailStop)" : "disabled (fixed stop)"));
+                    DiagLog(string.Format("Entry complete. Fill={0:F2} qty={1}.",
+                        entryFillPrice, entryFillQty));
                 }
                 return;
             }
 
-            // ---- bracket exit fill ----
-            bool isStopFill   = oName.IndexOf("Stop",            StringComparison.OrdinalIgnoreCase) >= 0
+            // ── bracket exit fill ─────────────────────────────────────────────
+            bool isStopFill   = oName.IndexOf("Stop",   StringComparison.OrdinalIgnoreCase) >= 0
                              || oName.IndexOf("StopCancelClose", StringComparison.OrdinalIgnoreCase) >= 0;
             bool isTargetFill = oName.IndexOf("Profit", StringComparison.OrdinalIgnoreCase) >= 0
                              || oName.IndexOf("Target", StringComparison.OrdinalIgnoreCase) >= 0;
 
             if ((isStopFill || isTargetFill) && isFull)
             {
-                DiagLog(string.Format("{0} fill: qty={1} @ {2:F2} name={3}",
-                    isStopFill ? "STOP" : "TARGET", quantity, price, oName));
-
                 if (Position.MarketPosition == MarketPosition.Flat)
                 {
                     double pnl = isStopFill
-                        ? -(StopLossPoints    * entryFillQty * Instrument.MasterInstrument.PointValue)
+                        ? -(StopLossPoints     * entryFillQty * Instrument.MasterInstrument.PointValue)
                         : +(ProfitTargetPoints * entryFillQty * Instrument.MasterInstrument.PointValue);
 
                     int bit = isStopFill ? 0 : 1;
 
                     DiagLog(string.Format(
-                        "CLOSED {0}: entry={1:F2} exit={2:F2} qty={3} pnl={4:0.00} bit={5}",
+                        "MONEY SLICE #{0} CLOSED {1}: entry={2:F2} exit={3:F2} qty={4} pnl={5:0.00} bit={6}",
+                        sliceCount,
                         isStopFill ? "STOP" : "TARGET",
                         entryFillPrice, price, entryFillQty, pnl, bit));
 
-                    awaitingClose     = false;
-                    entryInFlight     = false;
-                    workingEntryOrder = null;
-
-                    // Update real loss streak
+                    // update real loss streak
                     if (bit == 0)
                     {
                         realLossesInARow++;
@@ -611,12 +515,24 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 realLossesInARow));
                         realLossesInARow = 0;
                     }
-                    // AppendOutcome FIRST — L0 includes real trade bit before logging
-                    AppendOutcome(bit);
-                    // WriteLogRow AFTER — L0 and L1 now reflect this real trade
-                    WriteLogRow(price, pnl, bit, entryFillQty, time);
-                    entryFillPrice    = 0.0;
-                    entryFillQty      = 0;
+
+                    awaitingClose     = false;
+                    entryInFlight     = false;
+                    workingEntryOrder = null;
+                    inSlice           = false;
+                    isMoneySlice      = false;
+
+                    // save fill price before reset
+                    double logFillPrice = entryFillPrice;
+                    int    logFillQty   = entryFillQty;
+                    entryFillPrice = 0.0;
+                    entryFillQty   = 0;
+
+                    // ── update pipeline FIRST ──────────────────────────────────
+                    UpdatePipeline(bit);
+
+                    // ── log AFTER pipeline updated — shows final state ─────────
+                    WriteLogRow(logFillPrice, price, pnl, bit, logFillQty, time);
                 }
             }
         }
@@ -634,17 +550,19 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (oName == ENTRY_SIGNAL
                 && (orderState == OrderState.Cancelled || orderState == OrderState.Rejected))
             {
-                DiagLog(string.Format("Entry order {0} (filled={1}). Resetting entry flags.",
+                DiagLog(string.Format("Entry order {0} (filled={1}). Resetting.",
                     orderState, filled));
                 if (filled == 0)
                 {
-                    ordersPlaced--;
+                    sliceCount--;
                     entryInFlight     = false;
                     awaitingClose     = false;
                     workingEntryOrder = null;
                     entryFillPrice    = 0.0;
                     entryFillQty      = 0;
-                    DiagLog("Entry cancelled with zero fills. ordersPlaced decremented.");
+                    inSlice           = false;
+                    isMoneySlice      = false;
+                    DiagLog("Entry cancelled zero fills. sliceCount decremented.");
                 }
                 else
                 {
@@ -657,16 +575,53 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             if (error != ErrorCode.NoError || orderState == OrderState.Rejected)
-            {
                 DiagLog(string.Format("ORDER WARN: {0} state={1} err={2} native={3}",
                     oName, orderState, error,
                     string.IsNullOrEmpty(nativeError) ? "-" : nativeError));
-            }
             else
-            {
                 DiagLog(string.Format("ORDER {0} state={1} qty={2} filled={3} avg={4:F2}",
                     oName, orderState, quantity, filled, averageFillPrice));
+        }
+
+        // =====================================================================
+        // ReadyForNewSlice
+        // =====================================================================
+        private bool ReadyForNewSlice()
+        {
+            if (inSlice)      return false;
+            if (awaitingClose) return false;
+            if (entryInFlight) return false;
+            if (Position.MarketPosition != MarketPosition.Flat) return false;
+
+            try
+            {
+                if (Account != null)
+                {
+                    lock (Account.Orders)
+                    {
+                        foreach (var ord in Account.Orders)
+                        {
+                            if (ord.Instrument == Instrument
+                                && (ord.OrderState == OrderState.Working
+                                    || ord.OrderState == OrderState.Accepted
+                                    || ord.OrderState == OrderState.Submitted
+                                    || ord.OrderState == OrderState.PartFilled))
+                            {
+                                DiagLog(string.Format(
+                                    "ReadyForNewSlice: BLOCKED by order name='{0}' state={1}.",
+                                    ord.Name ?? "", ord.OrderState));
+                                return false;
+                            }
+                        }
+                    }
+                }
             }
+            catch (Exception ex)
+            {
+                DiagLog("ReadyForNewSlice scan error: " + ex.Message + ". Blocking.");
+                return false;
+            }
+            return true;
         }
 
         // =====================================================================
@@ -694,7 +649,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             pendingReason  = reason;
             pendingFlatten = true;
             DiagLog(Name + " shutdown requested: " + reason
-                + " | ordersPlaced=" + ordersPlaced
+                + " | sliceCount=" + sliceCount
                 + " | realLossesInARow=" + realLossesInARow);
         }
 
@@ -710,12 +665,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                     try
                     {
                         DiagLog(string.Format(
-                            "Shutdown: cancelling unfilled entry order (state={0}).", os));
+                            "Shutdown: cancelling entry order (state={0}).", os));
                         CancelOrder(workingEntryOrder);
                     }
                     catch (Exception ex)
                     {
-                        DiagLog("Shutdown: CancelOrder error: " + ex.Message);
+                        DiagLog("Shutdown CancelOrder error: " + ex.Message);
                         entryInFlight     = false;
                         awaitingClose     = false;
                         workingEntryOrder = null;
@@ -751,12 +706,23 @@ namespace NinjaTrader.NinjaScript.Strategies
             disabledSelf   = true;
             pendingFlatten = false;
             DiagLog(Name + " terminated. Reason: " + pendingReason
-                + " | ordersPlaced=" + ordersPlaced
+                + " | sliceCount=" + sliceCount
                 + " | realLossesInARow=" + realLossesInARow
-                + " | wL1=" + waitingForL1 + " | wTrade=" + waitingForTrade
-                + " | L0=" + outcomeHistory.ToString()
-                + " | L1=" + filter1History.ToString());
+                + " | isArmed=" + isArmed
+                + " | waitingForF1Outcome=" + waitingForF1Outcome
+                + " | nextIsMoney=" + nextIsMoney
+                + " | rawString=" + rawString.ToString()
+                + " | filter1Outcome=" + filter1Outcome.ToString());
             try { SetState(State.Terminated); } catch { }
+        }
+
+        // =====================================================================
+        // Helpers
+        // =====================================================================
+        private string TailOf(StringBuilder sb, int n)
+        {
+            string s = sb.ToString();
+            return s.Length <= n ? s : "..." + s.Substring(s.Length - n);
         }
 
         // =====================================================================
@@ -769,38 +735,37 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string dir = Path.GetDirectoryName(LogFilePath);
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                     Directory.CreateDirectory(dir);
-                // Always recreate on startup — guarantees header is always present
                 File.WriteAllText(LogFilePath,
-                    "timestamp,order_num,side,quantity,entry_price,exit_price,realized_pnl,win_loss_bit,layer0,layer1\n");
+                    "timestamp,slice_num,side,quantity,entry_price,exit_price,realized_pnl,win_loss_bit,rawString,filter1Outcome\n");
             }
             catch (Exception ex) { Print("Log header error: " + ex.Message); }
         }
 
-        private void WriteLogRow(double exitPrice, double pnl, int bit, int qty, DateTime exitTime)
+        private void WriteLogRow(double entryPrice, double exitPrice, double pnl, int bit, int qty, DateTime exitTime)
         {
             try
             {
                 string row = string.Format(
                     System.Globalization.CultureInfo.InvariantCulture,
                     "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6:0.00},{7},{8},{9}\n",
-                    exitTime, ordersPlaced, "Long", qty,
-                    entryFillPrice, exitPrice, pnl, bit,
-                    outcomeHistory.ToString(), filter1History.ToString());
+                    exitTime, sliceCount, "Long", qty,
+                    entryPrice, exitPrice, pnl, bit,
+                    rawString.ToString(), filter1Outcome.ToString());
                 File.AppendAllText(LogFilePath, row);
             }
             catch (Exception ex) { Print("Log write error: " + ex.Message); }
         }
 
-        private void WriteLogRowFake(double exitPrice, double pnl, int bit)
+        private void WriteLogRowFake(double entryPrice, double exitPrice, double pnl, int bit)
         {
             try
             {
                 string row = string.Format(
                     System.Globalization.CultureInfo.InvariantCulture,
                     "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6:0.00},{7},{8},{9}\n",
-                    DateTime.Now, ordersPlaced, "FAKE_Long", 0,
-                    fakeEntryPrice, exitPrice, pnl, bit,
-                    outcomeHistory.ToString(), filter1History.ToString());
+                    DateTime.Now, sliceCount, "FAKE_Long", 0,
+                    entryPrice, exitPrice, pnl, bit,
+                    rawString.ToString(), filter1Outcome.ToString());
                 File.AppendAllText(LogFilePath, row);
             }
             catch (Exception ex) { Print("Log write error (fake): " + ex.Message); }
@@ -817,7 +782,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string baseName = Path.GetFileNameWithoutExtension(LogFilePath);
                 if (baseName.EndsWith("_log", StringComparison.OrdinalIgnoreCase))
                     baseName = baseName.Substring(0, baseName.Length - 4);
-                string diagPath = Path.Combine(dir, baseName + "-diag.log");
+                string diagPath = Path.Combine(dir, baseName + "-diagLog.csv");
                 File.AppendAllText(diagPath, line + "\n");
             }
             catch { }
@@ -829,8 +794,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         #region Properties
 
         [NinjaScriptProperty]
-        [Display(Name = "Enable Trading Hours filter", Order = 1, GroupName = "Hours",
-            Description = "When false: no time filter. When true: only new entries within NY window.")]
+        [Display(Name = "Enable Trading Hours filter", Order = 1, GroupName = "Hours")]
         public bool EnableTradingHours { get; set; }
 
         [NinjaScriptProperty]
@@ -883,36 +847,27 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double ProfitTargetPoints { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Enable Trailing Stop", Order = 12, GroupName = "Bracket",
-            Description = "When true: NT native SetTrailStop (stop moves up with price). "
-                        + "When false: fixed stop only. "
-                        + "Recommended minimums: ETH 8-10pt | RTH 15-20pt | News 25-30pt.")]
+        [Display(Name = "Enable Trailing Stop", Order = 12, GroupName = "Bracket")]
         public bool EnableTrailingStop { get; set; }
 
         [NinjaScriptProperty]
         [Range(0.01, double.MaxValue)]
-        [Display(Name = "Trail distance (points)", Order = 13, GroupName = "Bracket",
-            Description = "Only used when Enable Trailing Stop = true.")]
+        [Display(Name = "Trail distance (points)", Order = 13, GroupName = "Bracket")]
         public double TrailDistancePoints { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Enable Real Order", Order = 1, GroupName = "Filter & Real Order",
-            Description = "FALSE = observation only, no real orders placed. "
-                        + "TRUE = real order fires when Filter 2 Pattern matches Layer 1 tail.")]
+            Description = "FALSE = observation only. TRUE = real order fires when armed and F1 matches.")]
         public bool EnableRealOrder { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Filter 1 Pattern (comma-separated)", Order = 2, GroupName = "Filter & Real Order",
-            Description = "Pattern checked against Layer 0 (raw outcome) tail after every trade. "
-                        + "Match → outcome appended to Layer 1. "
-                        + "Default '01' = after loss then win. Examples: '011', '01,011'.")]
+        [Display(Name = "Filter 1 Pattern", Order = 2, GroupName = "Filter & Real Order",
+            Description = "Pattern checked against rawString tail. Match → digit appended to filter1Outcome. Default '01'.")]
         public string Filter1Pattern { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Filter 2 Pattern (comma-separated)", Order = 3, GroupName = "Filter & Real Order",
-            Description = "Pattern checked against Layer 1 tail after every Layer 1 append. "
-                        + "Match + Enable Real Order = true → real trade fires. "
-                        + "Default '01' = after loss then win in Layer 1.")]
+        [Display(Name = "Filter 2 Pattern", Order = 3, GroupName = "Filter & Real Order",
+            Description = "Pattern checked against filter1Outcome tail. Match → isArmed=true → next F1 match = money trade. Default '11'.")]
         public string Filter2Pattern { get; set; }
 
         [NinjaScriptProperty]
@@ -922,17 +877,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
-        [Display(Name = "Max Fake + Real Trade Count", Order = 1, GroupName = "Limits",
-            Description = "Stop strategy after this many total trades (fake + real combined). "
-                        + "Controls session length and activity. Default 100.")]
-        public int MaxTotalTradeCount { get; set; }
+        [Display(Name = "Max Total Slice Count", Order = 1, GroupName = "Limits",
+            Description = "Stop after this many total slices (fake + real). Default 100.")]
+        public int MaxTotalSliceCount { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
         [Display(Name = "Max Real Loss In A Row", Order = 2, GroupName = "Limits",
-            Description = "Stop strategy after this many consecutive REAL trade losses. "
-                        + "Fake trade losses do NOT count toward this limit. "
-                        + "Resets to 0 on any real trade win. Default 3.")]
+            Description = "Stop after this many consecutive real trade losses. Default 3.")]
         public int MaxRealLossInARow { get; set; }
 
         [NinjaScriptProperty]
