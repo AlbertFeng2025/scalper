@@ -53,8 +53,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int      sliceCount    = 0;   // all slices (fake + real)
 
         // ── pipeline strings ─────────────────────────────────────────────────
-        private StringBuilder rawString      = new StringBuilder(); // Layer 0
-        private StringBuilder filter1Outcome = new StringBuilder(); // Layer 1
+        private StringBuilder rawString         = new StringBuilder(); // Layer 0: all bricks
+        private StringBuilder filter1Outcome    = new StringBuilder(); // Layer 1: after F1 match
+        private StringBuilder realTradeOutcome  = new StringBuilder(); // real money trade results only
 
         // ── pipeline state ───────────────────────────────────────────────────
         private bool isArmed             = false;  // filter2Outcome tail matched Filter2Pattern
@@ -155,6 +156,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     waitingForF1Outcome = false;
                     nextIsMoney         = false;
                     realLossesInARow    = 0;
+                    realTradeOutcome.Clear();
                     EnsureLogHeader();
                     DiagLog(Name + " enabled (LONG). Life=" + StrategyLifeMinutes
                         + "min, MaxTotalSliceCount=" + MaxTotalSliceCount
@@ -304,10 +306,18 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // CheckFakeSlice — tick by tick resolution for fake slices
+        // CheckFakeSlice — tick by tick brick resolution (LONG)
         // TARGET = 1 = price UP (LONG)
         //   stop hit   when bid <= sliceStopPrice   → bit = 0
         //   target hit when ask >= sliceTargetPrice → bit = 1
+        //
+        // BRICK END CLEANUP — if this was a money slice:
+        //   Case 1: not filled (position flat, order pending)
+        //     → cancel order, sliceCount--, no bit recorded
+        //   Case 2: filled but position still open (slippage/timing)
+        //     → force close, record bit from brick outcome
+        //   Case 3: already closed by bracket (normal)
+        //     → nothing to do, already handled by OnExecutionUpdate
         // =====================================================================
         private void CheckFakeSlice()
         {
@@ -327,26 +337,88 @@ namespace NinjaTrader.NinjaScript.Strategies
                     ? -(StopLossPoints     * Instrument.MasterInstrument.PointValue)
                     : +(ProfitTargetPoints * Instrument.MasterInstrument.PointValue);
 
+                bool wasMoneySlice = isMoneySlice;
                 inSlice      = false;
                 isMoneySlice = false;
 
-                DiagLog(string.Format(
-                    "FAKE SLICE #{0} {1}: entry={2:F2} exit={3:F2} pnl={4:0.00} bit={5}",
-                    sliceCount, stopHit ? "LOSS" : "WIN",
-                    sliceEntryPrice, exitPrice, pnl, bit));
-
-                // save entry price before reset
                 double logEntryPrice = sliceEntryPrice;
-
-                // reset slice prices
                 sliceEntryPrice  = 0.0;
                 sliceStopPrice   = 0.0;
                 sliceTargetPrice = 0.0;
 
-                // ── update pipeline FIRST ─────────────────────────────────────
+                // ── Brick end cleanup for money slice ─────────────────────────
+                if (wasMoneySlice)
+                {
+                    // Case 1: order never filled — cancel and discard
+                    if (Position.MarketPosition == MarketPosition.Flat
+                        && workingEntryOrder != null
+                        && (workingEntryOrder.OrderState == OrderState.Working
+                            || workingEntryOrder.OrderState == OrderState.Accepted
+                            || workingEntryOrder.OrderState == OrderState.Submitted))
+                    {
+                        DiagLog(string.Format(
+                            "[BRICK CLEANUP Case1] Slice #{0} — order never filled. Cancelling. No bit recorded.",
+                            sliceCount));
+                        try { CancelOrder(workingEntryOrder); } catch (Exception ex) {
+                            DiagLog("CancelOrder error: " + ex.Message);
+                        }
+                        workingEntryOrder = null;
+                        entryInFlight     = false;
+                        awaitingClose     = false;
+                        sliceCount--;  // refund — no trade happened
+                        WriteLogRowCancelled(logEntryPrice);
+                        return;  // NO pipeline update — brick discarded
+                    }
+
+                    // Case 2: filled but position still open — force close
+                    if (Position.MarketPosition == MarketPosition.Long)
+                    {
+                        DiagLog(string.Format(
+                            "[BRICK CLEANUP Case2] Slice #{0} — position still open at brick end. Force closing. bit={1}",
+                            sliceCount, bit));
+                        try { ExitLong(Math.Abs(Position.Quantity), "LR_ForceClose", ENTRY_SIGNAL); }
+                        catch (Exception ex) { DiagLog("ForceClose error: " + ex.Message); }
+                        awaitingClose     = false;
+                        entryInFlight     = false;
+                        workingEntryOrder = null;
+                        // record real trade outcome
+                        realTradeOutcome.Append(bit.ToString());
+                        if (bit == 0) {
+                            realLossesInARow++;
+                            DiagLog(string.Format("[REAL LOSS forced] realLossesInARow={0}", realLossesInARow));
+                        } else {
+                            realLossesInARow = 0;
+                            DiagLog("[REAL WIN forced] realLossesInARow reset to 0");
+                        }
+                        UpdatePipeline(bit);
+                        WriteLogRow(entryFillPrice > 0 ? entryFillPrice : logEntryPrice,
+                            exitPrice, pnl, bit, entryFillQty > 0 ? entryFillQty : BaseQuantity,
+                            DateTime.Now);
+                        entryFillPrice = 0.0;
+                        entryFillQty   = 0;
+                        return;
+                    }
+
+                    // Case 3: already closed normally by OnExecutionUpdate
+                    if (Position.MarketPosition == MarketPosition.Flat && !awaitingClose)
+                    {
+                        DiagLog(string.Format(
+                            "[BRICK CLEANUP Case3] Slice #{0} — already closed by bracket. Normal.",
+                            sliceCount));
+                        return;  // already handled, do not double-record
+                    }
+                }
+
+                // ── Normal fake slice ─────────────────────────────────────────
+                DiagLog(string.Format(
+                    "FAKE SLICE #{0} {1}: entry={2:F2} exit={3:F2} pnl={4:0.00} bit={5}",
+                    sliceCount, stopHit ? "LOSS" : "WIN",
+                    logEntryPrice, exitPrice, pnl, bit));
+
+                // update pipeline FIRST
                 UpdatePipeline(bit);
 
-                // ── log AFTER pipeline updated — shows final state ────────────
+                // log AFTER pipeline updated
                 WriteLogRowFake(logEntryPrice, exitPrice, pnl, bit);
             }
             catch (Exception ex)
@@ -501,18 +573,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                         isStopFill ? "STOP" : "TARGET",
                         entryFillPrice, price, entryFillQty, pnl, bit));
 
-                    // update real loss streak
+                    // update real loss streak and realTradeOutcome string
+                    realTradeOutcome.Append(bit.ToString());
                     if (bit == 0)
                     {
                         realLossesInARow++;
-                        DiagLog(string.Format("[REAL LOSS] realLossesInARow={0} / max={1}",
-                            realLossesInARow, MaxRealLossInARow));
+                        DiagLog(string.Format("[REAL LOSS] realLossesInARow={0} / max={1} | realTradeOutcome={2}",
+                            realLossesInARow, MaxRealLossInARow, realTradeOutcome.ToString()));
                     }
                     else
                     {
                         if (realLossesInARow > 0)
-                            DiagLog(string.Format("[REAL WIN] Resetting realLossesInARow {0}→0",
-                                realLossesInARow));
+                            DiagLog(string.Format("[REAL WIN] Resetting realLossesInARow {0}→0 | realTradeOutcome={1}",
+                                realLossesInARow, realTradeOutcome.ToString()));
                         realLossesInARow = 0;
                     }
 
@@ -712,7 +785,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 + " | waitingForF1Outcome=" + waitingForF1Outcome
                 + " | nextIsMoney=" + nextIsMoney
                 + " | rawString=" + rawString.ToString()
-                + " | filter1Outcome=" + filter1Outcome.ToString());
+                + " | filter1Outcome=" + filter1Outcome.ToString()
+                + " | realTradeOutcome=" + realTradeOutcome.ToString());
             try { SetState(State.Terminated); } catch { }
         }
 
@@ -736,7 +810,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                     Directory.CreateDirectory(dir);
                 File.WriteAllText(LogFilePath,
-                    "timestamp,slice_num,side,quantity,entry_price,exit_price,realized_pnl,win_loss_bit,rawString,filter1Outcome\n");
+                    "timestamp(machine_local_time),slice_num,side,quantity,entry_price,exit_price,realized_pnl,win_loss_bit,rawString,filter1Outcome,realTradeOutcome\n");
             }
             catch (Exception ex) { Print("Log header error: " + ex.Message); }
         }
@@ -747,10 +821,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 string row = string.Format(
                     System.Globalization.CultureInfo.InvariantCulture,
-                    "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6:0.00},{7},{8},{9}\n",
+                    "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6:0.00},{7},{8},{9},{10}\n",
                     exitTime, sliceCount, "Long", qty,
                     entryPrice, exitPrice, pnl, bit,
-                    rawString.ToString(), filter1Outcome.ToString());
+                    rawString.ToString(), filter1Outcome.ToString(), realTradeOutcome.ToString());
                 File.AppendAllText(LogFilePath, row);
             }
             catch (Exception ex) { Print("Log write error: " + ex.Message); }
@@ -762,13 +836,28 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 string row = string.Format(
                     System.Globalization.CultureInfo.InvariantCulture,
-                    "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6:0.00},{7},{8},{9}\n",
+                    "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6:0.00},{7},{8},{9},{10}\n",
                     DateTime.Now, sliceCount, "FAKE_Long", 0,
                     entryPrice, exitPrice, pnl, bit,
-                    rawString.ToString(), filter1Outcome.ToString());
+                    rawString.ToString(), filter1Outcome.ToString(), realTradeOutcome.ToString());
                 File.AppendAllText(LogFilePath, row);
             }
             catch (Exception ex) { Print("Log write error (fake): " + ex.Message); }
+        }
+
+        private void WriteLogRowCancelled(double entryPrice)
+        {
+            try
+            {
+                string row = string.Format(
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10}\n",
+                    DateTime.Now, sliceCount, "CANCELLED_no_fill", 0,
+                    entryPrice, 0, 0, "-",
+                    rawString.ToString(), filter1Outcome.ToString(), realTradeOutcome.ToString());
+                File.AppendAllText(LogFilePath, row);
+            }
+            catch (Exception ex) { Print("Log write error (cancelled): " + ex.Message); }
         }
 
         private void DiagLog(string msg)
