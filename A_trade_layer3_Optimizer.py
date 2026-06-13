@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-pipeline_optimizer_v2.py
+pipeline_optimizer_v3.py
 ------------------------
 Brute-force optimizer to find the best F1, F2, and F3 patterns.
-Includes layer-by-layer distillation metrics (Raw -> F1 -> F2 -> Trade).
+Includes layer-by-layer distillation metrics and consecutive loss streak tracking.
 """
 import itertools
 
 def simulate_pipeline(market_string: str, f1_pat: str, f2_pat: str, f3_pat: str) -> dict:
     """
     Simulates the exact tick-by-tick state machine from the C# NinjaScript.
-    Returns a dictionary containing the stats for every layer in the pipeline.
+    Returns a dictionary containing performance and risk stats for every layer.
     """
     raw_string = ""
     f1_outcome = ""
@@ -61,17 +61,38 @@ def simulate_pipeline(market_string: str, f1_pat: str, f2_pat: str, f3_pat: str)
         if not s: return 0.0
         return (s.count('1') / len(s)) * 100
 
+    # Helper function to calculate max consecutive losses (0s in a row)
+    def calc_max_loss_streak(sequence):
+        if not sequence: 
+            return 0
+        # If sequence is a list of integers (like trades), convert it to a string of bits
+        if isinstance(sequence, list):
+            seq_str = "".join(map(str, sequence))
+        else:
+            seq_str = sequence
+            
+        # Splitting by '1' breaks the string into blocks of consecutive '0's
+        streaks = seq_str.split('1')
+        return max(len(streak) for streak in streaks)
+
     # Package all metrics into a dictionary to return to the optimizer
     return {
         "raw_len": len(raw_string),
         "raw_pct": calc_pct(raw_string),
+        "raw_max_losses": calc_max_loss_streak(raw_string),
+        
         "f1_len": len(f1_outcome),
         "f1_pct": calc_pct(f1_outcome),
+        "f1_max_losses": calc_max_loss_streak(f1_outcome),
+        
         "f2_len": len(f2_outcome),
         "f2_pct": calc_pct(f2_outcome),
+        "f2_max_losses": calc_max_loss_streak(f2_outcome),
+        
         "trade_len": len(trades),
         "trade_wins": sum(trades),
-        "trade_pct": (sum(trades) / len(trades) * 100) if trades else 0.0
+        "trade_pct": (sum(trades) / len(trades) * 100) if trades else 0.0,
+        "trade_max_losses": calc_max_loss_streak(trades)
     }
 
 def generate_patterns(length: int) -> list:
@@ -109,9 +130,9 @@ def run_optimization(market_string: str, f1_len: int, f2_len: int, f3_len: int, 
     # Sort primarily by Final Trade Win Rate, secondarily by Total Trades
     results.sort(key=lambda x: (x["stats"]["trade_pct"], x["stats"]["trade_len"]), reverse=True)
     
-    print("=" * 80)
-    print(f"{'TOP FILTER COMBINATIONS (Showing Distillation Progress)':^80}")
-    print("=" * 80)
+    print("=" * 95)
+    print(f"{'TOP FILTER COMBINATIONS (Distillation & Streak Analysis)':^95}")
+    print("=" * 95)
     
     if not results:
         print(f"No combinations produced at least {min_trades} trades.")
@@ -120,26 +141,23 @@ def run_optimization(market_string: str, f1_len: int, f2_len: int, f3_len: int, 
     for i, res in enumerate(results[:10]):
         st = res["stats"]
         print(f"{i+1:2}. {res['combo']}")
-        print(f"    Raw String : {st['raw_len']:4} slices  |  Win Rate: {st['raw_pct']:6.2f}%")
-        print(f"    F1 Outcome : {st['f1_len']:4} slices  |  Win Rate: {st['f1_pct']:6.2f}%")
-        print(f"    F2 Outcome : {st['f2_len']:4} slices  |  Win Rate: {st['f2_pct']:6.2f}%")
-        print(f"    Live Trades: {st['trade_len']:4} trades  |  Win Rate: {st['trade_pct']:6.2f}%  ({st['trade_wins']}W - {st['trade_len'] - st['trade_wins']}L)")
-        print("-" * 80)
+        print(f"    Raw String : {st['raw_len']:4} slices  |  Win Rate: {st['raw_pct']:6.2f}%  |  Max Loss Streak: {st['raw_max_losses']} in a row")
+        print(f"    F1 Outcome : {st['f1_len']:4} slices  |  Win Rate: {st['f1_pct']:6.2f}%  |  Max Loss Streak: {st['f1_max_losses']} in a row")
+        print(f"    F2 Outcome : {st['f2_len']:4} slices  |  Win Rate: {st['f2_pct']:6.2f}%  |  Max Loss Streak: {st['f2_max_losses']} in a row")
+        print(f"    Live Trades: {st['trade_len']:4} trades  |  Win Rate: {st['trade_pct']:6.2f}%  |  Max Loss Streak: {st['trade_max_losses']} IN A ROW ({st['trade_wins']}W - {st['trade_len'] - st['trade_wins']}L)")
+        print("-" * 95)
 
 
 if __name__ == "__main__":
-    # 1. Paste your historical raw string here (No trailing comma)
-    test_market_string = (
-        "001100101101010010001100000011100101110110000001000001101011111111010111010111110110010000111111110111001101001000100011010101101111001011011000101000000011001010000100011111011010110100011100100100001101111101011011000110100011000010111100011000110111001001101010111001011011110001011110110111101001111111000111101000100100101110011001101001110111000100001100000100010101110011101111110011011101110001011101110101000111010110011101110110000101000010000110100000010011111100000000101110011010111100111110010111010000110001011011010110011001101110100011111011100100011110100101010101000100111000010111110001011100101000011110010011001101101111000"
-        "101000110110101010110111000100110110010001101010011011101011110100101101110110000111011010001111110110010111100010010110110101011011110110100000001010100101111"
-    )
+    # 1. Your historical raw market string
+    test_market_string = "001100101101010010001100000011100101110110000001000001101011111111010111010111110110010000111111110111001101001000100011010101101111001011011000101000000011001010000100011111011010110100011100100100001101111101011011000110100011000010111100011000110111001001101010111001011011110001011110110111101001111111000111101000100100101110011001101001110111000100001100000100010101110011101111110011011101110001011101110101000111010110011101110110000101000010000110100000010011111100000000101110011010111100111110010111010000110001011011010110011001101110100011111011100100011110100101010101000100111000010111110001011100101000011110010011001101101111000"
     
-    # 2. Set the lengths of the patterns you want to test
+    # 2. Pattern Length configurations (Testing 2x2x2 space = 64 unique state structures)
     LENGTH_F1 = 2
-    LENGTH_F2 = 1
-    LENGTH_F3 = 1
+    LENGTH_F2 = 2
+    LENGTH_F3 = 2
     
-    # 3. Minimum trades required to be considered a valid combo
+    # 3. Minimum trades required to ensure statistical significance
     MIN_TRADES = 3
     
     run_optimization(test_market_string, LENGTH_F1, LENGTH_F2, LENGTH_F3, min_trades=MIN_TRADES)
