@@ -12,7 +12,7 @@ using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.Strategies;
 #endregion
 
-// scalper_LONGrepeat_Layer2  v2
+// scalper_SHORTrepeat_Layer2  v3
 //
 // PIPELINE (matches Python trade_filter.py exactly):
 //
@@ -79,6 +79,40 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ── real loss streak ─────────────────────────────────────────────────
         private int realLossesInARow = 0;
 
+        // ── qty multiplier table ──────────────────────────────────────────────
+        // Edit this table to define your position sizing strategy.
+        // Pattern is checked against the TAIL of realTradeOutcome string.
+        // Longest matching pattern wins (most specific takes priority).
+        // Default multiplier = 1 if no pattern matches.
+        // Only used when EnableQtyIncrement = true.
+        //
+        // Pattern meaning:
+        //   "10"    = 1 win followed by 1 loss  → multiply qty by 2
+        //   "100"   = 1 win followed by 2 losses → multiply qty by 2
+        //   "1000"  = 1 win followed by 3 losses → multiply qty by 3
+        //   "10000" = 1 win followed by 4 losses → multiply qty by 4
+        //             (remove this line to surrender at 4 losses instead)
+        //
+        // You can use any pattern and any multiplier, for example:
+        //   ("10",    2)  → double after 1 loss
+        //   ("100",   4)  → quadruple after 2 losses
+        //   ("1000",  8)  → 8x after 3 losses
+        //   ("10000", 10) → 10x after 4 losses
+        //   OR: ("10", 2), ("100", 2), ("1000", 3), ("10000", 3) → gradual
+        //
+        // Future: this table will be loaded from external JSON/config file.
+        // ─────────────────────────────────────────────────────────────────────
+        private static readonly (string pattern, int multiplier)[] QtyMultiplierTable =
+        {
+            ("10000", 4),   // 4 losses after win → ×4 (remove to surrender at ×1)
+            ("1000",  3),   // 3 losses after win → ×3
+            ("100",   2),   // 2 losses after win → ×2
+            ("10",    2),   // 1 loss  after win  → ×2
+        };
+
+        // ── computed qty for current money trade ──────────────────────────────
+        private int currentQty = 1;  // recalculated in StartNextSlice when armed
+
         // ── shutdown ─────────────────────────────────────────────────────────
         private bool   pendingFlatten = false;
         private string pendingReason  = string.Empty;
@@ -130,9 +164,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Filter1Pattern       = "01";
                 Filter2Pattern       = "11";
                 BaseQuantity         = 1;
+                EnableQtyIncrement   = false;
                 MaxTotalSliceCount   = 100;
                 MaxRealLossInARow    = 3;
-                LogFilePath          = @"C:\temp\scalper_LONGrepeat_Layer2_log.csv";
+                LogFilePath          = @"C:\temp\scalper_SHORTrepeat_Layer2_log.csv";
+                StartMode            = 0;
+                RawStringFilePath    = @"C:\temp\rawString_SHORT_20stop_20profit.csv";
+                MaxFileAgeMinutes    = 10;
             }
             else if (State == State.Configure)
             {
@@ -156,6 +194,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     waitingForF1Outcome = false;
                     nextIsMoney         = false;
                     realLossesInARow    = 0;
+                    currentQty          = BaseQuantity;
                     realTradeOutcome.Clear();
                     EnsureLogHeader();
                     DiagLog(Name + " enabled (SHORT). Life=" + StrategyLifeMinutes
@@ -168,7 +207,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + (EnableTrailingStop ? ", TrailDist=" + TrailDistancePoints + "pt" : "")
                         + ", EnableRealOrder=" + EnableRealOrder
                         + ", Filter1=[" + Filter1Pattern + "]"
-                        + ", Filter2=[" + Filter2Pattern + "]");
+                        + ", Filter2=[" + Filter2Pattern + "]"
+                        + ", StartMode=" + (StartMode == 0 ? "Fresh" : "LoadFromFile")
+                        + (StartMode == 1 ? ", RawStringFile=" + RawStringFilePath : ""));
+
+                    // ── load and replay pre-built raw string if requested ──────
+                    if (StartMode == 1)
+                        LoadAndReplayRawString();
                 }
             }
         }
@@ -233,16 +278,47 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
+        // CalcQty — returns qty for next money trade based on QtyMultiplierTable
+        // Only called when EnableQtyIncrement = true.
+        // Checks realTradeOutcome tail against each table entry (longest first).
+        // First match wins. No match → BaseQuantity × 1.
+        // =====================================================================
+        private int CalcQty()
+        {
+            if (!EnableQtyIncrement) return BaseQuantity;
+
+            string outcome = realTradeOutcome.ToString();
+            if (outcome.Length == 0) return BaseQuantity;
+
+            // Table is ordered longest→shortest so first match = most specific
+            foreach (var entry in QtyMultiplierTable)
+            {
+                if (outcome.Length >= entry.pattern.Length
+                    && outcome.EndsWith(entry.pattern))
+                {
+                    int qty = BaseQuantity * entry.multiplier;
+                    DiagLog(string.Format(
+                        "[QTY] realTradeOutcome tail matches '{0}' → multiplier={1} → qty={2}",
+                        entry.pattern, entry.multiplier, qty));
+                    return qty;
+                }
+            }
+
+            DiagLog(string.Format(
+                "[QTY] No pattern match for realTradeOutcome tail '{0}' → qty={1} (default)",
+                outcome.Length > 8 ? "..." + outcome.Substring(outcome.Length - 8) : outcome,
+                BaseQuantity));
+            return BaseQuantity;
+        }
+
+        // =====================================================================
         // StartNextSlice — decides if next slice is fake or money
         // Based on: isArmed AND rawString tail matches Filter1Pattern
         // =====================================================================
         private void StartNextSlice()
         {
-            // Is this slice a money trade?
-            // YES if nextIsMoney flag was set at end of previous slice
-            // (= isArmed AND rawString tail matched F1 at end of last slice)
             bool startMoney = nextIsMoney;
-            nextIsMoney = false;  // reset after reading
+            nextIsMoney = false;
 
             sliceCount++;
             double refPrice = GetCurrentAsk();
@@ -259,7 +335,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (isMoneySlice)
             {
-                // Place real money order
+                // ── calculate qty for this money trade ────────────────────────
+                currentQty = CalcQty();
+
                 awaitingClose     = true;
                 entryInFlight     = true;
                 workingEntryOrder = null;
@@ -267,21 +345,23 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (UseMarketEntry)
                     {
-                        workingEntryOrder = EnterShort(BaseQuantity, ENTRY_SIGNAL);
+                        workingEntryOrder = EnterShort(currentQty, ENTRY_SIGNAL);
                         DiagLog(string.Format(
-                            "MONEY SHORT SLICE #{0} MARKET qty={1} entry~{2:F2} stop={3:F2}(above) target={4:F2}(below) | rawString={5} | filter1Outcome={6}",
-                            sliceCount, BaseQuantity, sliceEntryPrice, sliceStopPrice, sliceTargetPrice,
-                            TailOf(rawString, 8), TailOf(filter1Outcome, 8)));
+                            "MONEY SHORT SLICE #{0} MARKET qty={1} entry~{2:F2} stop={3:F2}(above) target={4:F2}(below) | rawString={5} | filter1Outcome={6} | realTradeOutcome={7}",
+                            sliceCount, currentQty, sliceEntryPrice, sliceStopPrice, sliceTargetPrice,
+                            TailOf(rawString, 8), TailOf(filter1Outcome, 8),
+                            TailOf(realTradeOutcome, 8)));
                     }
                     else
                     {
                         double limitPx = Instrument.MasterInstrument.RoundToTickSize(
                             GetCurrentAsk() + LimitOffsetPoints);
-                        workingEntryOrder = EnterShortLimit(0, true, BaseQuantity, limitPx, ENTRY_SIGNAL);
+                        workingEntryOrder = EnterShortLimit(0, true, currentQty, limitPx, ENTRY_SIGNAL);
                         DiagLog(string.Format(
-                            "MONEY SHORT SLICE #{0} LIMIT qty={1} limit={2:F2} | rawString={3} | filter1Outcome={4}",
-                            sliceCount, BaseQuantity, limitPx,
-                            TailOf(rawString, 8), TailOf(filter1Outcome, 8)));
+                            "MONEY SHORT SLICE #{0} LIMIT qty={1} limit={2:F2} | rawString={3} | filter1Outcome={4} | realTradeOutcome={5}",
+                            sliceCount, currentQty, limitPx,
+                            TailOf(rawString, 8), TailOf(filter1Outcome, 8),
+                            TailOf(realTradeOutcome, 8)));
                     }
                 }
                 catch (Exception ex)
@@ -392,7 +472,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         }
                         UpdatePipeline(bit);
                         WriteLogRow(entryFillPrice > 0 ? entryFillPrice : logEntryPrice,
-                            exitPrice, pnl, bit, entryFillQty > 0 ? entryFillQty : BaseQuantity,
+                            exitPrice, pnl, bit, entryFillQty > 0 ? entryFillQty : currentQty,
                             DateTime.Now);
                         entryFillPrice = 0.0;
                         entryFillQty   = 0;
@@ -426,6 +506,209 @@ namespace NinjaTrader.NinjaScript.Strategies
                 DiagLog("CheckFakeSlice error: " + ex.Message);
                 inSlice      = false;
                 isMoneySlice = false;
+            }
+        }
+
+        // =====================================================================
+        // LoadAndReplayRawString — called once on enable when StartMode=1
+        //
+        // VERIFICATION (hard stop on failure — no auto fallback):
+        //   Step 1: File exists
+        //   Step 2: Header settings match (direction=SHORT, stop, profit)
+        //   Step 3: Last timestamp within MaxFileAgeMinutes
+        //   Step 4: Bit count >= 20 (soft warn only, continues)
+        //   Step 5: Replay all bits through UpdatePipeline()
+        //
+        // On hard stop: strategy terminates. User must either:
+        //   A) Fix RawStringFilePath to correct file
+        //   B) Change StartMode=0 for fresh start
+        //   Then re-enable manually.
+        // =====================================================================
+        private void LoadAndReplayRawString()
+        {
+            try
+            {
+                // ── Step 1: File exists ───────────────────────────────────────
+                if (!File.Exists(RawStringFilePath))
+                {
+                    string msg = "[LOAD FAILED] File not found: " + RawStringFilePath + "\n"
+                               + "  Action: Verify path is correct, or set StartMode=0 for fresh start.\n"
+                               + "  Strategy will now terminate.";
+                    DiagLog(msg); Print(msg);
+                    BeginShutdown("LoadAndReplayRawString: file not found — " + RawStringFilePath);
+                    return;
+                }
+
+                string[] lines = File.ReadAllLines(RawStringFilePath);
+
+                // ── Step 2: Parse header and verify settings ──────────────────
+                string fileDirection = "";
+                string fileStop      = "";
+                string fileProfit    = "";
+
+                foreach (string line in lines)
+                {
+                    string t = line.Trim();
+                    if (!t.StartsWith("#")) break;
+                    if      (t.StartsWith("# direction:"))  fileDirection = t.Replace("# direction:",  "").Trim().ToUpper();
+                    else if (t.StartsWith("# stop_pts:"))   fileStop      = t.Replace("# stop_pts:",   "").Trim();
+                    else if (t.StartsWith("# profit_pts:")) fileProfit    = t.Replace("# profit_pts:", "").Trim();
+                }
+
+                // direction check — SHORT strategy must load SHORT file
+                const string stratDirection = "SHORT";
+                if (fileDirection != stratDirection)
+                {
+                    string msg = "[LOAD FAILED] Direction mismatch.\n"
+                               + "  File says:  direction=" + fileDirection + "\n"
+                               + "  Strategy:   direction=" + stratDirection + "\n"
+                               + "  Action: Point RawStringFilePath to a SHORT file,\n"
+                               + "          or set StartMode=0 for fresh start.\n"
+                               + "  Strategy will now terminate.";
+                    DiagLog(msg); Print(msg);
+                    BeginShutdown("LoadAndReplayRawString: direction mismatch file="
+                        + fileDirection + " strategy=" + stratDirection);
+                    return;
+                }
+
+                // stop loss check
+                double fileStopVal = 0;
+                if (!double.TryParse(fileStop,
+                    System.Globalization.NumberStyles.Any,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out fileStopVal) || Math.Abs(fileStopVal - StopLossPoints) > 0.001)
+                {
+                    string msg = "[LOAD FAILED] StopLossPoints mismatch.\n"
+                               + "  File says:  stop_pts=" + fileStop + "\n"
+                               + "  Strategy:   StopLossPoints=" + StopLossPoints + "\n"
+                               + "  Action: Match parameters or set StartMode=0.\n"
+                               + "  Strategy will now terminate.";
+                    DiagLog(msg); Print(msg);
+                    BeginShutdown("LoadAndReplayRawString: stop mismatch file="
+                        + fileStop + " strategy=" + StopLossPoints);
+                    return;
+                }
+
+                // profit target check
+                double fileProfitVal = 0;
+                if (!double.TryParse(fileProfit,
+                    System.Globalization.NumberStyles.Any,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out fileProfitVal) || Math.Abs(fileProfitVal - ProfitTargetPoints) > 0.001)
+                {
+                    string msg = "[LOAD FAILED] ProfitTargetPoints mismatch.\n"
+                               + "  File says:  profit_pts=" + fileProfit + "\n"
+                               + "  Strategy:   ProfitTargetPoints=" + ProfitTargetPoints + "\n"
+                               + "  Action: Match parameters or set StartMode=0.\n"
+                               + "  Strategy will now terminate.";
+                    DiagLog(msg); Print(msg);
+                    BeginShutdown("LoadAndReplayRawString: profit mismatch file="
+                        + fileProfit + " strategy=" + ProfitTargetPoints);
+                    return;
+                }
+
+                // ── Step 3: Find last timestamp and check staleness ───────────
+                DateTime lastTimestamp = DateTime.MinValue;
+                int      bitCount      = 0;
+
+                foreach (string line in lines)
+                {
+                    string t = line.Trim();
+                    if (string.IsNullOrEmpty(t) || t.StartsWith("#")) continue;
+                    // Support both old 2-column (timestamp,bit) and
+                    // new 3-column (timestamp,bit,bitStringForHuman) format.
+                    // Bit is always the SECOND field (between 1st and 2nd comma).
+                    int firstComma = t.IndexOf(',');
+                    if (firstComma < 0) continue;
+                    int secondComma = t.IndexOf(',', firstComma + 1);
+                    string bitStr = secondComma >= 0
+                        ? t.Substring(firstComma + 1, secondComma - firstComma - 1).Trim()
+                        : t.Substring(firstComma + 1).Trim();
+                    if (bitStr != "0" && bitStr != "1") continue;
+                    bitCount++;
+                    DateTime ts;
+                    if (DateTime.TryParse(t.Substring(0, firstComma).Trim(), out ts))
+                        lastTimestamp = ts;
+                }
+
+                if (lastTimestamp == DateTime.MinValue)
+                {
+                    string msg = "[LOAD FAILED] No valid data lines found in file.\n"
+                               + "  File: " + RawStringFilePath + "\n"
+                               + "  Action: Verify Part A is running and writing bits,\n"
+                               + "          or set StartMode=0 for fresh start.\n"
+                               + "  Strategy will now terminate.";
+                    DiagLog(msg); Print(msg);
+                    BeginShutdown("LoadAndReplayRawString: no valid data in file");
+                    return;
+                }
+
+                double ageMinutes = (DateTime.Now - lastTimestamp).TotalMinutes;
+                if (ageMinutes > MaxFileAgeMinutes)
+                {
+                    string msg = "[LOAD FAILED] File is stale.\n"
+                               + "  Last bit recorded: " + lastTimestamp.ToString("yyyy-MM-dd HH:mm:ss") + "\n"
+                               + "  Current time:      " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "\n"
+                               + "  Gap:               " + ageMinutes.ToString("F1") + " min"
+                               + " (max allowed: " + MaxFileAgeMinutes + " min)\n"
+                               + "  Action: Verify Part A (rawString recorder) is still enabled\n"
+                               + "          and actively writing to: " + RawStringFilePath + "\n"
+                               + "          Or set StartMode=0 for fresh start.\n"
+                               + "  Strategy will now terminate.";
+                    DiagLog(msg); Print(msg);
+                    BeginShutdown("LoadAndReplayRawString: file stale "
+                        + ageMinutes.ToString("F1") + " min > max " + MaxFileAgeMinutes + " min");
+                    return;
+                }
+
+                // ── Step 4: Soft warn if too few bits ─────────────────────────
+                const int MIN_BITS = 20;
+                if (bitCount < MIN_BITS)
+                {
+                    string warn = "[LOAD WARN] Only " + bitCount + " bits in file "
+                                + "(recommended minimum: " + MIN_BITS + ").\n"
+                                + "  Pipeline will be weakly warmed. "
+                                + "Consider waiting for more bits before enabling.";
+                    DiagLog(warn); Print(warn);
+                }
+
+                // ── Step 5: Replay all bits through UpdatePipeline() ──────────
+                int replayed = 0;
+                foreach (string line in lines)
+                {
+                    string t = line.Trim();
+                    if (string.IsNullOrEmpty(t) || t.StartsWith("#")) continue;
+                    // Support both old 2-column (timestamp,bit) and
+                    // new 3-column (timestamp,bit,bitStringForHuman) format.
+                    // Bit is always the SECOND field (between 1st and 2nd comma).
+                    int firstComma = t.IndexOf(',');
+                    if (firstComma < 0) continue;
+                    int secondComma = t.IndexOf(',', firstComma + 1);
+                    string bitStr = secondComma >= 0
+                        ? t.Substring(firstComma + 1, secondComma - firstComma - 1).Trim()
+                        : t.Substring(firstComma + 1).Trim();
+                    if (bitStr != "0" && bitStr != "1") continue;
+                    UpdatePipeline(int.Parse(bitStr));
+                    replayed++;
+                }
+
+                DiagLog(string.Format(
+                    "[LOAD OK] Replayed {0} bits. Last timestamp={1} (age={2:F1} min). "
+                    + "Pipeline: rawString.len={3} f1.len={4} "
+                    + "isArmed={5} waitF1={6} nextIsMoney={7}",
+                    replayed,
+                    lastTimestamp.ToString("yyyy-MM-dd HH:mm:ss"),
+                    ageMinutes,
+                    rawString.Length, filter1Outcome.Length,
+                    isArmed, waitingForF1Outcome, nextIsMoney));
+            }
+            catch (Exception ex)
+            {
+                string msg = "[LOAD FAILED] Unexpected error: " + ex.Message + "\n"
+                           + "  Strategy will now terminate.\n"
+                           + "  Action: Check file format or set StartMode=0.";
+                DiagLog(msg); Print(msg);
+                BeginShutdown("LoadAndReplayRawString exception: " + ex.Message);
             }
         }
 
@@ -965,6 +1248,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int BaseQuantity { get; set; }
 
         [NinjaScriptProperty]
+        [Display(Name = "Enable Qty Increment (if enabled, see code — QtyMultiplierTable)",
+            Order = 15, GroupName = "Quantity",
+            Description = "FALSE = always use BaseQuantity. "
+                        + "TRUE = qty scales dynamically per QtyMultiplierTable hardcoded in strategy. "
+                        + "Edit QtyMultiplierTable in source code to define your sizing pattern.")]
+        public bool EnableQtyIncrement { get; set; }
+
+        [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
         [Display(Name = "Max Total Slice Count", Order = 1, GroupName = "Limits",
             Description = "Stop after this many total slices (fake + real). Default 100.")]
@@ -979,6 +1270,27 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name = "Log file path", Order = 3, GroupName = "Logging")]
         public string LogFilePath { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 1)]
+        [Display(Name = "Start Mode (0=Fresh 1=LoadFromFile)", Order = 1, GroupName = "Raw String Load",
+            Description = "0=Fresh start (default). 1=Load pre-built raw string from file and replay through pipeline before live trading.")]
+        public int StartMode { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Raw String File Path", Order = 2, GroupName = "Raw String Load",
+            Description = "Path to file produced by LONG_SHORT_rawString_recorder. "
+                        + "MUST match Direction=SHORT, StopLossPoints, ProfitTargetPoints. "
+                        + "Only used when StartMode=1.")]
+        public string RawStringFilePath { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, int.MaxValue)]
+        [Display(Name = "Max File Age (minutes)", Order = 3, GroupName = "Raw String Load",
+            Description = "Maximum age of last bit in file before rejecting as stale. "
+                        + "Default 10 min — Part A must be actively running when Part B loads. "
+                        + "Strategy terminates if last bit is older than this threshold.")]
+        public int MaxFileAgeMinutes { get; set; }
 
         #endregion
     }
