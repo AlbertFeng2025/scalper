@@ -30,9 +30,18 @@ using NinjaTrader.NinjaScript.Strategies;
 //   between this recorder and the Layer strategy that loads the file.
 //   File name encodes these settings for visual verification.
 //
+// LONG_SHORT_rawString_recorder  v2
+//
+// CHANGES FROM v1:
+//   Added 'bitStringForHuman' column to CSV output.
+//   Each row now has: timestamp, bit, bitStringForHuman
+//   bitStringForHuman grows left→right oldest→newest.
+//   Copy the value from the LAST data line to use directly
+//   in trade_filter.py as the market_string parameter.
+//
 // FILE BEHAVIOR:
-//   On enable  → overwrites file (fresh session)
-//   Each slice → appends: "timestamp, bit"
+//   On enable  → overwrites file, resets bitStringForHuman (fresh session)
+//   Each slice → appends: "timestamp, bit, bitStringForHuman"
 //   On disable → file stays as-is
 //
 // NOTE FOR HISTORICAL RESEARCH:
@@ -64,6 +73,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double sliceTargetPrice = 0.0;
         private int    sliceCount       = 0;
         private int    bitCount         = 0;   // total bits recorded
+
+        // ── cumulative bit string for human reading ───────────────────────────
+        // Grows left→right oldest→newest as each bit is appended.
+        // The last line of the CSV always shows the complete raw string.
+        // Copy from the last data row to use in trade_filter.py directly.
+        private System.Text.StringBuilder bitStringForHuman = new System.Text.StringBuilder();
 
         // ── timing ────────────────────────────────────────────────────────────
         private DateTime lastCheckTime  = DateTime.MinValue;
@@ -240,15 +255,21 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                     Directory.CreateDirectory(dir);
 
+                // Reset cumulative string on fresh session
+                bitStringForHuman.Clear();
+
                 // Overwrite file — fresh session
                 // (See historical research note in header for continuous mode)
                 File.WriteAllText(LogFilePath,
-                    "# LONG_SHORT_rawString_recorder v1\n"
+                    "# LONG_SHORT_rawString_recorder v2\n"
                     + "# enable_time: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "\n"
                     + "# direction: "   + Direction + "\n"
                     + "# stop_pts: "    + StopLossPoints + "\n"
                     + "# profit_pts: "  + ProfitTargetPoints + "\n"
-                    + "# format: timestamp, bit\n"
+                    + "# format: timestamp, bit, bitStringForHuman\n"
+                    + "#   bit              = outcome of this slice (0=loss 1=win)\n"
+                    + "#   bitStringForHuman= cumulative string oldest→newest\n"
+                    + "#                     COPY FROM LAST DATA LINE for trade_filter.py\n"
                     + "#\n");
             }
             catch (Exception ex)
@@ -261,8 +282,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             try
             {
+                // grow the cumulative string
+                bitStringForHuman.Append(bit.ToString());
+
                 string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
-                            + ", " + bit + "\n";
+                            + ", " + bit
+                            + ", " + bitStringForHuman.ToString()
+                            + "\n";
                 File.AppendAllText(LogFilePath, line);
             }
             catch (Exception ex)
