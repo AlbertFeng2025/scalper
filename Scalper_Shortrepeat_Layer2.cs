@@ -975,8 +975,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string pattern = LogBaseName + "_*.csv";
                 var files = Directory.GetFiles(LogFolder, pattern);
                 if (files == null || files.Length == 0) return null;
+                // EXCLUDE diag-log files (they end in "-diagLog.csv"). The diag log
+                // is written on every startup/slice so its LastWriteTime is newer than
+                // the data file, and it has no data rows — picking it would make the
+                // reader see "unreadable/empty" and wrongly FRESH-start.
+                var dataFiles = files
+                    .Where(p => !Path.GetFileNameWithoutExtension(p)
+                                     .EndsWith("-diagLog", StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+                if (dataFiles.Length == 0) return null;
                 // newest by last write time
-                return files.OrderByDescending(f => File.GetLastWriteTime(f)).First();
+                return dataFiles.OrderByDescending(p => File.GetLastWriteTime(p)).First();
             }
             catch (Exception ex)
             {
