@@ -63,7 +63,7 @@ def A_layer2_wildcard_tester(
         rawString += b
         if waitF1:
             waitF1 = False
-            f1 += b
+            f1 += b          # layer-1 outcome string grows here
             isArmed = m2(f1)
         if m1(rawString):
             waitF1 = True
@@ -71,10 +71,17 @@ def A_layer2_wildcard_tester(
             pending = True
 
     n = len(string)
+
+    # ---- per-layer percentages (step-by-step filtration) ----
+    raw_hits = string.count(target_bit)
+    raw_pct = (raw_hits / n * 100) if n else 0.0
+    f1_hits = f1.count(target_bit)
+    f1_pct = (f1_hits / len(f1) * 100) if f1 else 0.0
+
     fire_count = len(trades)
     hits = sum(1 for t in trades if t == target_bit)
     fired_pct = (hits / fire_count * 100) if fire_count else 0.0
-    base_pct = (string.count(target_bit) / n * 100) if n else 0.0
+    base_pct = raw_pct
 
     def max_run(seq, ch):
         m = c = 0
@@ -96,6 +103,11 @@ def A_layer2_wildcard_tester(
     return {
         "string_length": n,
         "baseline_pct": round(base_pct, 1),
+        "raw_pct": round(raw_pct, 1),
+        "raw_count": f"{raw_hits}/{n}",
+        "layer1_pct": round(f1_pct, 1),
+        "layer1_count": f"{f1_hits}/{len(f1)}",
+        "layer1_string": f1,
         "fire_count": fire_count,
         "fire_rate_pct": round(fire_rate, 1),
         "bits_per_fire": round(bits_per_fire, 1),
@@ -116,14 +128,18 @@ def print_report(result, F1="011", F2="1*11", wild_bit='0', book=None):
     print(f"  F1 = {F1}   F2 = {F2}   (* = one-or-more '{wild_bit}')")
     print("-" * 60)
     print(f"  string length            : {result['string_length']}")
-    print(f"  baseline P(1)            : {result['baseline_pct']}%   <- whole-string")
-    print(f"  fire count (trades)      : {result['fire_count']}")
+    print(f"  STEP-BY-STEP FILTRATION (P(1) should climb each layer):")
+    print(f"    RAW            : {result['raw_pct']}%  ({result['raw_count']})")
+    print(f"    LAYER1 outcome : {result['layer1_pct']}%  ({result['layer1_count']})   "
+          f"after F1={F1}")
+    print(f"    LAYER2 (trade) : {result['fired_pct']}%  ({result['fired_count']})   "
+          f"after F2={F2}   <- THE ANSWER")
     print(f"  fire rate                : {result['fire_rate_pct']}% of bits  "
           f"(~1 per {result['bits_per_fire']} bits)")
-    print(f"  FIRED P(1)               : {result['fired_pct']}%  "
-          f"({result['fired_count']})   <- THE ANSWER")
     print(f"  max 0-in-a-row (losing)  : {result['max_nontarget_in_a_row']}")
     print(f"  max 1-in-a-row (winning) : {result['max_target_in_a_row']}")
+    print(f"  --- strings ---")
+    print(f"  layer1 outcome string    : {result['layer1_string']}")
     print(f"  trade string             : {result['trades_string']}")
     print("=" * 60)
 
