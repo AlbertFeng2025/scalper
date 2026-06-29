@@ -3,16 +3,16 @@
 build_historical_recorder_with_qualified.py
 --------------------------------------------
 Parses high-resolution historical tick data and replicates the NinjaScript
-'LONG_SHORT_rawString_recorder' slice logic, AND (optionally) builds two
+'LONG_SHORT_rawString_recorder' slice logic, AND (optionally) builds THREE
 "qualified" subsequences of the raw string based on per-slice metadata:
 
   RAW string             : every resolved slice's bit (the baseline; identical
                            to the original build_historical_recorder output).
-  VOLUME-QUALIFIED string : only bits whose slice traded enough volume
-                           (slice_volume >= vol_threshold * trailing-avg volume).
-  SPEED-QUALIFIED string  : only bits whose slice resolved fast enough
-                           (build_time <= trailing-avg build_time / spd_threshold,
-                            i.e. at least spd_threshold x faster than recent avg).
+  VOLUME-QUALIFIED       : only bits whose slice traded within the volume range
+                           (e.g., between 1.5x and 100x trailing-avg volume).
+  SPEED-QUALIFIED        : only bits whose slice resolved within the speed range
+                           (e.g., between 1.5x and 100x faster than recent avg).
+  DUAL-QUALIFIED         : only bits that passed BOTH the volume and speed tests.
 
 WHY: the bare 1/0 throws away HOW a bit formed. A '1' that ripped 20pts in
 0.3s on heavy volume is a different event than a '1' that drifted there in 8s
@@ -24,15 +24,8 @@ NT tick replay format (confirmed against NinjaTrader docs):
     index:   0(ts)          1   2   3   4
 So bid = parts[2], ask = parts[3], volume = parts[4].
 
-QUALIFICATION MECHANISM (locked with user):
-  - The qualified strings are SUBSEQUENCES: an unqualified bit is OMITTED.
-  - Trailing average = last `lookback` slices (ALL slices, regardless of
-    qualification) — reflects actual recent market conditions.
-  - During the first `lookback`-slice warm-up there is no full average, so
-    bits are marked NOT qualified (qualified strings begin after warm-up).
-
 USAGE: set BUILD_QUALIFIED=False to reproduce the OLD raw-only output exactly,
-or True to also emit the two qualified strings. Try ONE day first.
+or True to also emit the qualified strings. Try ONE day first.
 """
 
 import os
@@ -50,8 +43,10 @@ def generate_raw_string_from_history(
     check_interval_seconds: int,
     build_qualified: bool = False,
     lookback: int = 10,
-    vol_threshold: float = 1.5,
-    spd_threshold: float = 1.5,
+    vol_lower_bound: float = 1.5,
+    vol_upper_bound: float = 100.0,
+    spd_lower_bound: float = 1.5,
+    spd_upper_bound: float = 100.0,
 ):
     direction = direction.upper()
     if direction not in ["LONG", "SHORT"]:
@@ -60,6 +55,7 @@ def generate_raw_string_from_history(
     binary_chars = []          # RAW string
     vol_qualified_chars = []   # VOLUME-qualified subsequence
     spd_qualified_chars = []   # SPEED-qualified subsequence
+    dual_qualified_chars = []  # BOTH Volume AND Speed qualified subsequence
 
     # State Machine Variables (Matching C# Defaults)
     in_slice = False
@@ -87,8 +83,9 @@ def generate_raw_string_from_history(
     print(f"   Stop Loss      : {stop_loss} points")
     print(f"   Time Throttle  : {check_interval_seconds} second(s)")
     if build_qualified:
-        print(f"   Qualified      : ON  (lookback={lookback}, "
-              f"vol>={vol_threshold}x avg, speed>={spd_threshold}x faster)")
+        print(f"   Qualified      : ON  (lookback={lookback})")
+        print(f"      Vol bounds  : [{vol_lower_bound}x, {vol_upper_bound}x] avg")
+        print(f"      Spd bounds  : [{spd_lower_bound}x, {spd_upper_bound}x] avg")
     else:
         print(f"   Qualified      : OFF (raw string only)")
     print(f"   Processing     : {source_file}")
@@ -149,18 +146,37 @@ def generate_raw_string_from_history(
 
                     if build_qualified:
                         build_time = current_time_secs - slice_start_time
+                        
                         # decide qualification using the trailing averages
-                        # (computed from PRIOR slices, before adding this one)
                         if len(recent_volumes) == lookback:
                             avg_vol = sum(recent_volumes) / lookback
                             avg_bt = sum(recent_buildtimes) / lookback
-                            # volume: this slice >= threshold x avg
-                            if avg_vol > 0 and slice_volume_accum >= vol_threshold * avg_vol:
-                                vol_qualified_chars.append(bit)
-                            # speed: this slice resolved >= threshold x faster
-                            # (build_time <= avg_bt / threshold)
-                            if avg_bt > 0 and build_time <= avg_bt / spd_threshold:
-                                spd_qualified_chars.append(bit)
+                            
+                            vol_ok = False
+                            spd_ok = False
+
+                            # VOLUME CHECK: bounded by lower and upper multipliers
+                            if avg_vol > 0:
+                                min_vol = vol_lower_bound * avg_vol
+                                max_vol = vol_upper_bound * avg_vol
+                                if min_vol <= slice_volume_accum <= max_vol:
+                                    vol_ok = True
+                                    vol_qualified_chars.append(bit)
+
+                            # SPEED CHECK: bounded by lower and upper multipliers
+                            # (A higher multiplier means less time. e.g., 5x faster = avg_bt / 5)
+                            if avg_bt > 0:
+                                min_time = avg_bt / spd_upper_bound if spd_upper_bound > 0 else 0
+                                max_time = avg_bt / spd_lower_bound if spd_lower_bound > 0 else float('inf')
+                                
+                                if min_time <= build_time <= max_time:
+                                    spd_ok = True
+                                    spd_qualified_chars.append(bit)
+                            
+                            # DUAL CHECK: passed both volume and speed constraints
+                            if vol_ok and spd_ok:
+                                dual_qualified_chars.append(bit)
+
                         # update trailing windows with THIS slice (all slices)
                         recent_volumes.append(slice_volume_accum)
                         recent_buildtimes.append(build_time)
@@ -201,13 +217,19 @@ def generate_raw_string_from_history(
     if build_qualified:
         vol_string = "".join(vol_qualified_chars)
         spd_string = "".join(spd_qualified_chars)
+        dual_string = "".join(dual_qualified_chars)
+        
         base, ext = os.path.splitext(result_file)
         vol_path = base + "_VOLqualified" + ext
         spd_path = base + "_SPEEDqualified" + ext
+        dual_path = base + "_DUALqualified" + ext
+        
         with open(vol_path, 'w') as vf:
             vf.write(vol_string)
         with open(spd_path, 'w') as sf:
             sf.write(spd_string)
+        with open(dual_path, 'w') as df:
+            df.write(dual_string)
 
     execution_time = round(time.time() - start_perf_time, 2)
 
@@ -227,9 +249,12 @@ def generate_raw_string_from_history(
         print(f"     length {len(spd_string):,} ({len(spd_string)/max(len(raw_string),1)*100:.0f}% of raw) "
               f"| P(1)={p1(spd_string):.1f}%")
         print(f"     head {spd_string[:80]}")
+        print(f"   DUAL-qualified : {dual_path}")
+        print(f"     length {len(dual_string):,} ({len(dual_string)/max(len(raw_string),1)*100:.0f}% of raw) "
+              f"| P(1)={p1(dual_string):.1f}%")
+        print(f"     head {dual_string[:80]}")
         print("-" * 65)
-        print("   COMPARE: does VOL/SPEED-qualified P(1) beat RAW P(1)?")
-        print("   (then apply the 011/1*11 filter to each and compare again)")
+        print("   COMPARE: do the qualified strings beat RAW P(1)?")
     print("=" * 65)
 
 
@@ -239,15 +264,22 @@ if __name__ == "__main__":
     PARAM_DIRECTION   = "LONG"     # "LONG" or "SHORT"
     PARAM_STOP_LOSS   = 20.0
     PARAM_PROFIT_TAKE = 20.0
-    PARAM_THROTTLE    = 1           # match CheckIntervalSeconds
+    PARAM_THROTTLE    = 1          # match CheckIntervalSeconds
 
     # --- the new switch: False = old raw-only; True = also build qualified ---
     BUILD_QUALIFIED   = True
     LOOKBACK          = 10
-    VOL_THRESHOLD     = 1.5        # slice volume >= 1.5x trailing avg
-    SPD_THRESHOLD     = 1.5         # slice resolved >= 1.5x faster than avg
+    
+    # Range Bounds Example: 
+    # Between 1.5x and 100.0x the average volume/speed
+    VOL_LOWER_BOUND   = 0.1
+    VOL_UPPER_BOUND   = 0.5  
+    
+    SPD_LOWER_BOUND   = 0.1   
+    SPD_UPPER_BOUND   = 0.5  
+    
     FILE_SOURCE       = r"C:\Users\chpfe\Downloads\6-22MNQ 09-26.Last2.txt"
-    FILE_RESULT       = r"C:\Users\chpfe\Downloads\qualifiedto23morningrawString_LONG_20stop_20profit.txt"
+    FILE_RESULT       = r"C:\Users\chpfe\Downloads\qualifiedto23morningrawString_LONG_20stop_20profitmix.txt"
 
     generate_raw_string_from_history(
         source_file            = FILE_SOURCE,
@@ -258,6 +290,8 @@ if __name__ == "__main__":
         check_interval_seconds = PARAM_THROTTLE,
         build_qualified        = BUILD_QUALIFIED,
         lookback               = LOOKBACK,
-        vol_threshold          = VOL_THRESHOLD,
-        spd_threshold          = SPD_THRESHOLD,
+        vol_lower_bound        = VOL_LOWER_BOUND,
+        vol_upper_bound        = VOL_UPPER_BOUND,
+        spd_lower_bound        = SPD_LOWER_BOUND,
+        spd_upper_bound        = SPD_UPPER_BOUND,
     )
