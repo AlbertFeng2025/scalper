@@ -2,14 +2,14 @@
 #
 # PURE MATH. String of 0/1 only.
 #
-# Standard Layer-3 filter pipeline (F1 -> F2 -> F3 -> chase target). ANY filter
-# pattern may contain the flexible wildcard '*' meaning "a run of >=1 of a
-# specified bit" (default the gap bit is '0'). Wildcards may appear in any
-# layer, and the matcher allows the gap to overlay/absorb any run length.
+# Standard Layer-3 filter pipeline (F1 -> F2 -> F3 -> chase target). A filter
+# pattern may contain TWO kinds of flexible wildcard (mix them freely, any layer):
+#   '*'  = one-or-more 0s   (a gap / run of zeros)
+#   '?'  = one-or-more 1s   (a run of ones)
 #
-#   "1*11" with wild_bit='0'  ->  1, then one-or-more 0s, then 1, then 1
-#                                 (tail-anchored; matches ...10011, ...100011, ...1011)
-#   "011"  (no '*')           ->  plain fixed pattern
+#   "1*11" -> 1, one-or-more 0s, 1, 1      (tail: ...10011, ...100011, ...1011)
+#   "0?0"  -> 0, one-or-more 1s, 0         (tail: ...010, ...0110, ...01110)
+#   "011"  -> plain fixed pattern (no wildcard)
 #
 # PIPELINE (same as the NinjaTrader Layer-3 strategy):
 #   for each bit:
@@ -36,13 +36,30 @@ import re
 
 
 def make_matcher(pattern, wild_bit='0'):
-    """Return f(s) -> bool: does s END WITH pattern? '*' = one-or-more wild_bit.
-       The '+' (one-or-more) lets the gap overlay/absorb any run length."""
-    if '*' not in pattern:
+    """Return f(s) -> bool: does s END WITH pattern (tail-anchored)?
+
+    TWO wildcards are supported and may be mixed freely in one pattern:
+       '*'  = one-or-more 0s   (a gap / run of zeros)
+       '?'  = one-or-more 1s   (a run of ones)
+    Everything else ('0' or '1') is a single fixed bit.
+
+    Examples (all tail-anchored - must match at the END of the string):
+       "1*11" -> 1, some 0s, 1, 1          (10011, 100011, 1011, ...)
+       "0?0"  -> 0, some 1s, 0             (010, 0110, 01110, ...)   island of 1s
+       "1*1?1"-> 1, some 0s, 1, some 1s, 1 (mixed both wildcards)
+    Read left-to-right as you type it; the matcher checks the last char (anchor)
+    first and only looks further back if the anchor matches (so it's cheap).
+    """
+    if '*' not in pattern and '?' not in pattern:
         return lambda s: s.endswith(pattern)
     rx = ""
     for ch in pattern:
-        rx += (wild_bit + "+") if ch == '*' else ch
+        if ch == '*':
+            rx += wild_bit + "+"      # one-or-more 0s (default wild_bit)
+        elif ch == '?':
+            rx += "1+"                # one-or-more 1s
+        else:
+            rx += ch
     cre = re.compile(rx + "$")
     return lambda s: cre.search(s) is not None
 
