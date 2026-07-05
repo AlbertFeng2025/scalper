@@ -1,0 +1,127 @@
+# -*- coding: utf-8 -*-
+"""
+trade_qty_optimizer.py
+----------------------
+A strict, lookahead-free backtesting engine for optimizing trade quantities 
+based on historical binary outcome patterns (1 = Win, 0 = Loss).
+Includes Breakeven Win Rate analysis.
+"""
+
+def trade_qty_optimizer(trade_string: str, win_points: float, loss_points: float, rules: dict, default_qty: int = 1):
+    """
+    Simulates a variable-quantity strategy based on pattern rules.
+    """
+    
+    # Sort the rules by length (longest first).
+    sorted_patterns = sorted(rules.keys(), key=len, reverse=True)
+    
+    total_dynamic_profit = 0
+    wins = 0
+    losses = 0
+    history = ""
+    
+    trade_log = []
+
+    for i, char in enumerate(trade_string):
+        
+        # ─── STEP 1: SIZE THE TRADE (STRICTLY LOOKING AT HISTORY) ───
+        qty = default_qty
+        for pattern in sorted_patterns:
+            if history.endswith(pattern):
+                qty = rules[pattern]
+                break
+        
+        # ─── STEP 2: EXECUTE THE TRADE ───
+        if char == '1':
+            pnl = qty * win_points
+            total_dynamic_profit += pnl
+            wins += 1
+            trade_log.append(f"Trade {i+1:03d} | History: {history[-3:]:>3} | Result: W | Qty: {qty} | PnL: +{pnl}")
+        elif char == '0':
+            pnl = qty * loss_points
+            total_dynamic_profit -= pnl
+            losses += 1
+            trade_log.append(f"Trade {i+1:03d} | History: {history[-3:]:>3} | Result: L | Qty: {qty} | PnL: -{pnl}")
+            
+        # ─── STEP 3: UPDATE HISTORY (AFTER EXECUTION) ───
+        history += char
+
+    # Calculate analytics
+    total_trades = len(trade_string)
+    baseline_profit = (wins * win_points) - (losses * loss_points)
+    actual_win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
+    
+    # Breakeven Math
+    # Formula: Risk / (Reward + Risk)
+    breakeven_rate = (loss_points / (win_points + loss_points)) * 100
+
+    # Compile final report
+    return {
+        "Total_Trades": total_trades,
+        "Wins": wins,
+        "Losses": losses,
+        "Actual_Win_Rate": actual_win_rate,
+        "Breakeven_Rate": breakeven_rate,
+        "Dynamic_Profit": total_dynamic_profit,
+        "Baseline_Profit": baseline_profit,
+        "Edge_Gained": total_dynamic_profit - baseline_profit,
+        "Log": trade_log
+    }
+
+# ─── EXECUTION BLOCK ──────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    
+    # 1. Define Market Parameters
+    WIN_POINTS = 19.0
+    LOSS_POINTS = 32.0
+    
+    # 2. Define the Test String
+    TEST_STRING = "1001010010111111111111111100110001001100111111111110000111111100110011000111111101101101100011011111101011010100001111101011111111111110110101110001111111111011111100110110000011110010"
+    
+    # 3. Define the Qty Art Rules
+    # Example: "If history ends in '011', trade 2. If '01', trade 1. If '0', trade 0."
+    QTY_RULES = {
+        "0111": 3,
+        "011": 2,
+        "01":  1,
+        "0":   0
+    }
+    
+    DEFAULT_QUANTITY = 1
+    
+    # Run the Optimizer
+    results = trade_qty_optimizer(
+        trade_string = TEST_STRING,
+        win_points   = WIN_POINTS,
+        loss_points  = LOSS_POINTS,
+        rules        = QTY_RULES,
+        default_qty  = DEFAULT_QUANTITY
+    )
+    
+    # Print the Summary
+    print("="*60)
+    print("🚀 TRADE QTY OPTIMIZER REPORT")
+    print("="*60)
+    print(f" Total Trades : {results['Total_Trades']}")
+    print(f" Wins / Losses: {results['Wins']} W / {results['Losses']} L")
+    print("-" * 60)
+    
+    # Display Breakeven vs Actual
+    print(f" Req. Breakeven Win Rate : {results['Breakeven_Rate']:.2f}%")
+    print(f" Actual String Win Rate  : {results['Actual_Win_Rate']:.2f}%")
+    
+    if results['Actual_Win_Rate'] >= results['Breakeven_Rate']:
+        print(" System Health           : [✅ MATHEMATICAL EDGE DETECTED]")
+    else:
+        print(" System Health           : [⚠️ NEGATIVE RAW EDGE (Relies on Qty Art)]")
+        
+    print("-" * 60)
+    print(f" Baseline PnL : {results['Baseline_Profit']:+} points (Flat 1 Qty)")
+    print(f" Dynamic PnL  : {results['Dynamic_Profit']:+} points (Qty Art Rules)")
+    print(f" Edge Gained  : {results['Edge_Gained']:+} points via sizing strategy")
+    print("="*60)
+    
+    # Optional: Print the first 15 trades to audit the logic
+    print("\n[ Audit Log - First 15 Trades ]")
+    for log_entry in results['Log'][:15]:
+        print(log_entry)
