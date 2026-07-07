@@ -33,8 +33,9 @@ def A_layer2_tester_with_full_output(string, F1, F2):
 
 # --- Test ---
 s = "0110110111100011111111110100101111111001111101110001110011010011011010101111111011000111101101111010111111111011111101111101111100110011011011100011111101110011111011110111100101110010011100001101110101011011100111101111111110111111011101111011111110010110111001111101101110101001101010111111100110111100111101110000011001001011101111000111110111011010001110101011111011011110111101011111010010011111110101110"
-positions, outcomes = A_layer2_tester_with_full_output(s, F1="101010", F2="0")
-
+# the F2 is not enforced in this test, but it is included for completeness, that means, it is one layer filter.
+positions, outcomes = A_layer2_tester_with_full_output(s, F1="01011", F2="0")
+print(f"Percentage of 1's in input string: {s.count('1') / len(s) * 100:.2f}%")
 print(f"Outcome string: {outcomes}")
 print(f"Total trades captured: {len(positions)}")
 print(f"Percentage of 1's in outcomes: {outcomes.count('1') / len(outcomes) * 100:.2f}%")
