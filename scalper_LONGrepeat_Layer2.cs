@@ -128,15 +128,27 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string activeLogFilePath = null;
 
         // ── qty multiplier table ──────────────────────────────────────────────
+        // Researched default: the {'0':2} rule — size up to x2 on the trade that
+        // FOLLOWS a real loss, else base qty. Longest-pattern-first is preserved
+        // so the table can be extended later (first tail-match wins).
+        //
+        // Patterns here are matched against the tail of the PER-DAY session real
+        // outcome string (sessionRealOutcome), NOT the cumulative realTradeOutcome,
+        // so the qty rule resets every trading day. Wildcards ('*','?') allowed.
         private static readonly (string pattern, int multiplier)[] QtyMultiplierTable =
         {
-            ("10000", 4),
-            ("1000",  3),
-            ("100",   2),
-            ("10",    2),
+            ("0", 2),   // {'0':2}: after any real loss (today), next trade = x2
         };
 
         private int currentQty = 1;
+
+        // ── per-day (session) real outcome, drives the qty rule; resets daily ──
+        private StringBuilder sessionRealOutcome = new StringBuilder();
+        private int sessionDayKey = -1;   // yyyymmdd of the current NY session day
+
+        // Safety cap for the qty rule: never size up when already down this many
+        // real trades in the CURRENT session. 0 = disabled.
+        private int qtyMaxLossesForSizeUp = 3;
 
         // ── shutdown ─────────────────────────────────────────────────────────
         private bool   pendingFlatten = false;
@@ -171,34 +183,39 @@ namespace NinjaTrader.NinjaScript.Strategies
                 BarsRequiredToTrade          = 0;
                 IsUnmanaged                  = false;
 
-                // ── defaults ──────────────────────────────────────────────────
-                EnableTradingHours   = false;
-                TradingStartHour     = 9;
+                // ── defaults (researched LONG 32/19; regime-dependent) ─────────
+                // Validated: LONG 32/19, F1=10? (=101+), F2=110, morning window
+                // 09:30–11:30 ET. LONG is REGIME-DEPENDENT (makes almost all its
+                // money on up-days), so it ships with real orders OFF: enable it
+                // MANUALLY only on days you judge to be up-days. {'0':2} qty rule
+                // available (per-day) but off by default.
+                EnableTradingHours   = true;    // restrict to the researched window
+                TradingStartHour     = 9;       // 09:30 ET = morning_open start (6:30 PT)
                 TradingStartMinute   = 30;
-                TradingEndHour       = 16;
-                TradingEndMinute     = 0;
+                TradingEndHour       = 11;      // 11:30 ET = morning_open end (8:30 PT)
+                TradingEndMinute     = 30;
                 StrategyLifeMinutes  = 1440;   // 24h; lifetime no longer the main control
                 CheckIntervalSeconds = 1;
                 UseMarketEntry       = true;
                 LimitOffsetPoints    = 5;
-                StopLossPoints       = 10;
-                ProfitTargetPoints   = 10;
+                StopLossPoints       = 32;      // researched LONG stop
+                ProfitTargetPoints   = 19;      // researched LONG target
                 EnableTrailingStop   = false;
                 TrailDistancePoints  = 10;
-                EnableRealOrder      = false;
-                Filter1Pattern       = "01";
-                Filter2Pattern       = "11";
+                EnableRealOrder      = false;   // MANUAL enable only on believed up-days
+                Filter1Pattern       = "10?";   // 101+  (V-recovery)
+                Filter2Pattern       = "110";    // LONG-side L1 confirm (win-win-loss)
                 BaseQuantity         = 1;
-                EnableQtyIncrement   = false;
+                EnableQtyIncrement   = false;   // {'0':2} rule; enable after live-validating
                 MaxTotalSliceCount   = 100000; // high; not the main control anymore
-                MaxRealLossInARow    = 3;
+                MaxRealLossInARow    = 5;       // plan for MCL up to 5-6 (backtest MCL=3 is a floor)
 
                 // logging — folder + base name; timestamp appended per session
                 LogFolder            = @"C:\temp";
                 LogBaseName          = "scalper_LONGrepeat_Layer2";
 
                 // gap thresholds
-                GapToleranceMinutes  = 5;
+                GapToleranceMinutes  = 7;
                 GapCeilingHours      = 4;
             }
             else if (State == State.Configure)
@@ -339,6 +356,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                         ReDerivePipelineFlags();
                         activeLogFilePath = latest;     // keep same file
                         reason = gd.reason;
+
+                        // Per-day qty session: on RESUME we start the qty session
+                        // FRESH (empty) and set the day key to the current NY day.
+                        // RESUME only happens for small same-session gaps, so the
+                        // first post-reconnect real trade simply uses base qty until
+                        // a new real loss occurs — conservative and safe. (The
+                        // cumulative loss-streak breaker above is still restored.)
+                        sessionRealOutcome.Clear();
+                        sessionDayKey = CurrentNyDayKey();
                     }
                 }
             }
@@ -482,22 +508,75 @@ namespace NinjaTrader.NinjaScript.Strategies
         // =====================================================================
         // CalcQty (unchanged)
         // =====================================================================
+        // =====================================================================
+        // CalcQty — researched {'0':2} per-day rule (see QtyMultiplierTable)
+        // =====================================================================
         private int CalcQty()
         {
             if (!EnableQtyIncrement) return BaseQuantity;
-            string outcome = realTradeOutcome.ToString();
+
+            // Qty rule is driven by the PER-DAY session outcome string so it
+            // resets every trading day (each day is a brand-new sizing sequence).
+            string outcome = sessionRealOutcome.ToString();
             if (outcome.Length == 0) return BaseQuantity;
+
+            // Safety cap: if already down qtyMaxLossesForSizeUp real trades in a
+            // row THIS SESSION, do not size up — stay at base to avoid amplifying
+            // a losing cluster.
+            if (qtyMaxLossesForSizeUp > 0)
+            {
+                int trailingLosses = CountTrailingLosses(outcome);
+                if (trailingLosses >= qtyMaxLossesForSizeUp)
+                {
+                    DiagLog(string.Format("[QTY] {0} trailing session losses >= cap {1} -> stay at base qty {2}",
+                        trailingLosses, qtyMaxLossesForSizeUp, BaseQuantity));
+                    return BaseQuantity;
+                }
+            }
+
+            // Longest-pattern-first: first tail-match wins. Uses the same wildcard
+            // matcher as the filters (so '0','00','0*', etc. all work here).
             foreach (var entry in QtyMultiplierTable)
             {
-                if (outcome.Length >= entry.pattern.Length && outcome.EndsWith(entry.pattern))
+                if (TailMatches(outcome, entry.pattern))
                 {
                     int qty = BaseQuantity * entry.multiplier;
-                    DiagLog(string.Format("[QTY] tail matches '{0}' -> x{1} -> qty={2}",
-                        entry.pattern, entry.multiplier, qty));
+                    DiagLog(string.Format("[QTY] session tail matches '{0}' -> x{1} -> qty={2} (sessionReal={3})",
+                        entry.pattern, entry.multiplier, qty, outcome));
                     return qty;
                 }
             }
             return BaseQuantity;
+        }
+
+        // Returns the NY-session day key (yyyymmdd) for "now". Used to detect a new
+        // trading day and roll the per-day qty session. The morning window
+        // (default 09:30–11:30 ET) is always within one NY calendar day.
+        private int CurrentNyDayKey()
+        {
+            TimeZoneInfo et;
+            try   { et = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"); }
+            catch { try { et = TimeZoneInfo.FindSystemTimeZoneById("America/New_York"); } catch { et = null; } }
+            DateTime ny = (et != null)
+                ? TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, et)
+                : DateTime.Now;
+            return ny.Year * 10000 + ny.Month * 100 + ny.Day;
+        }
+
+        // Append a real outcome bit to the per-day session string, rolling to a
+        // fresh session string when the NY day changes.
+        private void RecordSessionOutcome(int bit)
+        {
+            int key = CurrentNyDayKey();
+            if (key != sessionDayKey)
+            {
+                if (sessionDayKey != -1)
+                    DiagLog(string.Format("[QTY SESSION ROLL] new NY day {0} (was {1}) -> qty session reset. "
+                        + "prev sessionReal={2}", key, sessionDayKey, sessionRealOutcome.ToString()));
+                sessionDayKey = key;
+                sessionRealOutcome.Clear();
+            }
+            sessionRealOutcome.Append(bit.ToString());
         }
 
         // =====================================================================
@@ -561,7 +640,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 DiagLog(string.Format(
                     "FAKE SLICE #{0} entry={1:F2} stop={2:F2} target={3:F2} | isArmed={4} | rawTail={5} | f1={6}",
                     sliceCount, sliceEntryPrice, sliceStopPrice, sliceTargetPrice,
-                    isArmed, TailOf(rawString, Filter1Pattern.Length), TailOf(filter1Outcome, 8)));
+                    isArmed, TailOf(rawString, 8), TailOf(filter1Outcome, 8)));
             }
         }
 
@@ -616,6 +695,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         catch (Exception ex) { DiagLog("ForceClose error: " + ex.Message); }
                         awaitingClose = false; entryInFlight = false; workingEntryOrder = null;
                         realTradeOutcome.Append(bit.ToString());
+                        RecordSessionOutcome(bit);   // per-day qty session
                         if (bit == 0) { realLossesInARow++; DiagLog("[REAL LOSS forced] realLossesInARow=" + realLossesInARow); }
                         else { realLossesInARow = 0; DiagLog("[REAL WIN forced] realLossesInARow reset 0"); }
                         UpdatePipeline(bit);
@@ -660,20 +740,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string f1str = filter1Outcome.ToString();
                 DiagLog(string.Format("[F1 COLLECT] digit after F1='{0}' is '{1}' -> f1={2}",
                     Filter1Pattern, bit, f1str));
-                isArmed = f1str.Length >= Filter2Pattern.Length && f1str.EndsWith(Filter2Pattern);
+                isArmed = TailMatches(f1str, Filter2Pattern);
                 DiagLog(isArmed ? "[F2 MATCH] isArmed=true" : "[F2 NO MATCH] isArmed=false");
             }
 
-            bool f1Match = raw.Length >= Filter1Pattern.Length && raw.EndsWith(Filter1Pattern);
+            bool f1Match = TailMatches(raw, Filter1Pattern);
             if (f1Match)
             {
                 waitingForF1Outcome = true;
                 DiagLog("[F1 MATCH] rawString tail matches Filter1 -> next bit feeds filter1Outcome");
             }
 
-            nextIsMoney = isArmed
-                       && rawString.Length >= Filter1Pattern.Length
-                       && rawString.ToString().EndsWith(Filter1Pattern);
+            nextIsMoney = isArmed && TailMatches(raw, Filter1Pattern);
 
             DiagLog(string.Format("[PIPELINE] raw({0})={1} | f1({2})={3} | waitF1={4} | isArmed={5} | nextIsMoney={6} | realLossRow={7}",
                 rawString.Length, TailOf(rawString, 8),
@@ -690,17 +768,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             string f1str = filter1Outcome.ToString();
 
             // isArmed: does filter1Outcome currently end with Filter2Pattern?
-            isArmed = f1str.Length >= Filter2Pattern.Length && f1str.EndsWith(Filter2Pattern);
+            isArmed = TailMatches(f1str, Filter2Pattern);
 
             // waitingForF1Outcome: did the LAST bit complete an F1 match whose
             // "digit after" has not yet arrived? We cannot perfectly know if the
             // next bit was already consumed, so we set it from the current tail:
             // if rawString currently ends with Filter1Pattern, the next real bit
             // should feed filter1Outcome.
-            waitingForF1Outcome = raw.Length >= Filter1Pattern.Length && raw.EndsWith(Filter1Pattern);
+            waitingForF1Outcome = TailMatches(raw, Filter1Pattern);
 
             // nextIsMoney consistent with UpdatePipeline's definition
-            nextIsMoney = isArmed && raw.Length >= Filter1Pattern.Length && raw.EndsWith(Filter1Pattern);
+            nextIsMoney = isArmed && TailMatches(raw, Filter1Pattern);
         }
 
         // =====================================================================
@@ -753,6 +831,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     sliceCount, oName));
 
                 realTradeOutcome.Append("0");
+                RecordSessionOutcome(0);   // per-day qty session (EOD = conservative loss)
                 realLossesInARow++;
                 DiagLog("[REAL LOSS eod] realLossesInARow=" + realLossesInARow
                     + " | realTradeOutcome=" + realTradeOutcome.ToString());
@@ -783,6 +862,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         sliceCount, isStopFill ? "STOP" : "TARGET", entryFillPrice, price, entryFillQty, pnl, bit));
 
                     realTradeOutcome.Append(bit.ToString());
+                    RecordSessionOutcome(bit);   // per-day qty session
                     if (bit == 0) { realLossesInARow++; DiagLog("[REAL LOSS] realLossesInARow=" + realLossesInARow); }
                     else { if (realLossesInARow > 0) DiagLog("[REAL WIN] reset " + realLossesInARow + "->0"); realLossesInARow = 0; }
 
@@ -945,6 +1025,76 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             string s = sb.ToString();
             return s.Length <= n ? s : "..." + s.Substring(s.Length - n);
+        }
+
+        // =====================================================================
+        // WILDCARD PATTERN MATCHING
+        // =====================================================================
+        // Pattern language (matches the Python research tooling exactly):
+        //     '0'  -> literal 0
+        //     '1'  -> literal 1
+        //     '*'  -> one-or-more 0s   (regex 0+)
+        //     '?'  -> one-or-more 1s   (regex 1+)
+        // The pattern is matched against the TAIL (suffix) of the text.
+        // Because '*' / '?' expand IN PLACE, a literal that precedes them stacks:
+        //     "0*"  = 0 then 0+  = "00+" = TWO-or-more 0s
+        //     "1*"  = 1 then 0+  = "10+"
+        //     "10?" = 1,0 then 1+ = "101+"
+        //     "1*?" = 1 then 0+ then 1+ = "10+1+"
+        //
+        // Implementation: small backtracking matcher (no System.Text.RegularExpressions
+        // dependency, and it only ever runs on short tails). The pattern must consume
+        // EXACTLY the end of the text.
+        private static bool PatternHasWildcard(string pattern)
+        {
+            return pattern.IndexOf('*') >= 0 || pattern.IndexOf('?') >= 0;
+        }
+
+        // Returns true if 'pattern' matches a suffix of 'text'.
+        private static bool TailMatches(string text, string pattern)
+        {
+            if (string.IsNullOrEmpty(pattern)) return false;
+            if (text.Length == 0) return false;
+
+            if (!PatternHasWildcard(pattern))
+                return text.Length >= pattern.Length && text.EndsWith(pattern);
+
+            for (int start = text.Length - 1; start >= 0; start--)
+            {
+                if (MatchHere(text, start, pattern, 0))
+                    return true;
+            }
+            return false;
+        }
+
+        // Recursive matcher: does pattern[pi..] match text[ti..] and consume to end?
+        private static bool MatchHere(string text, int ti, string pattern, int pi)
+        {
+            while (pi < pattern.Length)
+            {
+                char pc = pattern[pi];
+
+                if (pc == '*' || pc == '?')
+                {
+                    char want = (pc == '*') ? '0' : '1';   // '*' = 0+, '?' = 1+
+                    if (ti >= text.Length || text[ti] != want) return false;
+                    ti++;
+                    int maxConsume = ti;
+                    while (maxConsume < text.Length && text[maxConsume] == want) maxConsume++;
+                    for (int consume = maxConsume; consume >= ti; consume--)
+                    {
+                        if (MatchHere(text, consume, pattern, pi + 1))
+                            return true;
+                    }
+                    return false;
+                }
+                else
+                {
+                    if (ti >= text.Length || text[ti] != pc) return false;
+                    ti++; pi++;
+                }
+            }
+            return ti == text.Length;
         }
 
         private int CountTrailingLosses(string realOutcome)
@@ -1160,22 +1310,22 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Range(0, 23)]
-        [Display(Name = "Start hour (NY, 24h)", Order = 2, GroupName = "1. Hours")]
+        [Display(Name = "Start hour (NY/Eastern, 24h)", Order = 2, GroupName = "1. Hours")]
         public int TradingStartHour { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 59)]
-        [Display(Name = "Start minute (NY)", Order = 3, GroupName = "1. Hours")]
+        [Display(Name = "Start minute (NY/Eastern)", Order = 3, GroupName = "1. Hours")]
         public int TradingStartMinute { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 23)]
-        [Display(Name = "End hour (NY, 24h)", Order = 4, GroupName = "1. Hours")]
+        [Display(Name = "End hour (NY/Eastern, 24h)", Order = 4, GroupName = "1. Hours")]
         public int TradingEndHour { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 59)]
-        [Display(Name = "End minute (NY)", Order = 5, GroupName = "1. Hours")]
+        [Display(Name = "End minute (NY/Eastern)", Order = 5, GroupName = "1. Hours")]
         public int TradingEndMinute { get; set; }
 
         [NinjaScriptProperty]
@@ -1238,12 +1388,17 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Display(Name = "Filter 1 Pattern", Order = 2, GroupName = "5. Filter & Real Order",
-            Description = "Pattern checked against rawString tail. Match -> digit appended to filter1Outcome. Default '01'.")]
+            Description = "Tail pattern on rawString. Match -> next digit feeds filter1Outcome. "
+                        + "Wildcards: '*'=one-or-more 0s, '?'=one-or-more 1s, '0'/'1'=literal. "
+                        + "They expand in place, so '0*'='00+' (two+ zeros), '10?'='101+', '1*?'='10+1+'. "
+                        + "Researched LONG default: 10?")]
         public string Filter1Pattern { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Filter 2 Pattern", Order = 3, GroupName = "5. Filter & Real Order",
-            Description = "Pattern checked against filter1Outcome tail. Match -> isArmed=true. Default '11'.")]
+            Description = "Tail pattern on filter1Outcome. Match -> isArmed=true. "
+                        + "Same wildcards as Filter 1 ('*'=0+, '?'=1+, expand in place). "
+                        + "Researched LONG default: 110")]
         public string Filter2Pattern { get; set; }
 
         [NinjaScriptProperty]
@@ -1252,10 +1407,24 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int BaseQuantity { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Enable Qty Increment (see QtyMultiplierTable in code)",
+        [Display(Name = "Enable Qty Increment ({'0':2} per-day rule)",
             Order = 2, GroupName = "6. Quantity",
-            Description = "FALSE = always BaseQuantity. TRUE = qty scales per QtyMultiplierTable in source.")]
+            Description = "FALSE = always BaseQuantity. TRUE = researched {'0':2} rule: the real "
+                        + "trade FOLLOWING a real loss is sized x2 (BaseQuantity*2), else BaseQuantity. "
+                        + "History resets every NY trading day (each day is a fresh sizing sequence). "
+                        + "Capped by 'Qty max losses for size-up' below.")]
         public bool EnableQtyIncrement { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, int.MaxValue)]
+        [Display(Name = "Qty max losses for size-up (safety cap)", Order = 3, GroupName = "6. Quantity",
+            Description = "Do NOT size up if already down this many real trades in a row THIS session "
+                        + "(prevents amplifying a losing cluster). Default 3. Set 0 to disable the cap.")]
+        public int QtyMaxLossesForSizeUp
+        {
+            get { return qtyMaxLossesForSizeUp; }
+            set { qtyMaxLossesForSizeUp = value; }
+        }
 
         [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
