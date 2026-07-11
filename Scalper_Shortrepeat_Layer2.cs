@@ -128,18 +128,38 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string activeLogFilePath = null;
 
         // ── qty multiplier table ──────────────────────────────────────────────
-        // Researched default: the {'0':2} rule — size up to x2 on the trade that
-        // FOLLOWS a real loss, else base qty. Longest-pattern-first is preserved
-        // so the table can be extended later (e.g. add "00" for a different
-        // multiplier); the first tail-match wins.
+        // LONGEST-MATCHING pattern wins (order-independent; see CalcQty). Patterns
+        // are matched against the tail of the PER-DAY session real outcome string
+        // (sessionRealOutcome), so the qty rule resets every trading day.
+        // NO wildcards here — literal 0/1 only.
         //
-        // Patterns here are matched against the tail of the PER-DAY session real
-        // outcome string (sessionRealOutcome), NOT the cumulative realTradeOutcome,
-        // so the qty rule resets every trading day. Wildcards ('*','?') are allowed
-        // here too and use the same TailMatches matcher.
+        // DESIGN (researched {'0':2} extended into a layered loss-run rule):
+        //   Every pattern starts with '1' (a WIN) on purpose — this is a bug-guard.
+        //   Sizing only kicks in on a loss run that FOLLOWED a win in the session.
+        //   If the day opens with losses (e.g. "0000..." from a data/logic bug),
+        //   NONE of these match, so those trades stay at BASE qty (x1) and never
+        //   double into a disaster. The hard stop is MaxRealLossInARow.
+        //
+        //   "10","100","1000"        -> x2  (win then 1-3 losses: our validated edge)
+        //   "10000","100000","1000000" -> 0 (win then 4-6 losses: SKIP the trade)
+        //
+        //   qty 0 == DO NOT place a real order (observe only). See CalcQty caller.
+        //
+        // *** COUPLING WARNING ***
+        //   This table must be reviewed whenever MaxRealLossInARow changes. The x0
+        //   "skip" lines only cover loss-runs up to their length; a run LONGER than
+        //   the longest pattern reverts to base qty (the leading '1' scrolls out of
+        //   range and nothing matches). With MaxRealLossInARow=3 the x0 lines are
+        //   dormant (breaker halts first). If you raise the breaker (e.g. to 7),
+        //   extend the x0 lines so every loss up to the breaker is covered.
         private static readonly (string pattern, int multiplier)[] QtyMultiplierTable =
         {
-            ("0", 2),   // {'0':2}: after any real loss (today), next trade = x2
+            ("10",      2),
+            ("100",     2),
+            ("1000",    2),
+            ("10000",   0),
+            ("100000",  0),
+            ("1000000", 0),
         };
 
         private int currentQty = 1;
@@ -147,11 +167,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ── per-day (session) real outcome, drives the qty rule; resets daily ──
         private StringBuilder sessionRealOutcome = new StringBuilder();
         private int sessionDayKey = -1;   // yyyymmdd of the current NY session day
-
-        // Safety cap for the qty rule: never size up when already down this many
-        // real trades in the CURRENT session (protects against sizing into a
-        // losing cluster). 0 = disabled.
-        private int qtyMaxLossesForSizeUp = 3;
 
         // ── shutdown ─────────────────────────────────────────────────────────
         private bool   pendingFlatten = false;
@@ -507,7 +522,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // CalcQty — researched {'0':2} per-day rule (see QtyMultiplierTable)
+        // CalcQty — researched layered per-day loss-run rule (see QtyMultiplierTable)
+        // Returns the real order quantity, or 0 meaning "SKIP the trade" (the
+        // caller must NOT place a real order when this returns 0).
+        // LONGEST-matching pattern wins (order-independent).
         // =====================================================================
         private int CalcQty()
         {
@@ -518,33 +536,27 @@ namespace NinjaTrader.NinjaScript.Strategies
             string outcome = sessionRealOutcome.ToString();
             if (outcome.Length == 0) return BaseQuantity;
 
-            // Safety cap: if already down qtyMaxLossesForSizeUp real trades in a
-            // row THIS SESSION, do not size up — stay at base to avoid amplifying
-            // a losing cluster.
-            if (qtyMaxLossesForSizeUp > 0)
+            // Longest-matching pattern wins, regardless of table order. We scan
+            // all entries and keep the match whose pattern is the longest.
+            int  bestLen  = -1;
+            int  bestMult = 1;
+            bool matched  = false;
+            foreach (var entry in QtyMultiplierTable)
             {
-                int trailingLosses = CountTrailingLosses(outcome);
-                if (trailingLosses >= qtyMaxLossesForSizeUp)
+                if (entry.pattern.Length > bestLen && TailMatches(outcome, entry.pattern))
                 {
-                    DiagLog(string.Format("[QTY] {0} trailing session losses >= cap {1} -> stay at base qty {2}",
-                        trailingLosses, qtyMaxLossesForSizeUp, BaseQuantity));
-                    return BaseQuantity;
+                    bestLen  = entry.pattern.Length;
+                    bestMult = entry.multiplier;
+                    matched  = true;
                 }
             }
 
-            // Longest-pattern-first: first tail-match wins. Uses the same wildcard
-            // matcher as the filters (so '0','00','0*', etc. all work here).
-            foreach (var entry in QtyMultiplierTable)
-            {
-                if (TailMatches(outcome, entry.pattern))
-                {
-                    int qty = BaseQuantity * entry.multiplier;
-                    DiagLog(string.Format("[QTY] session tail matches '{0}' -> x{1} -> qty={2} (sessionReal={3})",
-                        entry.pattern, entry.multiplier, qty, outcome));
-                    return qty;
-                }
-            }
-            return BaseQuantity;
+            if (!matched) return BaseQuantity;
+
+            int qty = BaseQuantity * bestMult;   // bestMult may be 0 -> skip
+            DiagLog(string.Format("[QTY] longest match len={0} -> x{1} -> qty={2} (sessionReal={3})",
+                bestLen, bestMult, qty, outcome));
+            return qty;
         }
 
         // Returns the NY-session day key (yyyymmdd) for "now". Used to detect a new
@@ -600,9 +612,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             inSlice          = true;
             isMoneySlice     = startMoney && EnableRealOrder;
 
+            // Compute qty up front. A qty of 0 means the qty rule says SKIP this
+            // trade (e.g. deep into a loss run). We demote it to an OBSERVATION
+            // slice: no real order is placed, but the slice still resolves and
+            // feeds the pipeline so the bit string stays continuous.
             if (isMoneySlice)
             {
                 currentQty = CalcQty();
+                if (currentQty <= 0)
+                {
+                    DiagLog(string.Format(
+                        "[QTY SKIP] Slice #{0} qty rule returned 0 -> NO real order, observe only. sessionReal={1}",
+                        sliceCount, sessionRealOutcome.ToString()));
+                    isMoneySlice = false;   // run as a fake/observation slice
+                }
+            }
+
+            if (isMoneySlice)
+            {
                 awaitingClose     = true;
                 entryInFlight     = true;
                 workingEntryOrder = null;
@@ -1428,22 +1455,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name = "Enable Qty Increment ({'0':2} per-day rule)",
             Order = 2, GroupName = "6. Quantity",
-            Description = "FALSE = always BaseQuantity. TRUE = researched {'0':2} rule: the real "
-                        + "trade FOLLOWING a real loss is sized x2 (BaseQuantity*2), else BaseQuantity. "
-                        + "History resets every NY trading day (each day is a fresh sizing sequence). "
-                        + "Capped by 'Qty max losses for size-up' below.")]
+            Description = "FALSE = always BaseQuantity. TRUE = researched per-day loss-run rule "
+                        + "(see QtyMultiplierTable in source): after a win, losses 1-3 => x2; "
+                        + "losses 4-6 => SKIP (no trade). Resets every NY trading day. "
+                        + "REVIEW the table whenever MaxRealLossInARow changes.")]
         public bool EnableQtyIncrement { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0, int.MaxValue)]
-        [Display(Name = "Qty max losses for size-up (safety cap)", Order = 3, GroupName = "6. Quantity",
-            Description = "Do NOT size up if already down this many real trades in a row THIS session "
-                        + "(prevents amplifying a losing cluster). Default 3. Set 0 to disable the cap.")]
-        public int QtyMaxLossesForSizeUp
-        {
-            get { return qtyMaxLossesForSizeUp; }
-            set { qtyMaxLossesForSizeUp = value; }
-        }
 
         [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
