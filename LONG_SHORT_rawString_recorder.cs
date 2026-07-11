@@ -174,17 +174,32 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Runs once per instance. A reconnect/auto-re-enable makes a NEW
             // instance, so this runs again -- but OpenOrResumeFile() will RESUME
             // the existing trading-day file rather than wipe it.
+            //
+            // IMPORTANT (boundary-safe startup): we do NOT open any file until we
+            // can read a VALID trading day from NinjaTrader. At the 3 PM CME halt /
+            // right after a reconnect the SessionIterator may not be ready yet and
+            // GetTradingDayString() returns null. If we guessed (e.g. calendar date)
+            // we could open the WRONG session's file and then never correct. Instead
+            // we leave lifeStarted=false and simply return; the next tick retries,
+            // and the moment a real trading day is available we open the correct file.
             if (!lifeStarted)
             {
+                if (sessionIter == null && BarsArray != null && BarsArray.Length > 0)
+                    sessionIter = new SessionIterator(BarsArray[0]);
+
+                string td = GetTradingDayString();
+                if (td == null)
+                {
+                    // Session not knowable yet (halt / feed warming up). Wait; do NOT
+                    // guess a file name. Retry on the next tick.
+                    return;
+                }
+
                 lifeStarted = true;
                 sliceCount  = 0;
                 bitCount    = 0;
                 inSlice     = false;
 
-                if (sessionIter == null && BarsArray != null && BarsArray.Length > 0)
-                    sessionIter = new SessionIterator(BarsArray[0]);
-
-                string td = GetTradingDayString();
                 OpenOrResumeFile(td);
 
                 Print(Name + " started."
@@ -201,7 +216,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (inSlice)
             {
                 string tdWhileInSlice = GetTradingDayString();
-                if (tdWhileInSlice != null && tdWhileInSlice != currentTradingDay)
+                if (tdWhileInSlice != null && tdWhileInSlice != currentTradingDay
+                    && string.Compare(tdWhileInSlice, currentTradingDay, StringComparison.Ordinal) > 0)
                 {
                     Print(Name + " day boundary crossed mid-slice -> ABANDON open slice"
                           + " (no bit). " + currentTradingDay + " -> " + tdWhileInSlice);
@@ -224,12 +240,29 @@ namespace NinjaTrader.NinjaScript.Strategies
             // ── detect trading-day rollover (once per throttle, NOT in a slice) ──
             // Guarded by stored-date comparison, so the IsFirstBarOfSession
             // double-fire quirk rolls the file at most once.
+            //
+            // Self-heal: if sessionIter went null (can happen after a reconnect),
+            // rebuild it so GetTradingDayString() can answer. If we still can't get
+            // a valid day, we skip the rollover this pass (never guess) and try again.
+            if (sessionIter == null && BarsArray != null && BarsArray.Length > 0)
+                sessionIter = new SessionIterator(BarsArray[0]);
+
             string nowTradingDay = GetTradingDayString();
             if (nowTradingDay != null && nowTradingDay != currentTradingDay)
             {
-                Print(Name + " trading-day rollover: " + currentTradingDay
-                      + " -> " + nowTradingDay);
-                OpenOrResumeFile(nowTradingDay);   // new date -> new file, fresh string
+                // Never roll BACKWARD to an earlier session (safety against a stale
+                // read locking us onto the wrong day). Only roll forward.
+                if (string.Compare(nowTradingDay, currentTradingDay, StringComparison.Ordinal) > 0)
+                {
+                    Print(Name + " trading-day rollover: " + currentTradingDay
+                          + " -> " + nowTradingDay);
+                    OpenOrResumeFile(nowTradingDay);   // new date -> new file, fresh string
+                }
+                else
+                {
+                    Print(Name + " IGNORING backward day change " + currentTradingDay
+                          + " -> " + nowTradingDay + " (stale read; keeping current file).");
+                }
             }
 
             StartNextSlice();
@@ -289,8 +322,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (string.IsNullOrEmpty(tradingDay))
                 {
-                    // Fallback: if NT couldn't give a trading day, use calendar date.
-                    tradingDay = DateTime.Now.ToString("yyyy-MM-dd");
+                    // SAFETY: callers now guarantee a valid trading day before calling
+                    // (see OnBarUpdate startup + rollover). We must NEVER guess a file
+                    // name from the calendar date here — at the 3 PM boundary that could
+                    // open the WRONG session's file and then never self-correct. If we
+                    // somehow got here with no day, do nothing and let the next tick
+                    // retry once a real trading day is available.
+                    Print(Name + " OpenOrResumeFile called with no trading day -> "
+                          + "SKIPPING (will retry when session is known). No file opened.");
+                    return;
                 }
 
                 currentTradingDay = tradingDay;
@@ -487,6 +527,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     // Safety: ensure a file is open (e.g. if startup was odd).
                     OpenOrResumeFile(GetTradingDayString());
+                }
+
+                if (string.IsNullOrEmpty(currentFilePath))
+                {
+                    // Still no file (session not knowable yet). Drop this one bit
+                    // rather than write to a wrong/guessed file. A single missing
+                    // bit at a boundary is acceptable (gaps are allowed by design).
+                    Print(Name + " AppendBit: no file open yet (session unknown) -> "
+                          + "bit dropped. Will record once the session file is open.");
+                    return;
                 }
 
                 bitStringForHuman.Append(bit.ToString());
