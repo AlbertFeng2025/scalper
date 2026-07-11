@@ -195,9 +195,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 EnableTrailingStop   = false;
                 TrailDistancePoints  = 10;
                 EnableRealOrder      = false;
-                Filter1Pattern       = "01";
-                Filter2Pattern       = "01";
-                Filter3Pattern       = "001";
+                Filter1Pattern       = "1";
+                Filter2Pattern       = "0";
+                Filter3Pattern       = "00";
                 BaseQuantity         = 1;
                 EnableQtyIncrement   = false;
                 MaxTotalSliceCount   = 100000;
