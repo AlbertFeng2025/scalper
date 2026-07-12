@@ -615,6 +615,26 @@ namespace NinjaTrader.NinjaScript.Strategies
             inSlice          = true;
             isMoneySlice     = startMoney && EnableRealOrder;
 
+            // ── MULTI-STRATEGY GUARD (same instrument only) ────────────────────
+            // If ANY position or live order exists on THIS instrument — placed by
+            // another strategy (e.g. the other direction's book), or by you manually
+            // / via ATM — then we do NOT place an order. We demote this money slice
+            // to an OBSERVATION slice: it still runs, still resolves, and still feeds
+            // the pipeline, so the bit string stays continuous and the filters stay
+            // valid. Only the ORDER is suppressed.
+            //
+            // This is what lets LONG and SHORT run on the same account/instrument
+            // simultaneously without ever double-positioning. First to fire wins;
+            // the other records the bit but sits out that trade.
+            if (isMoneySlice && AccountBusyOnThisInstrument())
+            {
+                DiagLog(string.Format(
+                    "[ACCOUNT BUSY] Slice #{0} -> NO real order, OBSERVATION ONLY "
+                    + "(instrument already has a position/order from another strategy or manual). "
+                    + "Bit will still be recorded.", sliceCount));
+                isMoneySlice = false;   // run as a fake/observation slice
+            }
+
             // Compute qty up front. A qty of 0 means the qty rule says SKIP this
             // trade (e.g. deep into a loss run). We demote it to an OBSERVATION
             // slice: no real order is placed, but the slice still resolves and
@@ -942,43 +962,110 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // ReadyForNewSlice (unchanged)
+        // ReadyForNewSlice  — "is THIS strategy free to start a new slice?"
         // =====================================================================
+        // *** MULTI-STRATEGY CHANGE — READ THIS ***
+        // This method now checks ONLY THIS STRATEGY'S OWN state. It deliberately
+        // does NOT look at the account, at other strategies, or at manual trades.
+        //
+        // WHY: a slice must ALWAYS be allowed to start, because a slice is how we
+        // record a bit. If we blocked the slice when another strategy held a
+        // position, this strategy would record NOTHING for that period and its
+        // rawString would develop a HOLE — which silently corrupts every filter
+        // (the pipeline state is computed from an unbroken string).
+        //
+        // The account-level check has MOVED to StartNextSlice(), where it demotes
+        // a money slice to an OBSERVATION slice (records the bit, places no order)
+        // instead of skipping the slice entirely. See [ACCOUNT BUSY] there.
+        //
+        // NOTE: 'Position' in NinjaScript is THIS STRATEGY's position, not the
+        // account's. That is exactly what we want here.
         private bool ReadyForNewSlice()
         {
-            if (inSlice)      return false;
-            if (awaitingClose) return false;
-            if (entryInFlight) return false;
-            if (Position.MarketPosition != MarketPosition.Flat) return false;
+            if (inSlice)       return false;   // this strategy is already in a slice
+            if (awaitingClose) return false;   // this strategy's money trade is still closing
+            if (entryInFlight) return false;   // this strategy has an entry order in flight
+            if (Position.MarketPosition != MarketPosition.Flat) return false;  // THIS strategy holds a position
 
+            return true;
+        }
+
+        // =====================================================================
+        // AccountBusyOnThisInstrument  — "does ANYONE hold this instrument now?"
+        // =====================================================================
+        // *** MULTI-STRATEGY CHANGE — READ THIS ***
+        // Returns TRUE if the ACCOUNT has, on THIS INSTRUMENT (same instrument
+        // only — option (a)):
+        //     - any open position (from ANY strategy, or a manual/ATM trade), OR
+        //     - any working / accepted / submitted / part-filled order.
+        //
+        // When this returns TRUE, StartNextSlice() demotes the money slice to an
+        // OBSERVATION slice: NO real order is placed, but the slice still runs,
+        // still resolves, and still feeds the pipeline — so the bit string stays
+        // continuous and the filters remain valid.
+        //
+        // PURPOSE: allows LONG and SHORT (and any other strategies) to run on the
+        // SAME account and SAME instrument at once without ever double-positioning.
+        // First strategy to fire wins the slot; the others record but do not trade.
+        //
+        // IMPORTANT CONSEQUENCE: whichever strategy fires first takes the trade.
+        // The others will MISS that trade even if they were armed. This means live
+        // fire counts will be LOWER than each strategy's standalone backtest, and
+        // that interaction was never backtested. If you run a weaker book alongside
+        // a stronger one, the weaker one can STEAL a slot from the stronger one.
+        // Recommended: keep EnableRealOrder=false on the weaker book.
+        //
+        // ON ERROR: fail SAFE -> return true (treat as busy -> observation only,
+        // no order). Never risk placing an order when we cannot verify the account.
+        private bool AccountBusyOnThisInstrument()
+        {
             try
             {
-                if (Account != null)
+                if (Account == null) return true;   // cannot verify -> do not trade
+
+                // 1) any open position on this instrument (any strategy / manual)?
+                lock (Account.Positions)
                 {
-                    lock (Account.Orders)
+                    foreach (Position p in Account.Positions)
                     {
-                        foreach (var ord in Account.Orders)
+                        if (p.Instrument == Instrument
+                            && p.MarketPosition != MarketPosition.Flat)
                         {
-                            if (ord.Instrument == Instrument
-                                && (ord.OrderState == OrderState.Working
-                                    || ord.OrderState == OrderState.Accepted
-                                    || ord.OrderState == OrderState.Submitted
-                                    || ord.OrderState == OrderState.PartFilled))
-                            {
-                                DiagLog(string.Format("ReadyForNewSlice: BLOCKED by order '{0}' state={1}.",
-                                    ord.Name ?? "", ord.OrderState));
-                                return false;
-                            }
+                            DiagLog(string.Format(
+                                "[ACCOUNT BUSY] open position on {0}: {1} qty={2} (another strategy or manual).",
+                                Instrument.FullName, p.MarketPosition, p.Quantity));
+                            return true;
                         }
                     }
                 }
+
+                // 2) any live order on this instrument (any strategy / manual)?
+                lock (Account.Orders)
+                {
+                    foreach (Order ord in Account.Orders)
+                    {
+                        if (ord.Instrument == Instrument
+                            && (ord.OrderState == OrderState.Working
+                                || ord.OrderState == OrderState.Accepted
+                                || ord.OrderState == OrderState.Submitted
+                                || ord.OrderState == OrderState.PartFilled))
+                        {
+                            DiagLog(string.Format(
+                                "[ACCOUNT BUSY] live order on {0}: '{1}' state={2} (another strategy or manual).",
+                                Instrument.FullName, ord.Name ?? "", ord.OrderState));
+                            return true;
+                        }
+                    }
+                }
+
+                return false;   // account is clear on this instrument
             }
             catch (Exception ex)
             {
-                DiagLog("ReadyForNewSlice scan error: " + ex.Message + ". Blocking.");
-                return false;
+                DiagLog("[ACCOUNT BUSY] scan error: " + ex.Message
+                    + " -> treating as BUSY (observation only, no order). Fail-safe.");
+                return true;
             }
-            return true;
         }
 
         // =====================================================================
