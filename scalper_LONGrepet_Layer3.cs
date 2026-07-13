@@ -131,6 +131,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private int currentQty = 1;
 
+        // Why was a would-be money slice demoted to an observation slice?
+        // Written into the log's "side" column so the CSV can distinguish:
+        //   null                  -> ordinary fake slice (filter simply not armed)
+        //   "OBS_OUTSIDE_HOURS"   -> armed, but outside the trading window
+        //   "OBS_ACCOUNT_BUSY"    -> armed, but another strategy/manual held the instrument
+        //   "OBS_QTY_SKIP"        -> armed, but the qty rule returned 0
+        // This matters for the forward-log: it tells you which trades the strategy
+        // WOULD have taken but did not, which is otherwise unmeasurable.
+        private string suppressReason = null;
+
         // ── per-day (session) real outcome, drives the qty rule; resets daily ──
         private StringBuilder sessionRealOutcome = new StringBuilder();
         private int sessionDayKey = -1;
@@ -273,8 +283,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             lastCheckTime = DateTime.Now;
 
-            if (!WithinTradingHours())
-                return;
+            // *** DO NOT GATE SLICING ON TRADING HOURS ***
+            // Slices must run 24h so the pipeline gets its OVERNIGHT WARM-UP.
+            // The research/backtest feeds the filter the FULL day sequence
+            // (overnight + morning) and only COUNTS fires in the trading window.
+            // If we skipped slicing outside the window, rawString would start
+            // empty at 09:30 ET with no warm-up, the filter would arm differently,
+            // and the live strategy would NOT reproduce the backtest.
+            //
+            // The trading-hours check now lives in StartNextSlice(), where it
+            // demotes a money slice to an OBSERVATION slice (records the bit,
+            // places no order) — same mechanism as [ACCOUNT BUSY] / [QTY SKIP].
 
             if (!ReadyForNewSlice())
                 return;
@@ -538,8 +557,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             sliceTargetPrice = Instrument.MasterInstrument.RoundToTickSize(sliceEntryPrice + ProfitTargetPoints);
             inSlice          = true;
             isMoneySlice     = startMoney && EnableRealOrder;
+            suppressReason   = null;   // reset; set by the guards below if demoted
 
-            // ── MULTI-STRATEGY GUARD (same instrument only) ────────────────────
+            // ── GUARD 1: TRADING HOURS (order-only gate) ───────────────────────
+            // Outside the trading window we still SLICE and RECORD the bit (the
+            // pipeline needs 24h data for its overnight warm-up — see OnBarUpdate),
+            // but we place NO order. Demote to an observation slice.
+            if (isMoneySlice && EnableTradingHours && !WithinTradingHours())
+            {
+                DiagLog(string.Format(
+                    "[OUTSIDE HOURS] Slice #{0} -> NO real order, OBSERVATION ONLY "
+                    + "(outside {1:00}:{2:00}-{3:00}:{4:00} NY/Eastern). Bit still recorded.",
+                    sliceCount, TradingStartHour, TradingStartMinute,
+                    TradingEndHour, TradingEndMinute));
+                isMoneySlice   = false;
+                suppressReason = "OBS_OUTSIDE_HOURS";
+            }
+
+            // ── GUARD 2: MULTI-STRATEGY (same instrument only) ─────────────────
             // If ANY position or live order exists on THIS instrument — placed by
             // another strategy (e.g. the other direction's book), or by you manually
             // / via ATM — then we do NOT place an order. We demote this money slice
@@ -556,7 +591,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     "[ACCOUNT BUSY] Slice #{0} -> NO real order, OBSERVATION ONLY "
                     + "(instrument already has a position/order from another strategy or manual). "
                     + "Bit will still be recorded.", sliceCount));
-                isMoneySlice = false;   // run as a fake/observation slice
+                isMoneySlice   = false;   // run as a fake/observation slice
+                suppressReason = "OBS_ACCOUNT_BUSY";
             }
 
             // qty of 0 means the qty rule says SKIP: demote to an observation slice
@@ -569,7 +605,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     DiagLog(string.Format(
                         "[QTY SKIP] Slice #{0} qty rule returned 0 -> NO real order, observe only. sessionReal={1}",
                         sliceCount, sessionRealOutcome.ToString()));
-                    isMoneySlice = false;
+                    isMoneySlice   = false;
+                    suppressReason = "OBS_QTY_SKIP";
                 }
             }
 
@@ -1198,7 +1235,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     string real = p[11].Trim();
 
                     DateTime tparsed;
-                    if (!DateTime.TryParse(ts, out tparsed)) continue;
+                    if (!DateTime.TryParse(ts,
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            System.Globalization.DateTimeStyles.None,
+                            out tparsed)) continue;   // BUG FIX: we WRITE with InvariantCulture
 
                     snap.lastBitLocal     = tparsed;
                     snap.rawString        = raw;
@@ -1236,17 +1276,72 @@ namespace NinjaTrader.NinjaScript.Strategies
             catch (Exception ex) { Print("Log header error: " + ex.Message); }
         }
 
+        // =====================================================================
+        // SafeAppend — concurrency-tolerant file append
+        // =====================================================================
+        // BUG FIX: File.AppendAllText opens the file WITHOUT sharing, so if two
+        // instances of this strategy are alive at once (which HAPPENS during
+        // NinjaTrader's auto-restart churn on a lost price connection), the second
+        // writer throws IOException and the old code SILENTLY LOST the row while the
+        // bit had already been appended to the in-memory rawString. Log and memory
+        // then diverge and the next RESUME restores a WRONG pipeline state.
+        private bool logWriteFailed = false;
+
+        private void SafeAppend(string path, string text)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                DiagLog("[LOG ERROR] no active log file path — row DROPPED: " + text.TrimEnd());
+                logWriteFailed = true;
+                return;
+            }
+
+            const int MAX_TRIES = 5;
+            for (int attempt = 1; attempt <= MAX_TRIES; attempt++)
+            {
+                try
+                {
+                    using (var fs = new FileStream(path, FileMode.Append, FileAccess.Write,
+                                                   FileShare.ReadWrite))
+                    using (var sw = new StreamWriter(fs))
+                    {
+                        sw.Write(text);
+                    }
+                    return;
+                }
+                catch (IOException)
+                {
+                    if (attempt == MAX_TRIES) break;
+                    System.Threading.Thread.Sleep(20 * attempt);
+                }
+                catch (Exception ex)
+                {
+                    DiagLog("[LOG ERROR] append failed: " + ex.Message + " — row DROPPED: " + text.TrimEnd());
+                    logWriteFailed = true;
+                    return;
+                }
+            }
+
+            DiagLog("[LOG ERROR] append failed after " + MAX_TRIES
+                + " tries (file locked by another instance?) — row DROPPED: " + text.TrimEnd());
+            logWriteFailed = true;
+        }
+
         private void WriteLogRow(double entryPrice, double exitPrice, double pnl, int bit, int qty, DateTime exitTime)
         {
             try
             {
+                // BUG FIX (timestamp consistency): ALL rows now use DateTime.Now — the
+                // SAME clock DecideGap() compares against on RESUME. Mixing the execution
+                // 'time' here with DateTime.Now elsewhere can make the RESUME gap wrong
+                // and trigger a SPURIOUS FRESH START that WIPES rawString.
                 string row = string.Format(System.Globalization.CultureInfo.InvariantCulture,
                     "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6:0.00},{7},{8},{9},{10},{11}\n",
-                    exitTime, sliceCount, "Long", qty, entryPrice, exitPrice, pnl, bit,
+                    DateTime.Now, sliceCount, "Long", qty, entryPrice, exitPrice, pnl, bit,
                     rawString.ToString(), filter1Outcome.ToString(), filter2Outcome.ToString(), realTradeOutcome.ToString());
-                File.AppendAllText(activeLogFilePath, row);
+                SafeAppend(activeLogFilePath, row);
             }
-            catch (Exception ex) { Print("Log write error: " + ex.Message); }
+            catch (Exception ex) { DiagLog("[LOG ERROR] WriteLogRow: " + ex.Message); logWriteFailed = true; }
         }
 
         private void WriteLogRowFake(double entryPrice, double exitPrice, double pnl, int bit)
@@ -1255,11 +1350,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 string row = string.Format(System.Globalization.CultureInfo.InvariantCulture,
                     "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6:0.00},{7},{8},{9},{10},{11}\n",
-                    DateTime.Now, sliceCount, "FAKE_Long", 0, entryPrice, exitPrice, pnl, bit,
+                    DateTime.Now, sliceCount,
+                    (suppressReason ?? "FAKE_Long"),   // distinguishes suppressed trades
+                    0, entryPrice, exitPrice, pnl, bit,
                     rawString.ToString(), filter1Outcome.ToString(), filter2Outcome.ToString(), realTradeOutcome.ToString());
-                File.AppendAllText(activeLogFilePath, row);
+                SafeAppend(activeLogFilePath, row);
             }
-            catch (Exception ex) { Print("Log write error (fake): " + ex.Message); }
+            catch (Exception ex) { DiagLog("[LOG ERROR] WriteLogRowFake: " + ex.Message); logWriteFailed = true; }
         }
 
         private void WriteLogRowCancelled(double entryPrice)
@@ -1270,9 +1367,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11}\n",
                     DateTime.Now, sliceCount, "CANCELLED_no_fill", 0, entryPrice, 0, 0, "-",
                     rawString.ToString(), filter1Outcome.ToString(), filter2Outcome.ToString(), realTradeOutcome.ToString());
-                File.AppendAllText(activeLogFilePath, row);
+                SafeAppend(activeLogFilePath, row);
             }
-            catch (Exception ex) { Print("Log write error (cancelled): " + ex.Message); }
+            catch (Exception ex) { DiagLog("[LOG ERROR] WriteLogRowCancelled: " + ex.Message); logWriteFailed = true; }
         }
 
         private void DiagLog(string msg)
@@ -1286,7 +1383,27 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (string.IsNullOrEmpty(dir)) dir = @"C:\temp";
                 string baseName = Path.GetFileNameWithoutExtension(activeLogFilePath ?? (LogBaseName + ".csv"));
                 string diagPath = Path.Combine(dir, baseName + "-diagLog.csv");
-                File.AppendAllText(diagPath, line + "\n");
+
+                // Concurrency-safe. NOTE: do NOT call SafeAppend here — it calls
+                // DiagLog on failure, which would recurse forever.
+                for (int attempt = 1; attempt <= 3; attempt++)
+                {
+                    try
+                    {
+                        using (var fs = new FileStream(diagPath, FileMode.Append, FileAccess.Write,
+                                                       FileShare.ReadWrite))
+                        using (var sw = new StreamWriter(fs))
+                        {
+                            sw.Write(line + "\n");
+                        }
+                        break;
+                    }
+                    catch (IOException)
+                    {
+                        if (attempt == 3) break;
+                        System.Threading.Thread.Sleep(10 * attempt);
+                    }
+                }
             }
             catch { }
         }
