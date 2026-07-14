@@ -63,6 +63,48 @@ using NinjaTrader.NinjaScript.Strategies;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
+    // #####################################################################
+    // ## READ ME — HOW TO INTERPRET THE LOG (esp. if verifying in Python) ##
+    // #####################################################################
+    //
+    // 1) rawString RESETS EVERY TRADING DAY (3:00 PM PT -> 3:00 PM PT).
+    //    The research/backtest starts each trading day with an EMPTY pipeline,
+    //    warms up through the overnight bits, and fires in the morning window.
+    //    This strategy does the same, so live reproduces the backtest.
+    //    => In the CSV rawString grows through the session then STARTS OVER at
+    //       ~15:00 PT. That is CORRECT, not a bug.
+    //    => If you copy a rawString out of this log to re-check a filter in
+    //       Python, use bits from ONE trading day only. Do NOT concatenate
+    //       across the 15:00 PT boundary.
+    //
+    // 2) slice_num is PER STRATEGY INSTANCE, not global.
+    //    NinjaTrader creates a NEW instance on every disable/re-enable —
+    //    including its own automatic restarts after a lost price connection.
+    //    Each new instance restarts slice_num at 1 while rawString is RESUMED
+    //    from the log, so slice_num WILL jump back to 1 mid-file. Expected.
+    //    Order events by TIMESTAMP, not slice_num.
+    //
+    // 3) THIS STRATEGY'S rawString WILL NOT MATCH THE STANDALONE RECORDER'S
+    //    BIT STRING, BIT FOR BIT — AND THAT IS FINE.
+    //    Both slice with identical logic, but they are INDEPENDENT slicers with
+    //    independent 1-second throttle phases, so their slice boundaries (and
+    //    therefore their bits) differ. Each string is internally consistent;
+    //    neither is "wrong". Do not try to reconcile them slice-by-slice.
+    //
+    // 4) The "side" column tells you WHY a slice did not trade:
+    //       Short / Long        -> a REAL order was placed
+    //       FAKE_Short/_Long    -> ordinary observation slice (filter not armed)
+    //       OBS_OUTSIDE_HOURS   -> armed, but outside the trading window
+    //       OBS_ACCOUNT_BUSY    -> armed, but another strategy/manual held it
+    //       OBS_QTY_SKIP        -> armed, but the qty rule returned 0
+    //    The OBS_* rows are trades the strategy WOULD have taken but did not.
+    //
+    // 5) Resets per trading day: rawString, filter1Outcome, filter2Outcome, isArmed,
+    //    waiting flags, sessionRealOutcome (qty history).
+    //    Does NOT reset: realTradeOutcome (audit), realLossesInARow (breaker).
+    //
+    // #####################################################################
+
     public class scalper_SHORTrepeat_Layer3 : Strategy
     {
         // ── strategy lifecycle ────────────────────────────────────────────────
@@ -156,7 +198,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // ── per-day (session) real outcome, drives the qty rule; resets daily ──
         private StringBuilder sessionRealOutcome = new StringBuilder();
-        private int sessionDayKey = -1;   // yyyymmdd of the current NY session day
+        private int sessionDayKey = -1;          // yyyymmdd (trading day) of the qty session
+        private int currentTradingDayKey = -1;   // trading day the pipeline belongs to          // yyyymmdd (trading day) of the qty session
+         
 
         // ── shutdown ─────────────────────────────────────────────────────────
         private bool   pendingFlatten = false;
@@ -296,6 +340,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             lastCheckTime = DateTime.Now;
 
+            // Reset the pipeline at the 3:00 PM PT trading-day boundary (matches the
+            // research). Checked BEFORE a new slice starts, so a slice straddling the
+            // boundary completes and is attributed to the day it ENTERED in.
+            CheckTradingDayRollover();
+
             // *** DO NOT GATE SLICING ON TRADING HOURS ***
             // Slices must run 24h so the pipeline gets its OVERNIGHT WARM-UP.
             // The research/backtest feeds the filter the FULL day sequence
@@ -366,8 +415,29 @@ namespace NinjaTrader.NinjaScript.Strategies
                         reason = gd.reason;
 
                         // Per-day qty session starts FRESH on RESUME (see Layer 2).
+                        // If the restored snapshot belongs to a PREVIOUS trading day,
+                        // the pipeline must start EMPTY for the new day (research resets
+                        // every trading day). Otherwise we drag yesterday's bits into today.
+                        int snapKey = TradingDayKeyOfLocal(snap.lastBitLocal);
+                        int nowKey  = CurrentTradingDayKey();
+                        if (snapKey > 0 && nowKey > 0 && snapKey != nowKey)
+                        {
+                            DiagLog(string.Format(
+                                "[RESUME ACROSS DAY BOUNDARY] snapshot is trading day {0}, now {1}. "
+                                + "Discarding restored pipeline; new day starts EMPTY (matches research).",
+                                snapKey, nowKey));
+                            rawString.Clear();
+                            filter1Outcome.Clear();
+                            filter2Outcome.Clear();
+                            isArmed             = false;
+                            waitingForF1Outcome = false;
+                            waitingForF2Outcome = false;
+                            nextIsMoney         = false;
+                        }
+                        currentTradingDayKey = nowKey;
+
                         sessionRealOutcome.Clear();
-                        sessionDayKey = CurrentNyDayKey();
+                        sessionDayKey = nowKey;
                     }
                 }
             }
@@ -399,6 +469,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     + ". Breaker intact across reconnect.");
             }
 
+            DiagLog("[NOTE] rawString RESETS at 3:00 PM PT each trading day (matches research). "
+                  + "slice_num restarts at 1 on every strategy instance. "
+                  + "This string will NOT match the standalone recorder bit-for-bit "
+                  + "(independent slicers / throttle phase) — that is expected.");
             DiagLog(Name + " ready (SHORT). EnableRealOrder=" + EnableRealOrder
                 + ", Filter1=[" + Filter1Pattern + "], Filter2=[" + Filter2Pattern + "], Filter3=[" + Filter3Pattern + "]"
                 + ", MaxRealLossInARow=" + MaxRealLossInARow
@@ -527,27 +601,91 @@ namespace NinjaTrader.NinjaScript.Strategies
             return qty;
         }
 
-        // NY-session day key (yyyymmdd) for detecting a new trading day.
-        private int CurrentNyDayKey()
+        // =====================================================================
+        // TRADING-DAY KEY  (3:00 PM Pacific -> 3:00 PM Pacific)
+        // =====================================================================
+        // MUST match the research slicer exactly:
+        //     trading_day(t) = date(t) if t >= 15:00 PT, else date(t) - 1
+        // Everything that "resets per trading day" (the filter pipeline AND the qty
+        // session) rolls on THIS boundary, so live reproduces the backtest.
+        private TimeZoneInfo PacificZone()
         {
-            TimeZoneInfo et;
-            try   { et = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"); }
-            catch { try { et = TimeZoneInfo.FindSystemTimeZoneById("America/New_York"); } catch { et = null; } }
-            DateTime ny = (et != null)
-                ? TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, et)
-                : DateTime.Now;
-            return ny.Year * 10000 + ny.Month * 100 + ny.Day;
+            try   { return TimeZoneInfo.FindSystemTimeZoneById("Pacific Standard Time"); }
+            catch { try { return TimeZoneInfo.FindSystemTimeZoneById("America/Los_Angeles"); } catch { return null; } }
+        }
+
+        private int TradingDayKeyOfLocal(DateTime localTime)
+        {
+            try
+            {
+                TimeZoneInfo pt = PacificZone();
+                DateTime ptTime;
+                if (pt == null) { ptTime = localTime; }
+                else
+                {
+                    DateTime utc = TimeZoneInfo.ConvertTimeToUtc(
+                        DateTime.SpecifyKind(localTime, DateTimeKind.Unspecified), TimeZoneInfo.Local);
+                    ptTime = TimeZoneInfo.ConvertTimeFromUtc(utc, pt);
+                }
+                DateTime d = (ptTime.TimeOfDay >= new TimeSpan(15, 0, 0))
+                             ? ptTime.Date : ptTime.Date.AddDays(-1);
+                return d.Year * 10000 + d.Month * 100 + d.Day;
+            }
+            catch { return -1; }
+        }
+
+        private int CurrentTradingDayKey() { return TradingDayKeyOfLocal(DateTime.Now); }
+
+        // =====================================================================
+        // CheckTradingDayRollover — RESET THE PIPELINE AT 3:00 PM PT
+        // =====================================================================
+        // The research starts EVERY trading day with an EMPTY pipeline, warms up
+        // through the overnight bits, and fires in the morning window. Every
+        // published number was produced that way. If the live strategy carried
+        // yesterday's bits into today it would arm differently and would NOT
+        // reproduce the backtest — with no visible symptom. So we clear here.
+        //
+        // RESETS: rawString, filter1Outcome, filter2Outcome, isArmed, waiting flags, nextIsMoney,
+        //         sessionRealOutcome (qty history)
+        // KEPT  : realTradeOutcome (audit trail), realLossesInARow (safety breaker)
+        private void CheckTradingDayRollover()
+        {
+            int key = CurrentTradingDayKey();
+            if (key < 0) return;
+
+            if (currentTradingDayKey == -1) { currentTradingDayKey = key; return; }
+
+            if (key != currentTradingDayKey)
+            {
+                DiagLog(string.Format(
+                    "[TRADING DAY ROLLOVER] {0} -> {1} (3:00 PM PT boundary). "
+                    + "Clearing pipeline to match the research. prev raw({2}). "
+                    + "realTradeOutcome and realLossesInARow are KEPT.",
+                    currentTradingDayKey, key, rawString.Length));
+
+                rawString.Clear();
+                filter1Outcome.Clear();
+                filter2Outcome.Clear();
+                isArmed             = false;
+                waitingForF1Outcome = false;
+                waitingForF2Outcome = false;
+                nextIsMoney         = false;
+
+                sessionRealOutcome.Clear();
+                sessionDayKey = key;
+                currentTradingDayKey = key;
+            }
         }
 
         // Append a real outcome bit to the per-day session string, rolling to a
         // fresh session string when the NY day changes.
         private void RecordSessionOutcome(int bit)
         {
-            int key = CurrentNyDayKey();
+            int key = CurrentTradingDayKey();   // same 3PM-PT boundary as the pipeline
             if (key != sessionDayKey)
             {
                 if (sessionDayKey != -1)
-                    DiagLog(string.Format("[QTY SESSION ROLL] new NY day {0} (was {1}) -> qty session reset. "
+                    DiagLog(string.Format("[QTY SESSION ROLL] new trading day {0} (was {1}) -> qty session reset. "
                         + "prev sessionReal={2}", key, sessionDayKey, sessionRealOutcome.ToString()));
                 sessionDayKey = key;
                 sessionRealOutcome.Clear();
