@@ -97,6 +97,10 @@ namespace NinjaTrader.NinjaScript.Strategies
     //       OBS_OUTSIDE_HOURS   -> armed, but outside the trading window
     //       OBS_ACCOUNT_BUSY    -> armed, but another strategy/manual held it
     //       OBS_QTY_SKIP        -> armed, but the qty rule returned 0
+    //       WOULDBE_TRADE       -> filter ARMED, but EnableRealOrder=false
+    //                              (observation mode: this is the trade it WOULD
+    //                               have taken — use these to forward-log a book
+    //                               you are not trading live yet)
     //    The OBS_* rows are trades the strategy WOULD have taken but did not.
     //
     // 5) Resets per trading day: rawString, filter1Outcome, filter2Outcome, isArmed,
@@ -395,7 +399,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                         filter1Outcome.Append(snap.filter1Outcome);
                         filter2Outcome.Append(snap.filter2Outcome);
                         realTradeOutcome.Append(snap.realTradeOutcome);
-                        realLossesInARow = CountTrailingLosses(snap.realTradeOutcome);
+                        // BREAKER RESTORE (day-aware): count only TODAY's trailing real
+                        // losses. realTradeOutcome is cumulative and spans days, so using it
+                        // directly would drag yesterday's losses in and re-trip the breaker
+                        // on every restart.
+                        realLossesInARow = CountTodaysTrailingLosses(latest, CurrentTradingDayKey());
                         ReDerivePipelineFlags();
                         activeLogFilePath = latest;
                         reason = gd.reason;
@@ -657,6 +665,17 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 sessionRealOutcome.Clear();
                 sessionDayKey = key;
+
+                // DAILY CIRCUIT BREAKER: a new trading day is a brand-new day for
+                // EVERYTHING except realTradeOutcome (the cumulative audit trail).
+                // If we blew through MaxRealLossInARow yesterday, that is over — today
+                // starts clean. Without this the streak would carry forever and, on
+                // restart, the breaker would re-trip instantly, bricking the strategy.
+                if (realLossesInARow > 0)
+                    DiagLog("[BREAKER RESET] new trading day -> realLossesInARow "
+                          + realLossesInARow + " -> 0");
+                realLossesInARow = 0;
+
                 currentTradingDayKey = key;
             }
         }
@@ -696,6 +715,19 @@ namespace NinjaTrader.NinjaScript.Strategies
             inSlice          = true;
             isMoneySlice     = startMoney && EnableRealOrder;
             suppressReason   = null;   // reset; set by the guards below if demoted
+
+            // OBSERVATION MODE: when EnableRealOrder=false, isMoneySlice is always false,
+            // so none of the guards below fire and every row would log as a plain FAKE_*.
+            // That would hide the whole point of observation mode — WHICH SLICES THE
+            // FILTER ARMED FOR. 'startMoney' holds that, so mark it explicitly.
+            if (startMoney && !EnableRealOrder)
+            {
+                suppressReason = "WOULDBE_TRADE";
+                DiagLog(string.Format(
+                    "[WOULD-BE TRADE] Slice #{0} the filter ARMED and this WOULD have been a "
+                    + "real order, but EnableRealOrder=false. Bit recorded; no order placed.",
+                    sliceCount));
+            }
 
             // ── GUARD 1: TRADING HOURS (order-only gate) ───────────────────────
             // Outside the trading window we still SLICE and RECORD the bit (the
@@ -1292,6 +1324,66 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
             return ti == text.Length;
+        }
+
+        // =====================================================================
+        // CountTodaysTrailingLosses — the breaker's streak, for TODAY only
+        // =====================================================================
+        // WHY: realTradeOutcome is CUMULATIVE and never resets, so counting its trailing
+        // zeros would reach BACK ACROSS the trading-day boundary into yesterday's losses.
+        // On RESUME that restores a bogus streak and re-trips the breaker immediately —
+        // bricking the strategy permanently.
+        //
+        // Instead we walk the LOG backwards and count consecutive losing REAL trades that
+        // belong to the CURRENT trading day only. We stop at:
+        //     - a winning real trade (streak broken), or
+        //     - a real trade from a PREVIOUS trading day (new day = clean slate).
+        // Observation rows (FAKE_* / OBS_* / CANCELLED_*) are skipped: they are not real
+        // trades and must never affect the breaker.
+        private int CountTodaysTrailingLosses(string path, int todayKey)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(path) || !File.Exists(path)) return 0;
+
+                string[] lines = File.ReadAllLines(path);
+                int streak = 0;
+
+                for (int i = lines.Length - 1; i >= 0; i--)
+                {
+                    string line = lines[i].Trim();
+                    if (line.Length == 0) continue;
+                    if (line.StartsWith("timestamp")) continue;
+
+                    string[] p = line.Split(',');
+                    if (p.Length < 8) continue;
+
+                    string sideCol = p[2].Trim();
+                    string bitCol  = p[7].Trim();
+
+                    if (sideCol != "Long") continue;          // real trades only
+                    if (bitCol != "0" && bitCol != "1") continue;
+
+                    DateTime ts;
+                    if (!DateTime.TryParse(p[0].Trim(),
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            System.Globalization.DateTimeStyles.None, out ts))
+                        continue;
+
+                    if (TradingDayKeyOfLocal(ts) != todayKey) break;   // previous day -> stop
+
+                    if (bitCol == "0") streak++;   // loss -> extend
+                    else break;                    // win  -> streak ends
+                }
+
+                return streak;
+            }
+            catch (Exception ex)
+            {
+                DiagLog("CountTodaysTrailingLosses error: " + ex.Message
+                    + " -> returning 0 (breaker starts clean).");
+                return 0;
+            }
         }
 
         private int CountTrailingLosses(string realOutcome)
