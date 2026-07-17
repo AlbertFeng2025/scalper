@@ -477,13 +477,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                         }
                         currentTradingDayKey = nowKey;
 
-                        // Per-day qty session: on RESUME we start the qty session
-                        // FRESH (empty). RESUME is for small gaps, so the first
-                        // post-reconnect real trade simply uses base qty until a new
-                        // real loss occurs — conservative and safe. (The cumulative
-                        // loss-streak breaker above is still restored.)
+                        // Per-day qty session: on RESUME, REBUILD today's qty history
+                        // from the log (the same source the breaker uses) instead of
+                        // clearing it. This keeps the qty rule continuous across a
+                        // disable/enable or reconnect — the {'0':2} sizing survives.
+                        // If it's a new trading day (handled just above) or there are
+                        // no real trades today yet, this returns "" -> clean start,
+                        // which is the correct behavior in those cases.
                         sessionRealOutcome.Clear();
+                        sessionRealOutcome.Append(ReadTodaysRealOutcomes(latest, nowKey));
                         sessionDayKey = nowKey;
+                        DiagLog("[QTY RESUME] rebuilt today's qty history from log: sessionReal='"
+                            + sessionRealOutcome.ToString() + "'");
                     }
                 }
             }
@@ -1477,14 +1482,34 @@ namespace NinjaTrader.NinjaScript.Strategies
         //     - a real trade from a PREVIOUS trading day (new day = clean slate).
         // Observation rows (FAKE_* / OBS_* / CANCELLED_*) are skipped: they are not real
         // trades and must never affect the breaker.
-        private int CountTodaysTrailingLosses(string path, int todayKey)
+        // =====================================================================
+        // ReadTodaysRealOutcomes — the ONE shared reader of today's real trades
+        // =====================================================================
+        // Walks the log and returns TODAY's real-trade outcome bits, oldest-first
+        // (e.g. "1101" = win,win,loss,win). This is the SINGLE SOURCE OF TRUTH for
+        // "what real trades happened today", used by BOTH:
+        //    - the qty rule   (rebuilds sessionRealOutcome on RESUME), and
+        //    - the breaker    (counts trailing losses from this string).
+        // Having one reader guarantees the two can never disagree.
+        //
+        // "Real trade" = side column is exactly "Short" (not FAKE_/OBS_/WOULDBE_/
+        // CANCELLED_). "Today" = same trading-day key (3 PM PT boundary). We stop
+        // as soon as we walk back into a previous trading day.
+        //
+        // Returns "" on any error or if there are no real trades today (both the
+        // qty rule and the breaker treat an empty string as a clean start).
+        private string ReadTodaysRealOutcomes(string path, int todayKey)
         {
             try
             {
-                if (string.IsNullOrEmpty(path) || !File.Exists(path)) return 0;
+                if (string.IsNullOrEmpty(path) || !File.Exists(path)) return "";
 
                 string[] lines = File.ReadAllLines(path);
-                int streak = 0;
+
+                // Collect today's real bits walking BACKWARD (newest first), then
+                // reverse to oldest-first so the string matches how RecordSessionOutcome
+                // builds it (append in chronological order).
+                var rev = new System.Collections.Generic.List<char>();
 
                 for (int i = lines.Length - 1; i >= 0; i--)
                 {
@@ -1509,18 +1534,32 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                     if (TradingDayKeyOfLocal(ts) != todayKey) break;   // previous day -> stop
 
-                    if (bitCol == "0") streak++;   // loss -> extend
-                    else break;                    // win  -> streak ends
+                    rev.Add(bitCol[0]);
                 }
 
-                return streak;
+                rev.Reverse();   // -> oldest-first, matching sessionRealOutcome
+                return new string(rev.ToArray());
             }
             catch (Exception ex)
             {
-                DiagLog("CountTodaysTrailingLosses error: " + ex.Message
-                    + " -> returning 0 (breaker starts clean).");
-                return 0;
+                DiagLog("ReadTodaysRealOutcomes error: " + ex.Message + " -> returning \"\" (clean start).");
+                return "";
             }
+        }
+
+        // Count trailing losses in TODAY's real-outcome string (for the breaker).
+        // Now derived from the shared reader so it can never disagree with the qty
+        // rule's view of today's trades.
+        private int CountTodaysTrailingLosses(string path, int todayKey)
+        {
+            string today = ReadTodaysRealOutcomes(path, todayKey);
+            int streak = 0;
+            for (int i = today.Length - 1; i >= 0; i--)
+            {
+                if (today[i] == '0') streak++;   // loss -> extend
+                else break;                      // win  -> streak ends
+            }
+            return streak;
         }
 
         private int CountTrailingLosses(string realOutcome)
