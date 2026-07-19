@@ -69,7 +69,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool     lifeStarted  = false;
         private bool     disabledSelf = false;
 
-        private DateTime lastCheckTime = DateTime.MinValue;
         private int      barCount      = 0;   // processed Renko bars
 
         // ── pipeline strings ─────────────────────────────────────────────────
@@ -99,14 +98,19 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string activeLogFilePath = null;
 
         // ── qty multiplier table ──────────────────────────────────────────────
+        // Longest-tail match wins (see CalcQty). Patterns are read against
+        // sessionRealOutcome (real trade W/L only; 1=win, 0=loss), NOT bricks.
+        // Current scheme = capped loss-ratchet on CONSECUTIVE losses:
+        //   "00"  (2 losses) -> x2
+        //   "000" (3 losses) -> x3, and stays x3 for 4+ losses (tail still ends 000)
+        // Note: no leading "1", so this escalates on a loss run from the day's open
+        // too (not only after a win). No x0 skip lines, so every armed trade is real
+        // and the breaker counts every loss (MaxRealLossInARow must be >= 4 for the
+        // x3 line to ever fire).
         private static readonly (string pattern, int multiplier)[] QtyMultiplierTable =
         {
-            ("10",      2),
-            ("100",     2),
-            ("1000",    2),
-            ("10000",   0),
-            ("100000",  0),
-            ("1000000", 0),
+            ("00",  2),
+            ("000", 3),
         };
 
         private int currentQty = 1;
@@ -159,7 +163,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TradingEndHour       = 11;      // 11:30 ET
                 TradingEndMinute     = 30;
                 StrategyLifeMinutes  = 1440;    // 24h
-                CheckIntervalSeconds = 1;
                 UseMarketEntry       = true;
                 LimitOffsetPoints    = 5;
                 StopLossPoints       = 20;      // user-specified
@@ -172,7 +175,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 BaseQuantity         = 1;
                 EnableQtyIncrement   = false;
                 MaxTotalBarCount     = 100000;  // max Renko bars to process
-                MaxRealLossInARow    = 5;       // breaker
+                MaxRealLossInARow    = 4;       // breaker (>=4 so qty x3 line can fire)
+
+                // RESUME across a reconnect is DISABLED by default for Renko: the
+                // gap tolerance is measured in minutes but the pipeline advances in
+                // BRICKS, and a fast move can print many bricks in a few minutes.
+                // There is no reliable way to know how many bricks were missed during
+                // a disconnect, so RESUMING risks appending live bricks onto a holed
+                // string. Fresh-start re-warms from the day's live bricks (the pipeline
+                // resets daily anyway, so the warm-up cost is bounded to one day).
+                // Flip to true ONLY if you have validated brick continuity across your
+                // own reconnect pattern.
+                AllowLogResume       = false;
 
                 LogFolder            = @"C:\temp";
                 LogBaseName          = "scalper_Renko_SHORT_Layer2";
@@ -255,10 +269,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // ── throttle (optional, for log sanity) ──────────────────────────
-            if ((DateTime.Now - lastCheckTime).TotalSeconds < CheckIntervalSeconds)
-                return;
-            lastCheckTime = DateTime.Now;
+            // NOTE: no time-throttle here. With Calculate.OnBarClose this method
+            // fires exactly once per CLOSED Renko brick, and EVERY brick must be
+            // recorded or rawString develops a hole that silently corrupts the
+            // filter pipeline. (The old CheckIntervalSeconds gate dropped bricks
+            // whenever two closed within the interval — removed.)
 
             // ── trading day rollover ─────────────────────────────────────────
             CheckTradingDayRollover();
@@ -266,30 +281,33 @@ namespace NinjaTrader.NinjaScript.Strategies
             // =====================================================================
             // STEP 1: DETERMINE BIT FROM RENKO BAR
             // =====================================================================
-            // Green bar (Close > Open) = price went UP    = bit '0' (loss for SHORT)
-            // Red bar   (Close < Open) = price went DOWN  = bit '1' (win  for SHORT)
-            //
-            // Note: For Renko bars, Close[0] vs Open[0] is the standard way to
-            // determine color in NinjaTrader. A green Renko bar means the brick
-            // was built upward; red means built downward.
+            // Direction is derived from THIS brick's close vs the PREVIOUS brick's
+            // close — NOT Close[0] vs Open[0]. NinjaTrader's native Renko fabricates
+            // the OPEN of reversal bricks for cosmetic reasons ("the open is not
+            // real"), so Close-vs-Open can mislabel a reversal brick and flip the
+            // foundational bit. Consecutive Renko closes differ by exactly one brick
+            // size, so close-vs-close gives the true build direction.
+            //   Close rose  = brick built UP   = green = bit '0' (loss for SHORT)
+            //   Close fell  = brick built DOWN = red   = bit '1' (win  for SHORT)
             int bit;
-            if (Close[0] > Open[0])
-                bit = 0;   // Green bar, bullish, bad for short
-            else if (Close[0] < Open[0])
-                bit = 1;   // Red bar, bearish, good for short
+            if (Close[0] > Close[1])
+                bit = 0;   // up brick, bad for short
+            else if (Close[0] < Close[1])
+                bit = 1;   // down brick, good for short
             else
             {
-                // Doji / equal open/close — rare for Renko but possible
-                // Use previous bar's close direction as tiebreaker
-                bit = (Close[0] >= Close[1]) ? 0 : 1;
-                DiagLog("[RENKO DOJI] Close==Open, using vs prev close -> bit=" + bit);
+                // Equal closes should not occur in valid Renko (data anomaly).
+                // Carry the previous brick's direction rather than inject a bogus
+                // bit or a hole; log it so the anomaly is visible.
+                bit = (prevBarBit >= 0) ? prevBarBit : 1;
+                DiagLog("[RENKO ANOMALY] Close[0]==Close[1] (unexpected) -> carrying prev bit=" + bit);
             }
 
             barCount++;
             prevBarBit = bit;
 
-            DiagLog(string.Format("[RENKO BAR #{0}] Close={1:F2} Open={2:F2} -> bit={3} ({4})",
-                barCount, Close[0], Open[0], bit, bit == 1 ? "RED/down" : "GREEN/up"));
+            DiagLog(string.Format("[RENKO BAR #{0}] Close={1:F2} PrevClose={2:F2} -> bit={3} ({4})",
+                barCount, Close[0], Close[1], bit, bit == 1 ? "RED/down" : "GREEN/up"));
 
             // =====================================================================
             // STEP 2: UPDATE PIPELINE
@@ -298,22 +316,38 @@ namespace NinjaTrader.NinjaScript.Strategies
             UpdatePipeline(bit);
 
             // =====================================================================
-            // STEP 3: CHECK IF WE SHOULD OPEN REAL TRADE
+            // STEP 3: CANONICAL PER-BRICK LOG ROW  (resume + Python verification)
             // =====================================================================
-            // nextIsMoney was set during UpdatePipeline if isArmed AND F1 matched.
-            // We consume it here and open a real short if conditions allow.
+            // A data row is written for EVERY brick — not just trades. This is what
+            // makes the log a faithful bit-for-bit mirror of rawString, which the
+            // RESUME path and any Python re-check both depend on. (Earlier this row
+            // was only written on trades, so the log skipped most bricks and a resume
+            // would restore a stale string.)
+            //   side = WOULDBE_TRADE  -> pipeline armed AND F1 matched this brick
+            //   side = FAKE_Short     -> ordinary observation brick
+            //   win_loss_bit column   -> the RAW brick bit (0=up/green, 1=down/red)
+            // Real orders write their own supplementary rows (Short_ENTRY at entry,
+            // Short at close, OBS_* if a guard suppresses) — those carry the fill
+            // prices and the real outcome bit. Only side=="Short" close rows are read
+            // back as real-trade outcomes.
+            string barSide = nextIsMoney ? "WOULDBE_TRADE" : "FAKE_Short";
+            WriteLogRowBar(bit, barSide);
+
+            // =====================================================================
+            // STEP 4: ACT ON THE TRADE TRIGGER
+            // =====================================================================
             if (nextIsMoney && EnableRealOrder && !hasOpenPosition)
             {
                 nextIsMoney = false;  // consume the trigger
                 TryOpenRealTrade();
             }
-            else if (nextIsMoney && hasOpenPosition)
+            else if (nextIsMoney)
             {
-                // Pipeline says trade, but we already have a position
-                // Log as would-be trade for observation
-                DiagLog(string.Format(
-                    "[WOULDBE TRADE SKIPPED] nextIsMoney=true but position already open. "
-                    + "Bit={0} recorded; no additional order.", bit));
+                // Pipeline fired, but no real order: either observation mode is on,
+                // or a position is already open. Bit is already recorded above.
+                DiagLog(hasOpenPosition
+                    ? "[WOULDBE TRADE] fired but a position is already open; no order."
+                    : "[WOULDBE TRADE] fired but EnableRealOrder=false; no order.");
                 nextIsMoney = false;
             }
         }
@@ -392,7 +426,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         TailOf(rawString, 12), TailOf(filter1Outcome, 12), TailOf(realTradeOutcome, 12)));
                 }
 
-                WriteLogRowObs(entryPrice, "Short", currentQty);
+                WriteLogRowObs(entryPrice, "Short_ENTRY", currentQty);
             }
             catch (Exception ex)
             {
@@ -573,7 +607,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             string reason  = "no prior log file";
             DateTime lastBitLocal = DateTime.MinValue;
 
-            if (!string.IsNullOrEmpty(latest))
+            // RESUME is off by default for Renko (see AllowLogResume note in
+            // SetDefaults). When off, always start a fresh file + empty pipeline and
+            // re-warm from live bricks — no attempt to stitch across a brick gap we
+            // cannot measure.
+            if (!AllowLogResume)
+            {
+                doFresh = true;
+                reason  = "AllowLogResume=false — Renko fresh start (brick gaps are not measurable in minutes)";
+            }
+            else if (!string.IsNullOrEmpty(latest))
             {
                 PipelineSnapshot snap = ReadLastSnapshot(latest);
                 if (snap == null || !snap.valid)
@@ -1055,6 +1098,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             catch { logWriteFailed = true; }
         }
 
+        // Canonical per-brick row: written for EVERY closed brick so the log mirrors
+        // rawString bit-for-bit. win_loss_bit column holds the RAW brick bit.
+        private void WriteLogRowBar(int rawBit, string side)
+        {
+            try
+            {
+                string row = string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10}\n",
+                    DateTime.Now, barCount, side, 0, 0, 0, 0, rawBit,
+                    rawString.ToString(), filter1Outcome.ToString(), realTradeOutcome.ToString());
+                SafeAppend(activeLogFilePath, row);
+            }
+            catch { logWriteFailed = true; }
+        }
+
         private void WriteLogRowObs(double price, string side, int qty)
         {
             try
@@ -1221,6 +1279,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         [ReadOnly(true)]
         public string EodReminder { get { return "EOD flatten ON; recorded as loss"; } set { } }
 
+        [Display(Name = "IMPORTANT — interrupt = fresh start",
+            Description = "Any disable/enable, disconnect, or interrupt starts a BRAND-NEW pipeline "
+                        + "(empty rawString, isArmed = false) and re-warms from live bricks. Pre-interrupt "
+                        + "arming and context are discarded — this is intentional and safe for Renko. "
+                        + "Prefer changing parameters at the 3:00 PM PT daily reset or before the open, "
+                        + "so you are not throwing away mid-session arming.",
+            Order = 3, GroupName = "0. REQUIRED SETUP")]
+        [ReadOnly(true)]
+        public string InterruptReminder { get { return "Any interrupt / disconnect => BRAND-NEW start (pipeline re-warms from live bricks)"; } set { } }
+
         [NinjaScriptProperty]
         [Display(Name = "Enable Trading Hours filter", Order = 1, GroupName = "1. Hours")]
         public bool EnableTradingHours { get; set; }
@@ -1250,20 +1318,25 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Strategy life (minutes)", Order = 1, GroupName = "2. Timing")]
         public int StrategyLifeMinutes { get; set; }
 
+        // Hidden: resume is disabled by default (interrupt = fresh start), so these
+        // three are dormant. Kept in code (Browsable(false)) so the resume path still
+        // compiles and can be re-enabled in source if ever validated.
         [NinjaScriptProperty]
-        [Range(1, 3600)]
-        [Display(Name = "Check interval (seconds)", Order = 2, GroupName = "2. Timing")]
-        public int CheckIntervalSeconds { get; set; }
-
-        [NinjaScriptProperty]
+        [Browsable(false)]
         [Range(1, int.MaxValue)]
         [Display(Name = "Gap tolerance (market-open min)", Order = 3, GroupName = "2. Timing")]
         public int GapToleranceMinutes { get; set; }
 
         [NinjaScriptProperty]
+        [Browsable(false)]
         [Range(1, 48)]
         [Display(Name = "Gap ceiling (wall-clock hours)", Order = 4, GroupName = "2. Timing")]
         public int GapCeilingHours { get; set; }
+
+        [NinjaScriptProperty]
+        [Browsable(false)]
+        [Display(Name = "Allow log resume (advanced)", Order = 5, GroupName = "2. Timing")]
+        public bool AllowLogResume { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Use market entry (else limit)", Order = 1, GroupName = "3. Entry")]
@@ -1284,11 +1357,18 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Profit target (points)", Order = 2, GroupName = "4. Bracket")]
         public double ProfitTargetPoints { get; set; }
 
+        // Hidden: a trailing stop breaks this strategy's core invariant. The whole
+        // design relies on stop = 1 brick (20pt) and target = 2 bricks (40pt), so a
+        // trade always resolves in exactly one brick and brick color == trade outcome.
+        // A trailing stop would move the stop off the brick grid and desync
+        // filter1Outcome from the real fill. Kept fixed-stop only.
         [NinjaScriptProperty]
+        [Browsable(false)]
         [Display(Name = "Enable Trailing Stop", Order = 3, GroupName = "4. Bracket")]
         public bool EnableTrailingStop { get; set; }
 
         [NinjaScriptProperty]
+        [Browsable(false)]
         [Range(0.01, double.MaxValue)]
         [Display(Name = "Trail distance (points)", Order = 4, GroupName = "4. Bracket")]
         public double TrailDistancePoints { get; set; }
