@@ -13,7 +13,7 @@ using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.Strategies;
 #endregion
 
-// Scalper_Renko_SHORT_Layer2  v1
+// Scalper_Renko_SHORTrepeat_Layer2  v1
 //
 // ============================================================================
 // WHAT THIS IS
@@ -21,31 +21,46 @@ using NinjaTrader.NinjaScript.Strategies;
 // A Renko-based Layer-2 meta-labeling strategy for SHORT on MNQ.
 //
 // RAW STRING SOURCE:
-//   Each closed Renko bar produces ONE bit:
-//     Green bar (Close > Open) = price went UP    = bit '0' (loss for SHORT)
-//     Red bar   (Close < Open) = price went DOWN  = bit '1' (win  for SHORT)
+//   Each closed Renko bar produces ONE bit, from THIS bar's close vs the PREVIOUS
+//   bar's close (NOT close vs open — NT fabricates the reversal-bar open):
+//     Close rose = up bar  = GREEN = bit '0' (loss for SHORT)
+//     Close fell = down bar = RED  = bit '1' (win  for SHORT)
 //
-//   Target = 1 = we chase '1's = we want RED bars = bearish momentum.
+//   Target = 1 = we chase '1's = we want RED bars = bearish reversion.
+//
+// ****************************************************************************
+// * CRITICAL — STOP/TARGET MUST MATCH THE RENKO BRICK SIZE OF THE DATA SERIES *
+// ****************************************************************************
+//   This whole strategy only works because the bracket geometry lines up with
+//   the brick grid under the standard Renko 2x-reversal rule:
+//       Stop   = 1 x brick size   (a continuation brick against you = the stop)
+//       Target = 2 x brick size   (a reversal brick your way        = the target)
+//   With an 80-tick brick on MNQ (= 20 points): Stop = 20pt, Target = 40pt.
+//   If you change the data-series brick size, you MUST change Stop/Target to
+//   1x / 2x the new brick size, or a trade will no longer resolve in exactly one
+//   brick and brick color will STOP equaling the trade outcome (the pipeline and
+//   the P&L silently diverge). Brick size, Stop, and Target are ONE setting in
+//   three places — keep them in sync.
 //
 // PIPELINE (same as Python trade_filter.py):
 //   Every closed Renko bar:
-//     1. Determine bit from bar color (Green=0, Red=1)
+//     1. Determine bit from bar direction (Green/up=0, Red/down=1)
 //     2. Append bit to rawString
 //     3. If waitingForF1Outcome: append bit to filter1Outcome
 //        check filter1Outcome tail matches F2 -> isArmed
 //     4. If rawString tail matches F1 -> waitingForF1Outcome = true
 //     5. If isArmed AND rawString tail matches F1 -> nextIsMoney = true
-//     6. If nextIsMoney -> enter REAL SHORT on next bar with bracket
+//     6. If nextIsMoney -> enter REAL SHORT this bar with bracket
 //
 // REAL TRADE BRACKET (when fired):
 //   EnterShort at market (or limit)
-//   StopLoss   = entry + StopLossPoints   (price went up = bad)
-//   ProfitTarget = entry - ProfitTargetPoints (price went down = good)
+//   StopLoss     = entry + StopLossPoints     (price up = bad)  = 1x brick
+//   ProfitTarget = entry - ProfitTargetPoints (price down = good) = 2x brick
 //
 // DEFAULT COMBO (user-specified):
-//   F1 = "1000"  (rawString ends with 1,0,0,0)
-//   F2 = "000"   (filter1Outcome ends with 0,0,0)
-//   Stop = 20pt, Target = 40pt
+//   F1 = "1000"  (rawString ends with 1,0,0,0 = red-green-green-green)
+//   F2 = "000"   (filter1Outcome ends with 0,0,0 = 3 failed attempts)
+//   Stop = 20pt, Target = 40pt  (for an 80-tick / 20pt brick)
 //
 // ============================================================================
 // CONNECTION INTERRUPT / RESUME (same as v4)
@@ -62,7 +77,7 @@ using NinjaTrader.NinjaScript.Strategies;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
-    public class Scalper_Renko_SHORT_Layer2 : Strategy
+    public class Scalper_Renko_SHORTrepeat_Layer2 : Strategy
     {
         // ── strategy lifecycle ────────────────────────────────────────────────
         private DateTime strategyStartUtc;
@@ -137,7 +152,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Description = "Renko-based SHORT Layer-2 strategy. Each Renko bar = one bit. "
                             + "Green=0 (up), Red=1 (down). Chases '1's (red bars). "
                             + "Reconnect-survival via own log file.";
-                Name        = "Scalper_Renko_SHORT_Layer2";
+                Name        = "Scalper_Renko_SHORTrepeat_Layer2";
 
                 Calculate                    = Calculate.OnBarClose;   // KEY: OnBarClose for Renko
                 EntriesPerDirection          = 1;
@@ -189,7 +204,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 AllowLogResume       = false;
 
                 LogFolder            = @"C:\temp";
-                LogBaseName          = "scalper_Renko_SHORT_Layer2";
+                LogBaseName          = "scalper_Renko_SHORTrepeat_Layer2";
 
                 GapToleranceMinutes  = 7;
                 GapCeilingHours      = 4;
