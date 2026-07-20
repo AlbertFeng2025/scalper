@@ -236,15 +236,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Configure)
             {
-                if (EnableTrailingStop)
-                    SetTrailStop(ENTRY_SIGNAL, CalculationMode.Ticks,
-                        (int)Math.Round(TrailDistancePoints / TickSize), false);
-                else
-                    SetStopLoss(ENTRY_SIGNAL, CalculationMode.Ticks,
-                        (int)Math.Round(StopLossPoints / TickSize), false);
-
-                SetProfitTarget(ENTRY_SIGNAL, CalculationMode.Ticks,
-                    (int)Math.Round(ProfitTargetPoints / TickSize));
+                // Bracket is NOT set here. It is set per-entry in TryOpenRealTrade,
+                // anchored to the BRICK CLOSE (not the entry fill), so stop/target sit
+                // exactly on the next brick thresholds and "brick color == trade
+                // outcome" holds regardless of entry slippage. (Fixed stop only —
+                // trailing is intentionally unsupported; see header.)
             }
             else if (State == State.DataLoaded)
             {
@@ -444,8 +440,23 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             double entryPrice = UseMarketEntry ? refPrice
                 : Instrument.MasterInstrument.RoundToTickSize(refPrice + LimitOffsetPoints);
-            double stopPrice   = Instrument.MasterInstrument.RoundToTickSize(entryPrice + StopLossPoints);
-            double targetPrice = Instrument.MasterInstrument.RoundToTickSize(entryPrice - ProfitTargetPoints);
+
+            // Anchor the bracket to the BRICK CLOSE (Close[0] = the just-closed
+            // trigger brick), NOT the entry fill. stop = brickClose + 1 brick (the
+            // green continuation level); target = brickClose - 2 bricks (the red
+            // reversal level). This keeps stop/target exactly on the brick grid, so
+            // whichever brick prints next IS the trade outcome even when the fill
+            // lands off-grid. (Anchoring to the fill instead lets adverse entry
+            // slippage drop the stop into the blind zone below the green-brick
+            // threshold, where a whipsaw stops us out on a brick that ultimately
+            // went our way — the trade-3 failure in the 2026-07-19 sim run.)
+            double brickClose  = Close[0];
+            double stopPrice   = Instrument.MasterInstrument.RoundToTickSize(brickClose + StopLossPoints);
+            double targetPrice = Instrument.MasterInstrument.RoundToTickSize(brickClose - ProfitTargetPoints);
+
+            // Set the bracket as ABSOLUTE prices for this entry, before submitting it.
+            SetStopLoss(ENTRY_SIGNAL, CalculationMode.Price, stopPrice, false);
+            SetProfitTarget(ENTRY_SIGNAL, CalculationMode.Price, targetPrice);
 
             try
             {
@@ -573,10 +584,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (Position.MarketPosition == MarketPosition.Flat)
                 {
-                    double pnl = isStopFill
-                        ? -(StopLossPoints     * entryFillQty * Instrument.MasterInstrument.PointValue)
-                        : +(ProfitTargetPoints * entryFillQty * Instrument.MasterInstrument.PointValue);
+                    // Fill-based P&L (SHORT): sold at entryFillPrice, bought back at
+                    // 'price'. Uses ACTUAL fills, so it reflects real slippage rather
+                    // than the nominal 20/40. The win/loss BIT still comes from which
+                    // bracket filled (stop vs target), which now matches the brick.
                     int bit = isStopFill ? 0 : 1;
+                    double pnl = (entryFillPrice - price)
+                                 * entryFillQty * Instrument.MasterInstrument.PointValue;
 
                     DiagLog(string.Format("MONEY TRADE CLOSED {0}: entry={1:F2} exit={2:F2} qty={3} pnl={4:0.00} bit={5}",
                         isStopFill ? "STOP" : "TARGET", entryFillPrice, price, entryFillQty, pnl, bit));
