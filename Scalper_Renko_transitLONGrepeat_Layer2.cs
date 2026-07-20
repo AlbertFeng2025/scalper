@@ -250,15 +250,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Configure)
             {
-                if (EnableTrailingStop)
-                    SetTrailStop(ENTRY_SIGNAL, CalculationMode.Ticks,
-                        (int)Math.Round(TrailDistancePoints / TickSize), false);
-                else
-                    SetStopLoss(ENTRY_SIGNAL, CalculationMode.Ticks,
-                        (int)Math.Round(StopLossPoints / TickSize), false);
-
-                SetProfitTarget(ENTRY_SIGNAL, CalculationMode.Ticks,
-                    (int)Math.Round(ProfitTargetPoints / TickSize));
+                // Bracket is NOT set here. It is set per-entry in TryOpenRealTrade,
+                // anchored to the BRICK CLOSE (not the entry fill), so stop/target sit
+                // exactly on the next brick thresholds and "brick color == trade
+                // outcome" holds regardless of entry slippage. (Fixed stop only —
+                // trailing is intentionally unsupported; see header.)
             }
             else if (State == State.DataLoaded)
             {
@@ -457,13 +453,25 @@ namespace NinjaTrader.NinjaScript.Strategies
             workingEntryOrder = null;
 
             // LONG: a limit entry buys BELOW the reference; stop sits BELOW entry
-            // (1x brick) and target ABOVE entry (2x brick). (The live bracket is set
-            // in ticks via SetStopLoss/SetProfitTarget, which auto-orient to the
-            // position; these prices are for logging/limit placement.)
+            // (1x brick) and target ABOVE entry (2x brick).
             double entryPrice = UseMarketEntry ? refPrice
                 : Instrument.MasterInstrument.RoundToTickSize(refPrice - LimitOffsetPoints);
-            double stopPrice   = Instrument.MasterInstrument.RoundToTickSize(entryPrice - StopLossPoints);
-            double targetPrice = Instrument.MasterInstrument.RoundToTickSize(entryPrice + ProfitTargetPoints);
+
+            // Anchor the bracket to the BRICK CLOSE (Close[0] = the just-closed
+            // trigger brick), NOT the entry fill. For LONG: stop = brickClose - 1 brick
+            // (the red continuation level, below); target = brickClose + 2 bricks (the
+            // green reversal level, above). This keeps stop/target exactly on the brick
+            // grid, so whichever brick prints next IS the trade outcome even when the
+            // fill lands off-grid. (Anchoring to the fill lets adverse entry slippage
+            // push the stop into the blind zone above the red-brick threshold, where a
+            // whipsaw stops us out on a brick that ultimately went our way.)
+            double brickClose  = Close[0];
+            double stopPrice   = Instrument.MasterInstrument.RoundToTickSize(brickClose - StopLossPoints);
+            double targetPrice = Instrument.MasterInstrument.RoundToTickSize(brickClose + ProfitTargetPoints);
+
+            // Set the bracket as ABSOLUTE prices for this entry, before submitting it.
+            SetStopLoss(ENTRY_SIGNAL, CalculationMode.Price, stopPrice, false);
+            SetProfitTarget(ENTRY_SIGNAL, CalculationMode.Price, targetPrice);
 
             try
             {
@@ -591,10 +599,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (Position.MarketPosition == MarketPosition.Flat)
                 {
-                    double pnl = isStopFill
-                        ? -(StopLossPoints     * entryFillQty * Instrument.MasterInstrument.PointValue)
-                        : +(ProfitTargetPoints * entryFillQty * Instrument.MasterInstrument.PointValue);
+                    // Fill-based P&L (LONG): bought at entryFillPrice, sold at 'price'.
+                    // Uses ACTUAL fills, so it reflects real slippage rather than the
+                    // nominal 20/40. The win/loss BIT still comes from which bracket
+                    // filled (stop vs target), which now matches the brick.
                     int bit = isStopFill ? 0 : 1;
+                    double pnl = (price - entryFillPrice)
+                                 * entryFillQty * Instrument.MasterInstrument.PointValue;
 
                     DiagLog(string.Format("MONEY TRADE CLOSED {0}: entry={1:F2} exit={2:F2} qty={3} pnl={4:0.00} bit={5}",
                         isStopFill ? "STOP" : "TARGET", entryFillPrice, price, entryFillQty, pnl, bit));
