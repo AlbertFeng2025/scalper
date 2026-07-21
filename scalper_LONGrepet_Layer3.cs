@@ -165,15 +165,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         //   qty 0 == DO NOT place a real order (observe only). See CalcQty caller.
         // *** COUPLING WARNING: review table when MaxRealLossInARow changes.
         //   L3 filter params are NOT researched yet; table carried over from L2. ***
-        private static readonly (string pattern, int multiplier)[] QtyMultiplierTable =
-        {
-            ("10",      2),
-            ("100",     2),
-            ("1000",    2),
-            ("10000",   0),
-            ("100000",  0),
-            ("1000000", 0),
-        };
+        // NOTE: default below is overwritten at startup by ParseQtyRule() from the
+        // UI-editable QtyRuleText parameter (no recompile needed to change it).
+        private (string pattern, int multiplier)[] qtyTable =
+            new (string pattern, int multiplier)[] {
+                ("10", 2), ("100", 2), ("1000", 2),
+                ("10000", 0), ("100000", 0), ("1000000", 0) };
 
         private int currentQty = 1;
 
@@ -244,6 +241,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Filter3Pattern       = "01";
                 BaseQuantity         = 1;
                 EnableQtyIncrement   = false;
+                QtyRuleText          = "(\"10\":2),(\"100\":2),(\"1000\":2),(\"10000\":0),(\"100000\":0),(\"1000000\":0)";
+                EnableTradeOutcomeExit  = false;
+                TradeOutcomeExitPattern = "1111111";
                 MaxTotalSliceCount   = 100000;
                 MaxRealLossInARow    = 3;
 
@@ -281,6 +281,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         sessionIter = new SessionIterator(BarsArray[0]);
 
                     StartupDecideAndLoad();
+                    ParseQtyRule();   // after log path is set, so [QTY RULE] logs to the right file
                 }
             }
         }
@@ -572,6 +573,59 @@ namespace NinjaTrader.NinjaScript.Strategies
         // =====================================================================
         // CalcQty (unchanged)
         // =====================================================================
+        // Parse QtyRuleText into qtyTable. Lenient: strips ( ) " then scans for every
+        // "<pattern>:<qty>" pair (pattern = run of 0/1, qty >= 0) and ignores the rest.
+        // Warns on duplicate-length patterns (longest-match keeps the first at a length).
+        // On any failure keeps the built-in default and logs.
+        private void ParseQtyRule()
+        {
+            try
+            {
+                string cleaned = (QtyRuleText ?? "").Replace("(", "").Replace(")", "").Replace("\"", "");
+                var list = new System.Collections.Generic.List<(string pattern, int multiplier)>();
+                foreach (System.Text.RegularExpressions.Match mm in
+                         System.Text.RegularExpressions.Regex.Matches(cleaned, @"([01]+)\s*:\s*(\d+)"))
+                {
+                    string pat = mm.Groups[1].Value;
+                    int    q   = int.Parse(mm.Groups[2].Value,
+                                     System.Globalization.CultureInfo.InvariantCulture);
+                    list.Add((pat, q));
+                }
+                if (list.Count > 0)
+                {
+                    var seen = new System.Collections.Generic.HashSet<int>();
+                    foreach (var e in list)
+                        if (!seen.Add(e.pattern.Length))
+                            DiagLog("[QTY RULE] WARNING duplicate-length pattern '" + e.pattern
+                                + "' -> shadowed by an earlier same-length rule.");
+                    qtyTable = list.ToArray();
+                    DiagLog("[QTY RULE] parsed " + list.Count + " rule(s) from '" + QtyRuleText + "'");
+                }
+                else DiagLog("[QTY RULE] no valid pairs in '" + QtyRuleText + "' -> keeping default.");
+            }
+            catch (Exception ex)
+            {
+                DiagLog("[QTY RULE] parse error: " + ex.Message + " -> keeping default.");
+            }
+        }
+
+        // Trade-outcome exit: HALT the session (same shutdown as the breaker -> manual
+        // re-enable) when the REAL trade-outcome tail (sessionRealOutcome; 1=win,0=loss)
+        // ends with TradeOutcomeExitPattern (plain endsWith, NO wildcard). Called ONLY on
+        // a CLEAN stop/target resolution -- not on forced-close or EOD paths. Slice
+        // default pattern "1111111" + disabled = effectively inert.
+        private void CheckTradeOutcomeExit()
+        {
+            if (EnableTradeOutcomeExit
+                && !string.IsNullOrEmpty(TradeOutcomeExitPattern)
+                && sessionRealOutcome.ToString().EndsWith(TradeOutcomeExitPattern))
+            {
+                DiagLog("[OUTCOME EXIT] real-outcome tail matched '" + TradeOutcomeExitPattern
+                    + "' -> halting session. session=" + sessionRealOutcome.ToString());
+                BeginShutdown("trade-outcome exit '" + TradeOutcomeExitPattern + "' matched");
+            }
+        }
+
         private int CalcQty()
         {
             if (!EnableQtyIncrement) return BaseQuantity;
@@ -582,7 +636,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             int  bestLen  = -1;
             int  bestMult = 1;
             bool matched  = false;
-            foreach (var entry in QtyMultiplierTable)
+            foreach (var entry in qtyTable)
             {
                 if (entry.pattern.Length > bestLen && TailMatches(outcome, entry.pattern))
                 {
@@ -1054,6 +1108,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     RecordSessionOutcome(bit);   // per-day qty session
                     if (bit == 0) { realLossesInARow++; DiagLog("[REAL LOSS] realLossesInARow=" + realLossesInARow); }
                     else { if (realLossesInARow > 0) DiagLog("[REAL WIN] reset " + realLossesInARow + "->0"); realLossesInARow = 0; }
+                    CheckTradeOutcomeExit();
 
                     awaitingClose = false; entryInFlight = false; workingEntryOrder = null;
                     inSlice = false; isMoneySlice = false;
@@ -1812,6 +1867,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool EnableQtyIncrement { get; set; }
 
         [NinjaScriptProperty]
+        [Display(Name = "Qty rule (pattern:qty, comma-sep)", Order = 3, GroupName = "6. Quantity",
+            Description = "Applied only when Enable Qty Increment is ON. Loss-ratchet on the "
+                        + "REAL trade-outcome string (1=win,0=loss). Format pattern:qty pairs, e.g. "
+                        + "(\"10\":2),(\"100\":2),(\"10000\":0) . qty 0 = SKIP. Longest tail wins; "
+                        + "parens / quotes / spaces / trailing comma optional.")]
+        public string QtyRuleText { get; set; }
+
+        [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
         [Display(Name = "Max Total Slice Count", Order = 1, GroupName = "7. Limits",
             Description = "Stop after this many total slices (fake + real).")]
@@ -1822,6 +1885,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Max Real Loss In A Row", Order = 2, GroupName = "7. Limits",
             Description = "Stop after this many consecutive real losses. Default 3. Survives reconnect (restored on resume).")]
         public int MaxRealLossInARow { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable trade-outcome exit", Order = 3, GroupName = "7. Limits")]
+        public bool EnableTradeOutcomeExit { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trade-outcome exit pattern (halt session)", Order = 4, GroupName = "7. Limits",
+            Description = "When enabled, HALT the session (manual re-enable) once the REAL "
+                        + "trade-outcome tail (1=win,0=loss) ends with this PLAIN pattern (no "
+                        + "wildcard). Slice default '1111111' + disabled = effectively inert.")]
+        public string TradeOutcomeExitPattern { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Log Folder", Order = 1, GroupName = "8. Logging",
