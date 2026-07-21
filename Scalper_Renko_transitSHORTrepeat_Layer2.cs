@@ -147,11 +147,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         // too (not only after a win). No x0 skip lines, so every armed trade is real
         // and the breaker counts every loss (MaxRealLossInARow must be >= 4 for the
         // x3 line to ever fire).
-        private static readonly (string pattern, int multiplier)[] QtyMultiplierTable =
-        {
-            ("00",  2),
-            ("000", 3),
-        };
+        // NOTE: default below is overwritten at startup by ParseQtyRule() from the
+        // UI-editable QtyRuleText parameter (no recompile needed to change it).
+        private (string pattern, int multiplier)[] qtyTable =
+            new (string pattern, int multiplier)[] { ("00", 2), ("000", 3) };
 
         private int currentQty = 1;
         private string suppressReason = null;
@@ -214,6 +213,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Filter2Pattern       = "000";   // user-specified
                 BaseQuantity         = 1;
                 EnableQtyIncrement   = false;
+                QtyRuleText          = "(\"00\":2),(\"000\":3)";
+                EnableTradeOutcomeExit  = false;
+                TradeOutcomeExitPattern = "1";
                 MaxTotalBarCount     = 100000;  // max Renko bars to process
                 MaxRealLossInARow    = 4;       // breaker (>=4 so qty x3 line can fire)
 
@@ -246,6 +248,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (BarsArray != null && BarsArray.Length > 0)
                     sessionIter = new SessionIterator(BarsArray[0]);
+                ParseQtyRule();
             }
             else if (State == State.Realtime)
             {
@@ -600,6 +603,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (bit == 0) { realLossesInARow++; DiagLog("[REAL LOSS] realLossesInARow=" + realLossesInARow); }
                     else { if (realLossesInARow > 0) DiagLog("[REAL WIN] reset " + realLossesInARow + "->0"); realLossesInARow = 0; }
 
+                    // Trade-outcome exit: HALT the session when the real-outcome tail
+                    // matches TradeOutcomeExitPattern (plain endsWith, NO wildcard).
+                    // Operates on sessionRealOutcome (real trade W/L; 1=win,0=loss) --
+                    // NOT bricks and NOT filter1Outcome. Default "1" = stop after a win.
+                    if (EnableTradeOutcomeExit
+                        && !string.IsNullOrEmpty(TradeOutcomeExitPattern)
+                        && sessionRealOutcome.ToString().EndsWith(TradeOutcomeExitPattern))
+                    {
+                        DiagLog("[OUTCOME EXIT] real-outcome tail matched '" + TradeOutcomeExitPattern
+                            + "' -> halting session. session=" + sessionRealOutcome.ToString());
+                        BeginShutdown("trade-outcome exit '" + TradeOutcomeExitPattern + "' matched");
+                    }
+
                     awaitingClose = false; entryInFlight = false; workingEntryOrder = null;
 
                     double logFillPrice = entryFillPrice;
@@ -821,6 +837,43 @@ namespace NinjaTrader.NinjaScript.Strategies
         // =====================================================================
         // CalcQty (identical to v4)
         // =====================================================================
+        // Parse QtyRuleText into qtyTable. Lenient: scans for every "<pattern>:<qty>"
+        // pair (pattern = run of 0/1, qty = integer) and ignores everything else --
+        // parentheses, quotes, spaces, and trailing commas are all optional. On any
+        // failure, keeps the built-in default and logs.
+        private void ParseQtyRule()
+        {
+            try
+            {
+                var list = new System.Collections.Generic.List<(string pattern, int multiplier)>();
+                // strip noise chars ( ) " so BOTH ("00":2) and 00:2 forms parse
+                string cleaned = (QtyRuleText ?? "").Replace("(", "").Replace(")", "").Replace("\"", "");
+                foreach (System.Text.RegularExpressions.Match mm in
+                         System.Text.RegularExpressions.Regex.Matches(
+                             cleaned, @"([01]+)\s*:\s*(\d+)"))
+                {
+                    string pat = mm.Groups[1].Value;
+                    int    q   = int.Parse(mm.Groups[2].Value,
+                                     System.Globalization.CultureInfo.InvariantCulture);
+                    list.Add((pat, q));
+                }
+                if (list.Count > 0)
+                {
+                    qtyTable = list.ToArray();
+                    DiagLog("[QTY RULE] parsed " + list.Count + " rule(s) from '" + QtyRuleText + "'");
+                }
+                else
+                {
+                    DiagLog("[QTY RULE] no valid pairs in '" + QtyRuleText
+                        + "' -> keeping default (00:2,000:3)");
+                }
+            }
+            catch (Exception ex)
+            {
+                DiagLog("[QTY RULE] parse error: " + ex.Message + " -> keeping default");
+            }
+        }
+
         private int CalcQty()
         {
             if (!EnableQtyIncrement) return BaseQuantity;
@@ -828,7 +881,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (outcome.Length == 0) return BaseQuantity;
             int bestLen = -1, bestMult = 1;
             bool matched = false;
-            foreach (var entry in QtyMultiplierTable)
+            foreach (var entry in qtyTable)
             {
                 if (entry.pattern.Length > bestLen && TailMatches(outcome, entry.pattern))
                 {
@@ -1452,6 +1505,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool EnableQtyIncrement { get; set; }
 
         [NinjaScriptProperty]
+        [Display(Name = "Qty rule (pattern:qty, comma-sep)", Order = 3, GroupName = "6. Quantity",
+            Description = "Applied only when Enable Qty Increment is ON. Loss-ratchet on the "
+                        + "REAL trade-outcome string (1=win,0=loss). Format: pattern:qty pairs, "
+                        + "e.g.  (\"00\":2),(\"000\":3)  or  00:2,000:3 . Longest matching tail "
+                        + "wins. Parens / quotes / spaces / trailing comma are all optional.")]
+        public string QtyRuleText { get; set; }
+
+        [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
         [Display(Name = "Max Total Bar Count", Order = 1, GroupName = "7. Limits")]
         public int MaxTotalBarCount { get; set; }
@@ -1460,6 +1521,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Range(1, int.MaxValue)]
         [Display(Name = "Max Real Loss In A Row", Order = 2, GroupName = "7. Limits")]
         public int MaxRealLossInARow { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable trade-outcome exit", Order = 3, GroupName = "7. Limits")]
+        public bool EnableTradeOutcomeExit { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trade-outcome exit pattern (halt session)", Order = 4, GroupName = "7. Limits",
+            Description = "When enabled, HALT the session once the REAL trade-outcome tail "
+                        + "(1=win,0=loss) ends with this PLAIN pattern (no wildcard). "
+                        + "Default '1' = stop after a win. e.g. '11' = stop after two wins.")]
+        public string TradeOutcomeExitPattern { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Log Folder", Order = 1, GroupName = "8. Logging")]
