@@ -642,31 +642,54 @@ namespace NinjaTrader.NinjaScript.Strategies
         // "<pattern>:<qty>" pair (pattern = run of 0/1, qty >= 0) and ignores the rest.
         // Warns on duplicate-length patterns (longest-match keeps the first at a length).
         // On any failure keeps the built-in default and logs.
+        private const int QTY_MULT_CAP = 20;   // hard ceiling: any multiplier above this is REFUSED
+
+        // Parse QtyRuleText into qtyTable. Reads the CONTENT INSIDE each (...) group,
+        // so a MISSING COMMA between groups is harmless -- each parenthesised pair is
+        // read on its own and a qty can never merge into the next pattern's digits.
+        // If no parens are present, falls back to splitting the bare string on commas.
+        // SAFETY: any multiplier > QTY_MULT_CAP is REFUSED (a typo can never inflate
+        // size). Logs the full ACTIVE table so it can be verified at a glance.
         private void ParseQtyRule()
         {
             try
             {
-                string cleaned = (QtyRuleText ?? "").Replace("(", "").Replace(")", "").Replace("\"", "");
+                string src = QtyRuleText ?? "";
+                var units = new System.Collections.Generic.List<string>();
+                var groups = System.Text.RegularExpressions.Regex.Matches(src, @"\(([^)]*)\)");
+                if (groups.Count > 0)
+                    foreach (System.Text.RegularExpressions.Match g in groups) units.Add(g.Groups[1].Value);
+                else
+                    units.AddRange(src.Split(','));   // bare (no-paren) fallback
+
                 var list = new System.Collections.Generic.List<(string pattern, int multiplier)>();
-                foreach (System.Text.RegularExpressions.Match mm in
-                         System.Text.RegularExpressions.Regex.Matches(cleaned, @"([01]+)\s*:\s*(\d+)"))
+                foreach (string u in units)
                 {
-                    string pat = mm.Groups[1].Value;
-                    int    q   = int.Parse(mm.Groups[2].Value,
-                                     System.Globalization.CultureInfo.InvariantCulture);
+                    var m = System.Text.RegularExpressions.Regex.Match(u, @"([01]+)\s*""?\s*:\s*(\d+)");
+                    if (!m.Success)
+                    {
+                        if (u.Trim().Length > 0) DiagLog("[QTY RULE] ignored '" + u.Trim() + "'");
+                        continue;
+                    }
+                    string pat = m.Groups[1].Value;
+                    int    q   = int.Parse(m.Groups[2].Value, System.Globalization.CultureInfo.InvariantCulture);
+                    if (q > QTY_MULT_CAP)
+                    {
+                        DiagLog("[QTY RULE] DANGER '" + pat + "':" + q + " exceeds cap " + QTY_MULT_CAP
+                            + " -> REFUSED (check the format!).");
+                        continue;
+                    }
                     list.Add((pat, q));
                 }
+
                 if (list.Count > 0)
                 {
-                    var seen = new System.Collections.Generic.HashSet<int>();
-                    foreach (var e in list)
-                        if (!seen.Add(e.pattern.Length))
-                            DiagLog("[QTY RULE] WARNING duplicate-length pattern '" + e.pattern
-                                + "' -> shadowed by an earlier same-length rule.");
                     qtyTable = list.ToArray();
-                    DiagLog("[QTY RULE] parsed " + list.Count + " rule(s) from '" + QtyRuleText + "'");
+                    var sb = new StringBuilder();
+                    foreach (var e in list) sb.Append(e.pattern + "->x" + e.multiplier + "  ");
+                    DiagLog("[QTY RULE] ACTIVE: " + sb.ToString().Trim());
                 }
-                else DiagLog("[QTY RULE] no valid pairs in '" + QtyRuleText + "' -> keeping default.");
+                else DiagLog("[QTY RULE] no valid pairs in '" + src + "' -> keeping default.");
             }
             catch (Exception ex)
             {
@@ -1957,8 +1980,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool EnableQtyIncrement { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Qty rule (pattern:qty, comma-sep)", Order = 3, GroupName = "6. Quantity",
-            Description = "Applied only when Enable Qty Increment is ON. Loss-ratchet on the "
+        [Display(Name = "Qty rule  ***DANGER: TRIPLE-CHECK FORMAT***", Order = 3, GroupName = "6. Quantity",
+            Description = "DANGER: TRIPLE-CHECK THE FORMAT. A mistyped comma or colon can DROP or "
+                        + "shrink a rule (it can never INFLATE: any multiplier over 20 is refused, "
+                        + "and each (\"pat\":qty) group is read on its own). Verify via the [QTY RULE] "
+                        + "ACTIVE line in the diag log. "
+                        + "Applied only when Enable Qty Increment is ON. Loss-ratchet on the "
                         + "REAL trade-outcome string (1=win,0=loss). Format pattern:qty pairs, e.g. "
                         + "(\"10\":2),(\"100\":2),(\"10000\":0) . qty 0 = SKIP. Longest tail wins; "
                         + "parens / quotes / spaces / trailing comma optional.")]
