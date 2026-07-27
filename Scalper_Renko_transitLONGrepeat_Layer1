@@ -160,6 +160,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ── strategy lifecycle ────────────────────────────────────────────────
         private DateTime strategyStartUtc;
         private bool     lifeStarted  = false;
+        private bool     seedChecked  = false;  // one-shot: seed the pending brick on the first realtime bar
         private bool     disabledSelf = false;
 
         private int      barCount      = 0;   // processed Renko bars
@@ -275,6 +276,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TrailDistancePoints  = 10;
                 EnableRealOrder      = false;   // observation only until flipped
                 Filter1Pattern       = "10,100,1000";  // Layer-1 multi-pattern default (comma OR); type "1000" alone for the tight length-3-only bet
+                SeedPendingBarOnStart = false;  // OFF: first bit = first brick that fully closes after enable
                 Filter2Pattern       = "000";   // user-specified
                 BaseQuantity         = 1;
                 EnableQtyIncrement   = false;
@@ -382,6 +384,42 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             // ── trading day rollover ─────────────────────────────────────────
             CheckTradingDayRollover();
+
+            // ── ONE-TIME SEED OF THE PENDING BRICK ────────────────────────────
+            // On the FIRST realtime bar only, optionally recover the brick that was
+            // still forming when the strategy was ENABLED. NinjaTrader hands that
+            // brick's close over while it is still classified historical/transition,
+            // so the State!=Realtime guard above drops it; by this first realtime turn
+            // it has shifted to Close[1]. We recompute its bit from Close[1] vs Close[2]
+            // and push it through the pipeline as bar #1, so rawString starts ONE brick
+            // earlier. It is CONTIGUOUS with the first live brick (no gap), so this does
+            // NOT reintroduce the stale-resume problem. The seed brick NEVER places an
+            // order (its close predates 'live'); only bricks from #2 onward can trade.
+            // CAUTION: a Renko brick has no fixed duration, so the seeded brick may have
+            // largely formed BEFORE enable — hence this is opt-in (default OFF).
+            if (!seedChecked)
+            {
+                seedChecked = true;
+                if (SeedPendingBarOnStart && CurrentBar >= 2 && rawString.Length == 0)
+                {
+                    int seedBit;
+                    if (Close[1] > Close[2])      seedBit = 1;   // up brick (green), good for long
+                    else if (Close[1] < Close[2]) seedBit = 0;   // down brick (red), bad for long
+                    else                          seedBit = 0;   // anomaly -> match file default
+
+                    barCount++;
+                    prevBarBit = seedBit;
+                    DiagLog(string.Format(
+                        "[SEED BAR #{0}] pending brick recovered: Close={1:F2} PrevClose={2:F2} "
+                        + "closeTime={3:yyyy-MM-dd HH:mm:ss} -> bit={4} ({5}). "
+                        + "Fed to pipeline as first bit; will NOT place an order.",
+                        barCount, Close[1], Close[2], Time[1], seedBit, seedBit == 1 ? "GREEN/up" : "RED/down"));
+
+                    UpdatePipeline(seedBit);
+                    WriteLogRowBar(seedBit, nextIsMoney ? "WOULDBE_TRADE_SEED" : "FAKE_Long_SEED");
+                    nextIsMoney = false;   // the seed must never trigger a live order
+                }
+            }
 
             // =====================================================================
             // STEP 1: DETERMINE BIT FROM RENKO BAR
@@ -1621,6 +1659,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + "long run = up to 3 stacked losses. A blank/mistyped filter parses to nothing "
                         + "and simply never trades. Default: 10,100,1000")]
         public string Filter1Pattern { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Seed pending brick on start", Order = 20, GroupName = "5. Filter & Order",
+            Description = "When ON, the brick that was still forming when you ENABLED the "
+                        + "strategy becomes the FIRST bit of rawString (computed from Close[1] "
+                        + "vs Close[2] on the first realtime brick), saving one brick of warm-up. "
+                        + "The seed brick NEVER places an order; it only seeds the string, logged "
+                        + "as bar #1 with a _SEED tag. CAUTION: a Renko brick has no fixed duration, "
+                        + "so the seeded brick may have largely formed BEFORE you enabled. Default OFF.")]
+        public bool SeedPendingBarOnStart { get; set; }
 
         // Filter 2 is IGNORED for trading in Layer 1 (the F2 gate is bypassed).
         // Kept only so isArmed can be computed/logged for observation. Hidden from UI.
