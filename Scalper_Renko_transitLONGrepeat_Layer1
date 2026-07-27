@@ -102,9 +102,43 @@ using NinjaTrader.NinjaScript.Strategies;
 //   ProfitTarget = brickClose + ProfitTargetPoints (= green-brick level) = 2x brick
 //
 // DEFAULT COMBO:
-//   F1 = "1000"  (rawString ends with 1,0,0,0 = green-red-red-red)
+//   F1 = "10,100,1000"  (multi-pattern OR; LONG red-runs of length 1 / 2 / 3)
 //   Stop = 20pt, Target = 40pt  (for an 80-tick / 20pt brick)
 //   (F2 is IGNORED for trading in Layer 1.)
+//
+// ============================================================================
+// LAYER-1 MULTI-PATTERN FIRING + REQUIRED DISCIPLINE  (this revision)
+// ============================================================================
+// Filter1Pattern now accepts MULTIPLE comma-delimited tail patterns, e.g.
+// "10,100,1000" (whitespace ignored). A real trade fires whenever the rawString
+// tail matches ANY one of them (logical OR). A blank or all-invalid entry parses
+// to an EMPTY list and NEVER trades (safe no-op). Type a single "1000" alone for
+// the tight length-3-only bet; use "10,100,1000" to also catch length-1/2 runs.
+// All of 10 / 100 / 1000 end in bit 0 (red (down) = bit 0), so each is 20/40-geometry-valid
+// (they fire at the red-run -> first-flip). Wildcards ('*'=1+ zeros,
+// '?'=1+ ones) still work WITHIN each pattern.
+//
+// ****************************************************************************
+// * READ THIS — THIS IS A GAMBLE, NOT AN EDGE                                *
+// ****************************************************************************
+//   The 20/40 bracket has a 33.3% BREAKEVEN. That is a BREAKEVEN, not a win
+//   rate. Trend persistence drags the REAL win rate down toward — and in a
+//   strong trend BELOW — that line. Firing these patterns is a discretionary
+//   run-length-reversion BET you place BY EYE after you have personally seen
+//   several long (4+) red runs. The code gives you NO statistical edge on
+//   its own; your timing is the only thing that can push the true win rate
+//   above 33%, and it may not.
+//
+//   In the real world a 33%-breakeven setup can MISS 10 or 15 attempts in a
+//   ROW. Do NOT try to "win it back" in one session. Correct discipline:
+//     - Enable ONLY after you have seen clustered long (4+) red runs.
+//     - Set MaxRealLossInARow tight. When the breaker halts you, STOP.
+//     - If you lose the day's allowance, WALK AWAY and look again tomorrow.
+//   With "10,100,1000" a SINGLE long run can fire up to 3 times = up to 3
+//   stacked losses, and two long runs back-to-back can exhaust a 4-loss
+//   breaker fast. Your qty rule and breaker are the ONLY real protection —
+//   keep them conservative and honor them.
+// ****************************************************************************
 //
 // ============================================================================
 // CONNECTION INTERRUPT / RESUME (same as v4)
@@ -188,6 +222,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ── previous bar tracking (for Renko bit) ────────────────────────────
         private int prevBarBit = -1;  // -1 = uninitialized, 0 = green, 1 = red
 
+        // ── parsed Filter-1 pattern list (Layer-1 multi-pattern support) ──────
+        // Filter1Pattern may hold ONE OR MORE tail patterns separated by commas,
+        // e.g. "10,100,1000". ParseFilter1Patterns() strips ALL whitespace from
+        // each token and drops empties. A trade fires if the rawString tail matches
+        // ANY token (logical OR; see TailMatchesAny). Blank / all-junk input parses
+        // to an EMPTY list and NEVER fires — intentional safeguard: a mistyped
+        // filter trades NOTHING rather than trading the wrong thing. Wildcards
+        // ('*'=1+ zeros, '?'=1+ ones) still work WITHIN each token.
+        private System.Collections.Generic.List<string> filter1Patterns =
+            new System.Collections.Generic.List<string>();
+
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
@@ -229,7 +274,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 EnableTrailingStop   = false;
                 TrailDistancePoints  = 10;
                 EnableRealOrder      = false;   // observation only until flipped
-                Filter1Pattern       = "1000";  // user-specified
+                Filter1Pattern       = "10,100,1000";  // Layer-1 multi-pattern default (comma OR); type "1000" alone for the tight length-3-only bet
                 Filter2Pattern       = "000";   // user-specified
                 BaseQuantity         = 1;
                 EnableQtyIncrement   = false;
@@ -280,6 +325,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         sessionIter = new SessionIterator(BarsArray[0]);
 
                     StartupDecideAndLoad();
+                    ParseFilter1Patterns();   // parse the comma-delimited F1 list (Layer-1 multi-pattern)
                     ParseQtyRule();   // after log path is set, so [QTY RULE] logs to the right file
                 }
             }
@@ -529,14 +575,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 DiagLog(isArmed ? "[F2 MATCH] isArmed=true" : "[F2 NO MATCH] isArmed=false");
             }
 
-            bool f1Match = TailMatches(raw, Filter1Pattern);
+            bool f1Match = TailMatchesAny(raw);
             if (f1Match)
             {
                 waitingForF1Outcome = true;
                 DiagLog("[F1 MATCH] rawString tail matches Filter1 -> next bit feeds filter1Outcome");
             }
 
-            nextIsMoney = TailMatches(raw, Filter1Pattern);   // LAYER 1: fire on every F1 match (Layer 2/F2 gate bypassed)
+            nextIsMoney = TailMatchesAny(raw);   // LAYER 1: fire on every F1 match (Layer 2/F2 gate bypassed)
 
             DiagLog(string.Format("[PIPELINE] raw({0})={1} | f1({2})={3} | waitF1={4} | isArmed={5} | nextIsMoney={6} | realLossRow={7}",
                 rawString.Length, TailOf(rawString, 12),
@@ -870,6 +916,43 @@ namespace NinjaTrader.NinjaScript.Strategies
         // If no parens are present, falls back to splitting the bare string on commas.
         // SAFETY: any multiplier > QTY_MULT_CAP is REFUSED (a typo can never inflate
         // size). Logs the full ACTIVE table so it can be verified at a glance.
+        // =====================================================================
+        // ParseFilter1Patterns — Layer-1 comma-delimited multi-pattern support
+        // =====================================================================
+        // Splits Filter1Pattern into a list of tail patterns on commas, removing
+        // ALL whitespace inside each token and dropping empty tokens. A brick fires
+        // a real trade if the rawString tail matches ANY token (logical OR — see
+        // TailMatchesAny). Blank or all-invalid input -> EMPTY list -> NO trade ever
+        // fires (the same silent, safe no-op a malformed single pattern gives today).
+        // Wildcards ('*','?') are preserved and matched per-token.
+        private void ParseFilter1Patterns()
+        {
+            filter1Patterns = new System.Collections.Generic.List<string>();
+            string src = Filter1Pattern ?? "";
+            foreach (string rawTok in src.Split(','))
+            {
+                string tok = new string(rawTok.Where(c => !char.IsWhiteSpace(c)).ToArray());
+                if (tok.Length == 0) continue;
+                filter1Patterns.Add(tok);
+            }
+            if (filter1Patterns.Count > 0)
+                DiagLog("[F1 PATTERNS] ACTIVE (OR-match, ANY one fires): "
+                    + string.Join("  |  ", filter1Patterns.ToArray()));
+            else
+                DiagLog("[F1 PATTERNS] EMPTY after parsing '" + src
+                    + "' -> NO trade will EVER fire (safeguard).");
+        }
+
+        // OR over the parsed Filter-1 list: true if the tail matches ANY pattern.
+        // Empty list -> false (no trade). Replaces the old single-pattern
+        // raw-vs-Filter1Pattern test everywhere F1 matching is needed.
+        private bool TailMatchesAny(string text)
+        {
+            for (int i = 0; i < filter1Patterns.Count; i++)
+                if (TailMatches(text, filter1Patterns[i])) return true;
+            return false;
+        }
+
         private void ParseQtyRule()
         {
             try
@@ -1013,8 +1096,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             string raw = rawString.ToString();
             string f1str = filter1Outcome.ToString();
             isArmed = TailMatches(f1str, Filter2Pattern);
-            waitingForF1Outcome = TailMatches(raw, Filter1Pattern);
-            nextIsMoney = TailMatches(raw, Filter1Pattern);   // LAYER 1: fire on every F1 match (Layer 2/F2 gate bypassed)
+            waitingForF1Outcome = TailMatchesAny(raw);
+            nextIsMoney = TailMatchesAny(raw);   // LAYER 1: fire on every F1 match (Layer 2/F2 gate bypassed)
         }
 
         // =====================================================================
@@ -1529,8 +1612,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool EnableRealOrder { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Filter 1 Pattern", Order = 2, GroupName = "5. Filter & Order",
-            Description = "Tail pattern on rawString. Wildcards: '*'=0+, '?'=1+. Default: 1000")]
+        [Display(Name = "Filter 1 Pattern  (Multiple pattern delimited by comma ok, use CAUTIOUS)", Order = 2, GroupName = "5. Filter & Order",
+            Description = "ONE or MORE comma-delimited tail patterns on rawString (spaces ignored), "
+                        + "e.g. '10,100,1000'. A trade fires if the tail matches ANY pattern (OR). "
+                        + "Per-pattern wildcards: '*'=one-or-more 0s, '?'=one-or-more 1s. "
+                        + "CAUTIOUS: discretionary gamble, NOT an edge (33% is only BREAKEVEN). "
+                        + "Overlapping short patterns (10,100,1000) can fire up to 3 times inside ONE "
+                        + "long run = up to 3 stacked losses. A blank/mistyped filter parses to nothing "
+                        + "and simply never trades. Default: 10,100,1000")]
         public string Filter1Pattern { get; set; }
 
         // Filter 2 is IGNORED for trading in Layer 1 (the F2 gate is bypassed).
