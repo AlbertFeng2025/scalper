@@ -182,6 +182,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ── previous bar tracking (for Renko bit) ────────────────────────────
         private int prevBarBit = -1;  // -1 = uninitialized, 0 = green, 1 = red
 
+        // -- Trend Gate: rolling window of brick directions (+1 up, -1 down) --
+        private readonly System.Collections.Generic.Queue<int> trendWindow =
+            new System.Collections.Generic.Queue<int>();
+        // -- reconnect re-warm flag (set on connection thread, applied on next bar) --
+        private bool pendingRewarm = false;
+
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
@@ -233,6 +239,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MaxTotalBarCount     = 100000;  // max Renko bars to process
                 MaxRealLossInARow    = 4;       // breaker (>=4 so qty x3 line can fire)
 
+                // Trend Gate (ON by default) + optional reconnect re-warm (OFF by default)
+                EnableTrendGate       = true;
+                TrendGateBarsBack     = 10;
+                TrendGateMaxNetDown   = 3;
+                EnableReconnectRewarm = false;
+
                 // RESUME across a reconnect is DISABLED by default for Renko: the
                 // gap tolerance is measured in minutes but the pipeline advances in
                 // BRICKS, and a fast move can print many bricks in a few minutes.
@@ -279,6 +291,39 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // Clear ONLY the brick-derived pipeline (rawString / filter1Outcome / arming /
+        // trend window) so it re-warms from live bricks after a connection interrupt. Does
+        // NOT touch the open position, its GTC broker-side bracket, or real-outcome/qty/breaker.
+        private void ClearPipelineForRewarm()
+        {
+            rawString.Clear();
+            filter1Outcome.Clear();
+            isArmed = false;
+            waitingForF1Outcome = false;
+            nextIsMoney = false;
+            trendWindow.Clear();
+            DiagLog("[RECONNECT REWARM] pipeline cleared; re-warming from live bricks.");
+        }
+
+        // Optional (EnableReconnectRewarm, default OFF). NT auto-reconnect does NOT restart the
+        // strategy, so bricks missed during an outage would leave a HOLE in rawString. When
+        // enabled, a lost/dropped price connection flags a re-warm (performed on the next bar,
+        // on the pipeline thread) so we distrust the string and rebuild from live bricks.
+        protected override void OnConnectionStatusUpdate(ConnectionStatusEventArgs connectionStatusUpdate)
+        {
+            try
+            {
+                if (!EnableReconnectRewarm) return;
+                ConnectionStatus ps = connectionStatusUpdate.PriceStatus;
+                if (ps == ConnectionStatus.ConnectionLost || ps == ConnectionStatus.Disconnected)
+                {
+                    pendingRewarm = true;
+                    DiagLog("[RECONNECT REWARM] price connection " + ps + " -> will re-warm on next bar.");
+                }
+            }
+            catch { }
+        }
+
         // =====================================================================
         // OnBarUpdate — CORE: Renko bar close -> bit -> pipeline -> maybe trade
         // =====================================================================
@@ -286,6 +331,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State != State.Realtime) return;
             if (!lifeStarted) return;
+
+            // Apply a pending reconnect re-warm (flagged on the connection thread).
+            if (pendingRewarm) { ClearPipelineForRewarm(); pendingRewarm = false; }
 
             // Must have at least 1 previous bar to compare
             if (CurrentBar < 1) return;
@@ -362,6 +410,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             DiagLog(string.Format("[RENKO BAR #{0}] Close={1:F2} PrevClose={2:F2} -> bit={3} ({4})",
                 barCount, Close[0], Close[1], bit, bit == 1 ? "GREEN/up" : "RED/down"));
 
+            // Trend Gate: record this brick's direction in the rolling window.
+            trendWindow.Enqueue(bit == 1 ? 1 : -1);
+            while (trendWindow.Count > TrendGateBarsBack) trendWindow.Dequeue();
+
             // =====================================================================
             // STEP 2: UPDATE PIPELINE
             // =====================================================================
@@ -389,10 +441,23 @@ namespace NinjaTrader.NinjaScript.Strategies
             // =====================================================================
             // STEP 4: ACT ON THE TRADE TRIGGER
             // =====================================================================
-            if (nextIsMoney && EnableRealOrder && !hasOpenPosition)
+            // Trend Gate: suppress ONLY the real order (pipeline already advanced above)
+            // when the last N bricks are a strong run against the fade.
+            int trendNet = 0; foreach (int d in trendWindow) trendNet += d;
+            bool trendGateOK = !EnableTrendGate || (trendNet >= -TrendGateMaxNetDown);
+
+            if (nextIsMoney && EnableRealOrder && !hasOpenPosition && trendGateOK)
             {
                 nextIsMoney = false;  // consume the trigger
                 TryOpenRealTrade();
+            }
+            else if (nextIsMoney && EnableRealOrder && !hasOpenPosition && !trendGateOK)
+            {
+                DiagLog(string.Format(
+                    "[TREND GATE] real order suppressed: net{0}={1} beyond -{2} (strong DOWN-run). Pipeline intact.",
+                    TrendGateBarsBack, trendNet, TrendGateMaxNetDown));
+                WriteLogRowObs(GetCurrentAsk(), "OBS_TREND_GATE");
+                nextIsMoney = false;
             }
             else if (nextIsMoney)
             {
@@ -686,6 +751,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             rawString.Clear();
             filter1Outcome.Clear();
             realTradeOutcome.Clear();
+            trendWindow.Clear();
 
             string latest = FindMostRecentLogFile();
             bool   doFresh = true;
@@ -977,6 +1043,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 isArmed = false;
                 waitingForF1Outcome = false;
                 nextIsMoney = false;
+                trendWindow.Clear();
                 sessionRealOutcome.Clear();
                 sessionDayKey = key;
                 if (realLossesInARow > 0)
@@ -1573,6 +1640,33 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + "(1=win,0=loss) ends with this PLAIN pattern (no wildcard). "
                         + "Default '1' = stop after a win. e.g. '11' = stop after two wins.")]
         public string TradeOutcomeExitPattern { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Trend Gate", Order = 1, GroupName = "9. Trend Gate",
+            Description = "ON by default. Skips a REAL entry when the last N bricks are a strong down-run "
+                        + "(the fade loses when run over by a trend). Pipeline / arming / logging are unaffected "
+                        + "- only the real order is gated, so it stays in sync with the research pipeline.")]
+        public bool EnableTrendGate { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(2, 100)]
+        [Display(Name = "Trend Gate: bricks looked back (N)", Order = 2, GroupName = "9. Trend Gate",
+            Description = "Window size. net = (#up - #down) over the last N closed bricks. Default 10.")]
+        public int TrendGateBarsBack { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 100)]
+        [Display(Name = "Trend Gate: max net DOWN-bricks to allow LONG", Order = 3, GroupName = "9. Trend Gate",
+            Description = "LONG: skip the entry when net down-bricks over the window EXCEEDS this (a strong selloff). Default 3 (mirror of the SHORT gate).")]
+        public int TrendGateMaxNetDown { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Re-warm pipeline on disconnect (advanced)", Order = 6, GroupName = "2. Timing",
+            Description = "OFF by default. When ON, a lost/dropped price connection clears the brick pipeline "
+                        + "so it re-warms from live bricks - avoids trading on a HOLED rawString after an "
+                        + "auto-reconnect that does not restart the strategy. Costs the re-warm delay. "
+                        + "Open positions keep their broker-side GTC bracket and are untouched.")]
+        public bool EnableReconnectRewarm { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Log Folder", Order = 1, GroupName = "8. Logging")]
