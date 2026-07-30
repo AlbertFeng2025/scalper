@@ -205,25 +205,25 @@ namespace NinjaTrader.NinjaScript.Strategies
                 EnableTradingHours   = true;
                 TradingStartHour     = 9;       // 09:30 ET
                 TradingStartMinute   = 30;
-                TradingEndHour       = 11;      // 11:30 ET
+                TradingEndHour       = 15;      // 11:30 ET
                 TradingEndMinute     = 30;
                 StrategyLifeMinutes  = 1440;    // 24h
                 UseMarketEntry       = true;
                 LimitOffsetPoints    = 5;
-                StopLossPoints       = 20;      // user-specified
-                ProfitTargetPoints   = 40;      // user-specified
+                StopLossPoints       = 10;      // user-specified
+                ProfitTargetPoints   = 20;      // user-specified
                 EnableTrailingStop   = false;
                 TrailDistancePoints  = 10;
                 EnableRealOrder      = false;   // observation only until flipped
-                Filter1Pattern       = "1000";  // user-specified
-                Filter2Pattern       = "000";   // user-specified
+                Filter1Pattern       = "100";  // user-specified
+                Filter2Pattern       = "0100";   // user-specified
                 BaseQuantity         = 1;
                 EnableQtyIncrement   = false;
-                QtyRuleText          = "(\"00\":2),(\"000\":3)";
+                QtyRuleText          = "(\"00\":2),(\"000\":3),(\"0000\":3),(\"00000\":4)";
                 EnableTradeOutcomeExit  = false;
                 TradeOutcomeExitPattern = "1";
                 MaxTotalBarCount     = 100000;  // max Renko bars to process
-                MaxRealLossInARow    = 4;       // breaker (>=4 so qty x3 line can fire)
+                MaxRealLossInARow    = 6;       // breaker (>=4 so qty x3 line can fire)
 
                 // Trend Gate (ON by default) + optional reconnect re-warm (OFF by default)
                 EnableTrendGate       = true;
