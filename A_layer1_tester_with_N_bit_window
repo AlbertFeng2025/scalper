@@ -1,0 +1,66 @@
+def A_layer1_tester_with_N_bit_window(string, F1, N_LENGTH):
+    def make_matcher(pattern):
+        return lambda s: s.endswith(pattern)
+    
+    m1 = make_matcher(F1)
+    
+    rawString = ""
+    bits_remaining = 0
+    
+    outcome_string = ""
+    
+    for i, b in enumerate(string):
+        # 1. If we are in a capture window, collect the current bit
+        if bits_remaining > 0:
+            outcome_string += b
+            bits_remaining -= 1
+        
+        rawString += b
+        
+        # 2. Check for trigger (F1) directly
+        # If triggered, we start/reset our N_LENGTH capture window
+        if m1(rawString):
+            bits_remaining = N_LENGTH
+            
+    # 3. Break the outcome_string into individual N_LENGTH chunks for analysis
+    substrings_data = []
+    for i in range(0, len(outcome_string), N_LENGTH):
+        chunk = outcome_string[i:i+N_LENGTH]
+        if chunk:  # Ensure we don't process empty chunks if lengths don't align perfectly
+            ones_count = chunk.count('1')
+            percentage = (ones_count / len(chunk)) * 100 if len(chunk) > 0 else 0.0
+            substrings_data.append({
+                "chunk": chunk,
+                "length": len(chunk),
+                "ones_percentage": percentage
+            })
+            
+    return outcome_string, substrings_data
+
+# --- Test ---
+s = "0110110111100011111111110100101111111001111101110001110011010011011010101111111011000111101101111010111111111011111101111101111100110011011011100011111101110011111011110111100101110010011100001101110101011011100111101111111110111111011101111011111110010110111001111101101110101001101010111111100110111100111101110000011001001011101111000111110111011010001110101011111011011110111101011111010010011111110101110"
+
+# ==========================================
+# USER CONFIGURATION PANEL
+# ==========================================
+F1_PATTERN = "001100"
+N_LENGTH   = 4
+# ==========================================
+
+outcomes, sub_data = A_layer1_tester_with_N_bit_window(s, F1=F1_PATTERN, N_LENGTH=N_LENGTH)
+
+# Calculate metrics
+input_ones_pct = (s.count('1') / len(s)) * 100
+outcome_ones_pct = (outcomes.count('1') / len(outcomes)) * 100 if len(outcomes) > 0 else 0.0
+max_consecutive_zeros = max((len(zero_seq) for zero_seq in outcomes.split('1')), default=0)
+
+print(f"Percentage of 1's in input string: {input_ones_pct:.2f}%")
+print(f"Outcome string (all N_LENGTH blocks concatenated): {outcomes}")
+print(f"Total bits captured: {len(outcomes)}")
+print(f"Percentage of 1's in total outcomes: {outcome_ones_pct:.2f}%")
+print(f"Max consecutive 0's in outcome string: {max_consecutive_zeros}\n")
+
+# Detailed breakdown of each N_LENGTH substring
+print(f"--- Breakdown of each {N_LENGTH}-bit Substring ---")
+for idx, data in enumerate(sub_data):
+    print(f"Substring {idx + 1}: '{data['chunk']}' -> 1's: {data['ones_percentage']:.2f}%")
