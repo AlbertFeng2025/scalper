@@ -8,14 +8,21 @@
 # Step 2: Applies a second filter, pattern F2, directly to each of the three Layer 1
 #         outcome strings to extract the next bit, creating Layer 2 strings.
 # Step 3: Calculates and prints the statistics for the Layer 2 strings.
+#
+# INPUT CONVENTION (important):
+#   The input string is GREEN=1 / RED=0  (i.e. the LONG-book encoding, up-brick=1).
+#   -> long_rawString  = input as-is        (green=1 = LONG book, 1 = long win)
+#   -> short_rawString = bitwise flip        (green=0 = SHORT book, 1 = short win)
+#   NOTE: the saved renko_strings.json is SHORT-encoded (green=0). To use those
+#         here, FLIP them first, or the long/short labels will be reversed.
 # ==============================================================================
 
 def analyze_renko_layer2(renkobar_rawString, F1="10", F2="100"):
     # ---------------------------------------------------------
     # STEP 1: Build Layer 1 Strings (Long, Short, Merged)
     # ---------------------------------------------------------
-    long_rawString = renkobar_rawString
-    short_rawString = "".join(['1' if bit == '0' else '0' for bit in long_rawString])
+    long_rawString  = renkobar_rawString                                            # green=1/red=0 -> LONG book (1 = long win)
+    short_rawString = "".join(['1' if bit == '0' else '0' for bit in long_rawString])  # flip -> SHORT book (1 = short win)
     
     F1_longOutcome = ""
     F1_shortOutcome = ""
@@ -120,8 +127,8 @@ def analyze_renko_layer2(renkobar_rawString, F1="10", F2="100"):
 # RUN THE SCRIPT
 # ==============================================================================
 if __name__ == "__main__":
-    # User-defined inputs
-    input_string = "111110011001000100011110111100001010111101011100011"
+    # User-defined input (GREEN=1 / RED=0 = LONG-book encoding). Feed ONE day at a time.
+    renko_green1_red0_string = "111110011001000100011110111100001010111101011100011"
     
     # Execute function with F1 and F2 parameters
-    analyze_renko_layer2(renkobar_rawString=input_string, F1="10", F2="100")
+    analyze_renko_layer2(renkobar_rawString=renko_green1_red0_string, F1="10", F2="100")
