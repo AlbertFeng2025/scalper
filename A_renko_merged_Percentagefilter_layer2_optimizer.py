@@ -1,8 +1,9 @@
 # ==============================================================================
-# Renko_Layer2_Optimizer.py
+# Renko_Layer2_Cluster_Optimizer.py (with Overlay toggle)
 # ==============================================================================
-# This script automatically tests thousands of parameter combinations to find 
-# the settings that yield the highest percentage of 1's in F2_mergedOutcome.
+# This script maps all parameter combinations and then scans for "Clusters" - 
+# areas where a parameter AND its immediate neighbors all perform well.
+# It now tests both Overlay = True and Overlay = False and prints the result.
 # ==============================================================================
 
 def get_f2_merged_stats(long_rawString, F1, num_search, pct_lower, pct_upper, num_capture, allow_overlay):
@@ -36,7 +37,7 @@ def get_f2_merged_stats(long_rawString, F1, num_search, pct_lower, pct_upper, nu
             outcome += F1_mergedOutcome[capture_start:capture_end]
             
             if allow_overlay:
-                i = capture_end - num_search
+                i = max(i + 1, capture_end - num_search)
             else:
                 i = capture_end
         else:
@@ -55,54 +56,79 @@ if __name__ == "__main__":
     PATTERN_F1 = "10"
     
     # ------------------------------------------------------------------
-    # SEARCH GRID CONFIGURATION
-    # Adjust these ranges to search wider or narrower possibilities
+    # ROBUSTNESS CRITERIA
     # ------------------------------------------------------------------
-    SEARCH_LENGTHS = range(3, 16)       # Tests num_search from 3 to 15
-    CAPTURE_LENGTHS = range(1, 8)       # Tests num_capture from 1 to 7
-    OVERLAY_OPTIONS = [True, False]
-    
-    # Minimum amount of bits required in the final string to be considered valid
     MIN_CAPTURE_LENGTH = 30 
+    MIN_NEIGHBOR_WIN_RATE = 35.0 
     # ------------------------------------------------------------------
 
-    results = []
-
-    print("Running optimizer, testing parameter combinations...")
+    # 1. Run Grid Search and store everything in a dictionary
+    results_map = {}
+    print("Step 1: Running grid search (Testing both Overlay True and False)...")
     
-    for n_search in SEARCH_LENGTHS:
-        for n_cap in CAPTURE_LENGTHS:
-            for overlay in OVERLAY_OPTIONS:
-                # Test different percentage brackets (e.g. 0-20, 10-30, 80-100, etc.)
+    for overlay in [True, False]:  # Now testing both!
+        for n_search in range(3, 16):
+            for n_cap in range(1, 8):
                 for p_lower in range(0, 100, 10):
                     for p_upper in range(p_lower + 10, 101, 10):
-                        
                         pct, length = get_f2_merged_stats(
                             RAW_STRING, PATTERN_F1, n_search, p_lower, p_upper, n_cap, overlay
                         )
                         
                         if length >= MIN_CAPTURE_LENGTH:
-                            results.append({
-                                'pct': pct,
-                                'len': length,
-                                'n_search': n_search,
-                                'p_lower': p_lower,
-                                'p_upper': p_upper,
-                                'n_cap': n_cap,
-                                'overlay': overlay
-                            })
+                            # We now store overlay in the dictionary key so we can track it
+                            results_map[(n_search, n_cap, p_lower, p_upper, overlay)] = (pct, length)
 
-    # Sort the results by highest percentage first, then by highest length
-    results.sort(key=lambda x: (x['pct'], x['len']), reverse=True)
-
-    print("\n" + "=" * 70)
-    print(" TOP 10 BEST PARAMETER COMBINATIONS")
-    print(f" (Filtering out results with less than {MIN_CAPTURE_LENGTH} total captured bits)")
-    print("=" * 70)
+    # 2. Analyze Neighborhoods (Clusters)
+    print("Step 2: Finding robust parameter clusters...")
+    clusters = []
     
-    if not results:
-        print("No combinations met the minimum capture length requirement.")
+    for params, (center_pct, center_len) in results_map.items():
+        S, C, L, U, overlay = params
+        
+        # Look at the 3x3 grid around our current parameter set
+        # We keep the overlay, lower, and upper bounds the same, but shift search and capture lengths
+        neighbors = []
+        for dS in [-1, 0, 1]:
+            for dC in [-1, 0, 1]:
+                neighbor_key = (S + dS, C + dC, L, U, overlay)
+                if neighbor_key in results_map:
+                    neighbors.append(results_map[neighbor_key])
+        
+        # A full 3x3 grid has 9 points. We want at least 6 valid neighbors 
+        if len(neighbors) >= 6:
+            avg_pct = sum(n[0] for n in neighbors) / len(neighbors)
+            min_pct = min(n[0] for n in neighbors)
+            total_cluster_trades = sum(n[1] for n in neighbors)
+            
+            # Filter: Does the WORST neighbor still survive our break-even threshold?
+            if min_pct >= MIN_NEIGHBOR_WIN_RATE:
+                clusters.append({
+                    'params': params,
+                    'center_pct': center_pct,
+                    'avg_pct': avg_pct,
+                    'min_pct': min_pct,
+                    'total_trades': total_cluster_trades,
+                    'neighbor_count': len(neighbors)
+                })
+
+    # Sort the clusters by the highest AVERAGE percentage across the neighborhood
+    clusters.sort(key=lambda x: x['avg_pct'], reverse=True)
+
+    # 3. Print Results
+    print("\n" + "=" * 80)
+    print(" TOP ROBUST PARAMETER CLUSTERS")
+    print(f" (Worst neighbor must stay above {MIN_NEIGHBOR_WIN_RATE}% win rate)")
+    print("=" * 80)
+    
+    if not clusters:
+        print("No clusters met the strict robustness and break-even requirements.")
+        print("Try lowering the MIN_NEIGHBOR_WIN_RATE or providing a longer RAW_STRING.")
     else:
-        for i, res in enumerate(results[:10]):
-            print(f"Rank {i+1}: {res['pct']:.2f}% 1's (Total bits: {res['len']})")
-            print(f"  -> num_search: {res['n_search']}, pct_bounds: [{res['p_lower']}-{res['p_upper']}], num_cap: {res['n_cap']}, overlay: {res['overlay']}\n")
+        for i, cl in enumerate(clusters[:10]):
+            S, C, L, U, overlay = cl['params']
+            print(f"Rank {i+1}: Center [Search:{S}, Cap:{C}, Bounds:{L}-{U}, Overlay: {overlay}]")
+            print(f"  -> Cluster Average Win Rate: {cl['avg_pct']:.2f}% (over {cl['neighbor_count']} neighbors)")
+            print(f"  -> Center Point Win Rate:    {cl['center_pct']:.2f}%")
+            print(f"  -> WORST Neighbor Win Rate:  {cl['min_pct']:.2f}%  <-- Safe!")
+            print(f"  -> Total bits captured across cluster: {cl['total_trades']}\n")
