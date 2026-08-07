@@ -1,0 +1,647 @@
+#region Using declarations
+using System;
+using System.IO;
+using System.Text;
+using System.ComponentModel.DataAnnotations;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.Strategies;
+#endregion
+
+// =============================================================================
+// Renko_mergedTransit_Layer1  —  DUAL-DIRECTION merged Renko Layer-1
+// =============================================================================
+// One instance trades BOTH long and short off a MERGED brick stream.
+//
+//   Bit convention (MERGED / LONG-string):  Close rose = GREEN = 1
+//                                            Close fell = RED   = 0
+//   shortString = bitwise flip of longString.
+//
+//   Each brick, F1 is tested against BOTH strings:
+//     - longString  tail matches F1  ->  a LONG transit  -> place LONG
+//     - shortString tail matches F1  ->  a SHORT transit -> place SHORT
+//   For F1="10" the two never match on the same brick (a tail can't be both
+//   "10" and "01"); if a symmetric F1 ever matches both, LONG is taken first
+//   and (serialized) SHORT is skipped while the long is open.
+//
+//   DIRECTION = the book that matched. "Chase the transit":
+//     long-string "10" (green->red) -> bet next green -> LONG
+//     short-string "10" (= real red->green) -> bet next red -> SHORT
+//
+//   Bracket geometry flips per trade, anchored to the BRICK CLOSE (Close[0]):
+//     LONG : stop = brickClose - StopLossPoints (below), target = brickClose + ProfitTargetPoints (above)
+//     SHORT: stop = brickClose + StopLossPoints (above), target = brickClose - ProfitTargetPoints (below)
+//
+//   Layer 1 = fires on EVERY F1 match (no F2 gate). filter1Outcome (merged,
+//   win-encoded) is still collected for observation/logging.
+//
+//   ONE account, SERIALIZED: a new signal is skipped while a position/order is
+//   open. With exit-bit=1 (win-and-quit) the book clears fast, so the next
+//   transit is usually free to take.
+//
+//   Qty rule, breaker, exit-bit, trading hours, gap fresh-start, and the
+//   StopCancelCloseIgnoreRejects safety are the SAME as the single-book files.
+//   Qty rule / exit-bit / breaker all read the MERGED realTradeOutcome (a loss
+//   is a loss regardless of side).
+// =============================================================================
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public class Renko_mergedTransit_Layer1 : Strategy
+    {
+        // ── merged pipeline strings (LONG encoding: green=1/red=0) ────────────
+        private readonly StringBuilder longStr        = new StringBuilder();
+        private readonly StringBuilder shortStr       = new StringBuilder();
+        private readonly StringBuilder filter1Outcome = new StringBuilder(); // merged, win-encoded (observation)
+        private readonly StringBuilder realTradeOutcome = new StringBuilder(); // merged real W/L
+
+        // ── pipeline / order state ────────────────────────────────────────────
+        private int    prevBarBit    = -1;     // 1=green, 0=red
+        private int    barCount      = 0;
+        private bool   entryInFlight = false;
+        private bool   awaitingClose = false;
+        private double entryFillPrice = 0.0;
+        private int    entryFillQty   = 0;
+        private int    tradeSide      = 0;      // +1 long, -1 short, 0 flat (side of the working money trade)
+        private const string ENTRY_LONG  = "ML1_Long";
+        private const string ENTRY_SHORT = "ML1_Short";
+
+        // waiting-for-outcome (observation string, per book)
+        private bool waitLongOutcome  = false;
+        private bool waitShortOutcome = false;
+
+        // ── loss streak / qty ─────────────────────────────────────────────────
+        private int realLossesInARow = 0;
+        private (string pattern, int multiplier)[] qtyTable =
+            new (string pattern, int multiplier)[] { ("00", 2), ("000", 3), ("0000", 5) };
+        private int currentQty = 1;
+        private readonly StringBuilder sessionRealOutcome = new StringBuilder();
+        private int sessionDayKey = -1;
+
+        // ── life / shutdown ───────────────────────────────────────────────────
+        private DateTime strategyStartUtc = DateTime.MinValue;
+        private bool     lifeStarted      = false;
+        private bool     pendingFlatten   = false;
+        private string   pendingReason    = string.Empty;
+
+        // ── logging / gap ─────────────────────────────────────────────────────
+        private string  activeLogFilePath = null;
+        private SessionIterator sessionIter = null;
+        private DateTime lastBrickTimeUtc = DateTime.MinValue;
+
+        // ── parsed F1 list ────────────────────────────────────────────────────
+        private System.Collections.Generic.List<string> filter1Patterns =
+            new System.Collections.Generic.List<string>();
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name        = "Renko_mergedTransit_Layer1";
+                Description = "Dual-direction MERGED Renko Layer-1. green=1/red=0. F1 tested vs long+short "
+                            + "strings; matching book decides direction (chase the transit). No F2 gate.";
+
+                Calculate                    = Calculate.OnBarClose;
+                EntriesPerDirection          = 1;
+                EntryHandling                = EntryHandling.AllEntries;
+                IsExitOnSessionCloseStrategy = true;
+                ExitOnSessionCloseSeconds    = 30;
+                MaximumBarsLookBack          = MaximumBarsLookBack.TwoHundredFiftySix;
+                StartBehavior                = StartBehavior.WaitUntilFlat;
+                TimeInForce                  = TimeInForce.Gtc;
+                RealtimeErrorHandling        = RealtimeErrorHandling.StopCancelCloseIgnoreRejects;
+                StopTargetHandling           = StopTargetHandling.PerEntryExecution;
+                BarsRequiredToTrade          = 0;
+                IsUnmanaged                  = false;
+
+                EnableTradingHours   = true;
+                TradingStartHour     = 9;
+                TradingStartMinute   = 30;
+                TradingEndHour       = 11;
+                TradingEndMinute     = 30;
+                StrategyLifeMinutes  = 1440;
+                UseMarketEntry       = true;
+                LimitOffsetPoints    = 5;
+                StopLossPoints       = 10;      // 40-tick brick default
+                ProfitTargetPoints   = 20;
+                EnableRealOrder      = false;   // observation only until flipped
+                Filter1Pattern       = "10";
+                BaseQuantity         = 1;
+                EnableQtyIncrement   = false;
+                QtyRuleText          = "(\"00\":2),(\"000\":3),(\"0000\":5)";
+                EnableTradeOutcomeExit  = true; // exit-bit on by default per design
+                TradeOutcomeExitPattern = "1";  // win-and-quit
+                MaxTotalBarCount     = 100000;
+                MaxRealLossInARow    = 5;
+                LogFolder            = @"C:\temp";
+                LogBaseName          = "Renko_mergedTransit_Layer1";
+                GapToleranceMinutes  = 7;
+            }
+            else if (State == State.DataLoaded)
+            {
+                if (BarsArray != null && BarsArray.Length > 0)
+                    sessionIter = new SessionIterator(BarsArray[0]);
+            }
+            else if (State == State.Realtime)
+            {
+                if (!lifeStarted)
+                {
+                    strategyStartUtc = DateTime.UtcNow;
+                    lifeStarted      = true;
+                    if (sessionIter == null && BarsArray != null && BarsArray.Length > 0)
+                        sessionIter = new SessionIterator(BarsArray[0]);
+                    FreshStart("strategy entered real-time");
+                    ParseFilter1Patterns();
+                    ParseQtyRule();
+                }
+            }
+        }
+
+        // =====================================================================
+        // OnBarUpdate — brick close -> bit -> merged pipeline -> maybe trade(s)
+        // =====================================================================
+        protected override void OnBarUpdate()
+        {
+            if (State != State.Realtime) return;
+            if (CurrentBar < 1) return;
+
+            if (pendingFlatten) { DoFlatten(); return; }
+
+            // ── daily reset (3:00 PM PT session boundary uses the bar's day) ──
+            int dayKey = Time[0].DayOfYear + Time[0].Year * 1000;
+            if (dayKey != sessionDayKey)
+            {
+                sessionDayKey = dayKey;
+                sessionRealOutcome.Clear();
+                realLossesInARow = 0;
+            }
+
+            // ── gap fresh-start: too many market-open minutes since last brick ──
+            if (lastBrickTimeUtc != DateTime.MinValue)
+            {
+                int openMin = MarketOpenMinutesBetween(lastBrickTimeUtc, Time[0].ToUniversalTime());
+                if (openMin > GapToleranceMinutes)
+                    FreshStart("market-open minutes in gap = " + openMin + " > tolerance " + GapToleranceMinutes + "min");
+            }
+            lastBrickTimeUtc = Time[0].ToUniversalTime();
+
+            // ── life / bar-count / breaker shutdown checks ───────────────────
+            if (StrategyLifeMinutes > 0 && (DateTime.UtcNow - strategyStartUtc).TotalMinutes >= StrategyLifeMinutes)
+            { BeginShutdown("strategy life reached"); return; }
+            if (barCount >= MaxTotalBarCount) { BeginShutdown("MaxTotalBarCount reached"); return; }
+            if (realLossesInARow >= MaxRealLossInARow) { BeginShutdown("MaxRealLossInARow reached"); return; }
+
+            // ── derive the brick bit (green=1 / red=0) from close-vs-close ────
+            int bit;
+            if (Close[0] > Close[1])      bit = 1;   // up brick  (green)
+            else if (Close[0] < Close[1]) bit = 0;   // down brick (red)
+            else                          bit = (prevBarBit >= 0) ? prevBarBit : 0;
+            prevBarBit = bit;
+            barCount++;
+
+            // ── collect prior-match observation outcomes (merged, win-encoded)
+            // long win = green next (bit==1); short win = red next (bit==0)
+            if (waitLongOutcome)
+            {
+                waitLongOutcome = false;
+                filter1Outcome.Append(bit == 1 ? "1" : "0");
+            }
+            if (waitShortOutcome)
+            {
+                waitShortOutcome = false;
+                filter1Outcome.Append(bit == 0 ? "1" : "0");
+            }
+
+            // ── append bit to both strings ───────────────────────────────────
+            longStr.Append(bit == 1 ? "1" : "0");
+            shortStr.Append(bit == 1 ? "0" : "1");
+            if (longStr.Length  > 2048) longStr.Remove(0, longStr.Length - 2048);
+            if (shortStr.Length > 2048) shortStr.Remove(0, shortStr.Length - 2048);
+
+            DiagLog(string.Format("[BRICK #{0}] Close={1:F2} Prev={2:F2} bit={3}({4}) | longTail={5} shortTail={6}",
+                barCount, Close[0], Close[1], bit, bit == 1 ? "GREEN/up" : "RED/down",
+                TailOf(longStr, 12), TailOf(shortStr, 12)));
+
+            // ── test F1 against BOTH books ───────────────────────────────────
+            bool longMatch  = TailMatchesAny(longStr.ToString());
+            bool shortMatch = TailMatchesAny(shortStr.ToString());
+
+            // observation arm (collect next-brick outcome regardless of trading)
+            if (longMatch)  waitLongOutcome  = true;
+            if (shortMatch) waitShortOutcome = true;
+
+            // ── fire (serialized): LONG first, then SHORT if still free ───────
+            bool busy = hasOpenPosition() || entryInFlight || awaitingClose;
+
+            if (longMatch)
+            {
+                if (!busy && EnableRealOrder) { TryOpenRealTrade(+1); busy = true; }
+                else DiagLog("[LONG SIGNAL] " + (busy ? "skipped (busy/serialized)" : "obs only (real orders off)"));
+            }
+            if (shortMatch)
+            {
+                if (!busy && EnableRealOrder) { TryOpenRealTrade(-1); }
+                else DiagLog("[SHORT SIGNAL] " + (busy ? "skipped (busy/serialized)" : "obs only (real orders off)"));
+            }
+        }
+
+        // =====================================================================
+        // TryOpenRealTrade(side) — direction-aware entry + flipped bracket
+        // =====================================================================
+        private void TryOpenRealTrade(int side)
+        {
+            if (EnableTradingHours && !WithinTradingHours())
+            { DiagLog("[OUTSIDE HOURS] suppressed"); return; }
+
+            currentQty = CalcQty();
+            if (currentQty <= 0) { DiagLog("[QTY SKIP] qty rule returned 0"); return; }
+
+            double refPrice = (side > 0) ? GetCurrentAsk() : GetCurrentBid();
+            if (refPrice <= 0) { DiagLog("[TRADE ABORT] no valid price"); return; }
+
+            awaitingClose = true;
+            entryInFlight = true;
+            tradeSide     = side;
+
+            double brickClose = Close[0];
+            double stopPrice, targetPrice;
+            if (side > 0)   // LONG: stop below, target above
+            {
+                stopPrice   = Instrument.MasterInstrument.RoundToTickSize(brickClose - StopLossPoints);
+                targetPrice = Instrument.MasterInstrument.RoundToTickSize(brickClose + ProfitTargetPoints);
+            }
+            else            // SHORT: stop above, target below
+            {
+                stopPrice   = Instrument.MasterInstrument.RoundToTickSize(brickClose + StopLossPoints);
+                targetPrice = Instrument.MasterInstrument.RoundToTickSize(brickClose - ProfitTargetPoints);
+            }
+
+            string sig = (side > 0) ? ENTRY_LONG : ENTRY_SHORT;
+            SetStopLoss(sig, CalculationMode.Price, stopPrice, false);
+            SetProfitTarget(sig, CalculationMode.Price, targetPrice);
+
+            try
+            {
+                if (side > 0)
+                {
+                    if (UseMarketEntry) EnterLong(currentQty, sig);
+                    else EnterLongLimit(0, true, currentQty,
+                        Instrument.MasterInstrument.RoundToTickSize(refPrice - LimitOffsetPoints), sig);
+                }
+                else
+                {
+                    if (UseMarketEntry) EnterShort(currentQty, sig);
+                    else EnterShortLimit(0, true, currentQty,
+                        Instrument.MasterInstrument.RoundToTickSize(refPrice + LimitOffsetPoints), sig);
+                }
+                DiagLog(string.Format("MONEY TRADE #{0} {1} qty={2} brickClose={3:F2} stop={4:F2} target={5:F2} | real={6}",
+                    barCount, side > 0 ? "LONG" : "SHORT", currentQty, brickClose, stopPrice, targetPrice,
+                    TailOf(realTradeOutcome, 12)));
+            }
+            catch (Exception ex)
+            {
+                DiagLog("TryOpenRealTrade error: " + ex.Message);
+                awaitingClose = false; entryInFlight = false; tradeSide = 0;
+            }
+        }
+
+        // =====================================================================
+        // OnExecutionUpdate — entry fill tracking + bracket close -> W/L
+        // =====================================================================
+        protected override void OnExecutionUpdate(Execution execution, string executionId,
+            double price, int quantity, MarketPosition marketPosition, string orderId, DateTime time)
+        {
+            if (execution == null || execution.Order == null) return;
+            string oName = execution.Order.Name ?? "";
+            bool isEntry = (oName == ENTRY_LONG || oName == ENTRY_SHORT);
+
+            if (isEntry)
+            {
+                entryFillPrice = price;
+                entryFillQty  += quantity;
+                if (execution.Order.OrderState == OrderState.Filled)
+                    entryInFlight = false;
+                return;
+            }
+
+            // an exit fill (stop/target/flatten) -> once flat, record the outcome
+            if (Position.MarketPosition == MarketPosition.Flat && awaitingClose)
+            {
+                // win/loss by side: long wins if exit price > entry; short wins if exit < entry
+                bool win = (tradeSide > 0) ? (price > entryFillPrice) : (price < entryFillPrice);
+                RecordTradeOutcome(win, price);
+            }
+        }
+
+        private void RecordTradeOutcome(bool win, double exitPrice)
+        {
+            awaitingClose = false;
+            entryInFlight = false;
+            int side = tradeSide;
+            tradeSide = 0;
+
+            string bitStr = win ? "1" : "0";
+            realTradeOutcome.Append(bitStr);
+            sessionRealOutcome.Append(bitStr);
+            if (realTradeOutcome.Length > 2048) realTradeOutcome.Remove(0, realTradeOutcome.Length - 2048);
+
+            realLossesInARow = win ? 0 : (realLossesInARow + 1);
+            entryFillQty = 0;
+
+            DiagLog(string.Format("[TRADE CLOSED] side={0} {1} exit={2:F2} entry={3:F2} | real={4} | lossRow={5}",
+                side > 0 ? "LONG" : "SHORT", win ? "WIN" : "LOSS", exitPrice, entryFillPrice,
+                TailOf(realTradeOutcome, 12), realLossesInARow));
+
+            // exit-bit / trade-outcome halt (merged)
+            if (EnableTradeOutcomeExit && TailMatches(realTradeOutcome.ToString(), TradeOutcomeExitPattern))
+                BeginShutdown("trade-outcome exit '" + TradeOutcomeExitPattern + "' matched");
+        }
+
+        // =====================================================================
+        // Qty rule (merged sessionRealOutcome) — longest-tail match wins
+        // =====================================================================
+        private int CalcQty()
+        {
+            int mult = 1;
+            if (EnableQtyIncrement && qtyTable != null)
+            {
+                string s = sessionRealOutcome.ToString();
+                int bestLen = -1;
+                foreach (var row in qtyTable)
+                {
+                    if (row.pattern.Length > s.Length) continue;
+                    if (s.EndsWith(row.pattern) && row.pattern.Length > bestLen)
+                    { bestLen = row.pattern.Length; mult = row.multiplier; }
+                }
+            }
+            int q = Math.Max(0, BaseQuantity * mult);
+            if (q != BaseQuantity)
+                DiagLog(string.Format("[QTY] sessionReal={0} -> mult applied -> qty={1}", sessionRealOutcome.ToString(), q));
+            return q;
+        }
+
+        private void ParseQtyRule()
+        {
+            var list = new System.Collections.Generic.List<(string, int)>();
+            string src = QtyRuleText ?? "";
+            int i = 0;
+            while (i < src.Length)
+            {
+                int q1 = src.IndexOf('"', i);
+                if (q1 < 0) break;
+                int q2 = src.IndexOf('"', q1 + 1);
+                if (q2 < 0) break;
+                string pat = src.Substring(q1 + 1, q2 - q1 - 1).Trim();
+                int colon = src.IndexOf(':', q2);
+                if (colon < 0) break;
+                int j = colon + 1;
+                while (j < src.Length && !char.IsDigit(src[j]) && src[j] != '-') j++;
+                int k = j;
+                while (k < src.Length && (char.IsDigit(src[k]) || src[k] == '-')) k++;
+                int mult;
+                if (j < k && int.TryParse(src.Substring(j, k - j), out mult)
+                    && pat.Length > 0 && pat.Trim('0', '1').Length == 0)
+                    list.Add((pat, mult));
+                i = (k > i) ? k : i + 1;
+            }
+            if (list.Count > 0) qtyTable = list.ToArray();
+            DiagLog("[QTY RULE] parsed " + list.Count + " rows from '" + QtyRuleText + "'");
+        }
+
+        // =====================================================================
+        // F1 parse + wildcard matcher (?=1+ ones, *=1+ zeros)
+        // =====================================================================
+        private void ParseFilter1Patterns()
+        {
+            filter1Patterns.Clear();
+            if (!string.IsNullOrEmpty(Filter1Pattern))
+                foreach (string tok in Filter1Pattern.Split(','))
+                {
+                    string t = (tok ?? "").Trim();
+                    if (t.Length == 0) continue;
+                    bool ok = true;
+                    foreach (char c in t) if (c != '0' && c != '1' && c != '*' && c != '?') { ok = false; break; }
+                    if (ok) filter1Patterns.Add(t);
+                }
+            DiagLog("[F1] active=[" + string.Join(",", filter1Patterns) + "]");
+        }
+
+        private bool TailMatchesAny(string text)
+        {
+            for (int i = 0; i < filter1Patterns.Count; i++)
+                if (TailMatches(text, filter1Patterns[i])) return true;
+            return false;
+        }
+
+        private static bool HasWild(string p)
+        { for (int i = 0; i < p.Length; i++) if (p[i] == '*' || p[i] == '?') return true; return false; }
+
+        private static bool TailMatches(string text, string pattern)
+        {
+            if (string.IsNullOrEmpty(pattern) || string.IsNullOrEmpty(text)) return false;
+            if (!HasWild(pattern)) return text.Length >= pattern.Length && text.EndsWith(pattern);
+            for (int start = text.Length - 1; start >= 0; start--)
+                if (MatchHere(text, start, pattern, 0)) return true;
+            return false;
+        }
+
+        private static bool MatchHere(string text, int ti, string pattern, int pi)
+        {
+            while (pi < pattern.Length)
+            {
+                char pc = pattern[pi];
+                if (pc == '*' || pc == '?')
+                {
+                    char want = (pc == '*') ? '0' : '1';
+                    if (ti >= text.Length || text[ti] != want) return false;
+                    ti++;
+                    int maxC = ti;
+                    while (maxC < text.Length && text[maxC] == want) maxC++;
+                    for (int c = maxC; c >= ti; c--) if (MatchHere(text, c, pattern, pi + 1)) return true;
+                    return false;
+                }
+                else { if (ti >= text.Length || text[ti] != pc) return false; ti++; pi++; }
+            }
+            return ti == text.Length;
+        }
+
+        // =====================================================================
+        // helpers: price, position, hours, gap, shutdown, logging
+        // =====================================================================
+        private double GetCurrentAsk()
+        { try { return GetCurrentAsk(0) > 0 ? GetCurrentAsk(0) : Close[0]; } catch { return Close[0]; } }
+        private double GetCurrentBid()
+        { try { return GetCurrentBid(0) > 0 ? GetCurrentBid(0) : Close[0]; } catch { return Close[0]; } }
+
+        private bool hasOpenPosition()
+        { return Position != null && Position.MarketPosition != MarketPosition.Flat; }
+
+        private bool WithinTradingHours()
+        {
+            DateTime t = Time[0];
+            int cur = t.Hour * 60 + t.Minute;
+            int s = TradingStartHour * 60 + TradingStartMinute;
+            int e = TradingEndHour * 60 + TradingEndMinute;
+            return (s <= e) ? (cur >= s && cur <= e) : (cur >= s || cur <= e);
+        }
+
+        private bool IsMarketOpenAt(DateTime localTime)
+        {
+            try
+            {
+                if (sessionIter == null) return true;
+                return sessionIter.IsInSession(localTime, false, true);
+            }
+            catch { return true; }
+        }
+
+        private int MarketOpenMinutesBetween(DateTime aUtc, DateTime bUtc)
+        {
+            try
+            {
+                DateTime a = aUtc.ToLocalTime(), b = bUtc.ToLocalTime();
+                if (b <= a) return 0;
+                int mins = 0;
+                for (DateTime t = a; t < b && mins < GapToleranceMinutes + 9999; t = t.AddMinutes(1))
+                    if (IsMarketOpenAt(t)) mins++;
+                return mins;
+            }
+            catch { return 0; }
+        }
+
+        private void FreshStart(string reason)
+        {
+            longStr.Clear(); shortStr.Clear(); filter1Outcome.Clear();
+            waitLongOutcome = false; waitShortOutcome = false;
+            prevBarBit = -1;
+            string stamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+            try
+            {
+                if (!Directory.Exists(LogFolder)) Directory.CreateDirectory(LogFolder);
+                activeLogFilePath = Path.Combine(LogFolder, LogBaseName + "_" + stamp + ".csv");
+            }
+            catch { activeLogFilePath = null; }
+            DiagLog("[FRESH START] " + reason + " | new log=" + activeLogFilePath
+                + " | pipeline EMPTY, will arm naturally (no real trades until a transit fires).");
+            DiagLog(string.Format("{0} ready (MERGED). EnableRealOrder={1}, F1=[{2}], Stop={3}pt, Target={4}pt, "
+                + "ExitBit={5}({6}), MaxLossRow={7}, GapTol={8}min",
+                Name, EnableRealOrder, Filter1Pattern, StopLossPoints, ProfitTargetPoints,
+                EnableTradeOutcomeExit, TradeOutcomeExitPattern, MaxRealLossInARow, GapToleranceMinutes));
+        }
+
+        private void BeginShutdown(string reason)
+        {
+            if (pendingFlatten) return;
+            pendingFlatten = true;
+            pendingReason  = reason;
+            DiagLog("[SHUTDOWN] " + reason + " -> flatten + disable");
+            DoFlatten();
+        }
+
+        private void DoFlatten()
+        {
+            try
+            {
+                if (Position.MarketPosition == MarketPosition.Short)
+                    ExitShort(Math.Abs(Position.Quantity), "ML1_Flatten", ENTRY_SHORT);
+                else if (Position.MarketPosition == MarketPosition.Long)
+                    ExitLong(Math.Abs(Position.Quantity), "ML1_Flatten", ENTRY_LONG);
+            }
+            catch (Exception ex) { DiagLog("[SHUTDOWN] flatten error: " + ex.Message); }
+
+            if (Position.MarketPosition == MarketPosition.Flat)
+            {
+                try { DiagLog("[SHUTDOWN] flat -> disabling."); } catch { }
+                pendingFlatten = false;
+                try { SetState(State.Terminated); } catch { }
+            }
+        }
+
+        private string TailOf(StringBuilder sb, int n)
+        {
+            int len = sb.Length;
+            if (len <= n) return sb.ToString();
+            return sb.ToString(len - n, n);
+        }
+
+        private void DiagLog(string msg)
+        {
+            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + msg;
+            try
+            {
+                if (activeLogFilePath != null)
+                    File.AppendAllText(activeLogFilePath, line + Environment.NewLine);
+            }
+            catch { }
+            Print(line);
+        }
+
+        #region Properties
+        [NinjaScriptProperty] [Display(Name="Enable Real Order", Order=1, GroupName="1. Core")]
+        public bool EnableRealOrder { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="F1 Pattern (comma OR; ?=1+ ones *=1+ zeros)", Order=2, GroupName="1. Core")]
+        public string Filter1Pattern { get; set; }
+
+        [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Base Quantity", Order=3, GroupName="1. Core")]
+        public int BaseQuantity { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Use Market Entry", Order=4, GroupName="1. Core")]
+        public bool UseMarketEntry { get; set; }
+
+        [NinjaScriptProperty] [Range(0,double.MaxValue)] [Display(Name="Limit Offset Points", Order=5, GroupName="1. Core")]
+        public double LimitOffsetPoints { get; set; }
+
+        [NinjaScriptProperty] [Range(0.25,double.MaxValue)] [Display(Name="Stop Loss Points", Order=6, GroupName="1. Core")]
+        public double StopLossPoints { get; set; }
+
+        [NinjaScriptProperty] [Range(0.25,double.MaxValue)] [Display(Name="Profit Target Points", Order=7, GroupName="1. Core")]
+        public double ProfitTargetPoints { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Enable Qty Increment", Order=1, GroupName="2. Qty Rule")]
+        public bool EnableQtyIncrement { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Qty Rule Text", Order=2, GroupName="2. Qty Rule")]
+        public string QtyRuleText { get; set; }
+
+        [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Max Real Loss In A Row (breaker)", Order=3, GroupName="2. Qty Rule")]
+        public int MaxRealLossInARow { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Enable Trade-Outcome Exit", Order=1, GroupName="3. Exit")]
+        public bool EnableTradeOutcomeExit { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Trade-Outcome Exit Pattern (1=win-and-quit)", Order=2, GroupName="3. Exit")]
+        public string TradeOutcomeExitPattern { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Enable Trading Hours", Order=1, GroupName="4. Hours")]
+        public bool EnableTradingHours { get; set; }
+
+        [NinjaScriptProperty] [Range(0,23)] [Display(Name="Start Hour", Order=2, GroupName="4. Hours")]
+        public int TradingStartHour { get; set; }
+
+        [NinjaScriptProperty] [Range(0,59)] [Display(Name="Start Minute", Order=3, GroupName="4. Hours")]
+        public int TradingStartMinute { get; set; }
+
+        [NinjaScriptProperty] [Range(0,23)] [Display(Name="End Hour", Order=4, GroupName="4. Hours")]
+        public int TradingEndHour { get; set; }
+
+        [NinjaScriptProperty] [Range(0,59)] [Display(Name="End Minute", Order=5, GroupName="4. Hours")]
+        public int TradingEndMinute { get; set; }
+
+        [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Strategy Life Minutes", Order=1, GroupName="5. Session")]
+        public int StrategyLifeMinutes { get; set; }
+
+        [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Max Total Bar Count", Order=2, GroupName="5. Session")]
+        public int MaxTotalBarCount { get; set; }
+
+        [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Gap Tolerance Minutes", Order=3, GroupName="5. Session")]
+        public int GapToleranceMinutes { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Log Folder", Order=4, GroupName="5. Session")]
+        public string LogFolder { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Log Base Name", Order=5, GroupName="5. Session")]
+        public string LogBaseName { get; set; }
+        #endregion
+    }
+}
