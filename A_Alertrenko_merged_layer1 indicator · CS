@@ -1,0 +1,341 @@
+#region Using declarations
+using System;
+using System.Text;
+using System.ComponentModel.DataAnnotations;
+using System.Windows.Media;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
+using System.ComponentModel;
+using System.Xml.Serialization;
+#endregion
+
+// =============================================================================
+// Alert_renko_layer1  —  ALERT-ONLY Renko Layer-1 INDICATOR (draws on the chart)
+//
+// Same bit + wildcard engine as the trading strategy, but places NO orders.
+// Each closed Renko brick = one bit (up=1/green, down=0/red).
+// When rawString tail matches an F1 pattern during the alert window it:
+//   (1) plays the alert sound N times,
+//   (2) draws a marker ON THE CHART (arrow + text at the signal bar), and
+//   (3) writes to the Alerts window (Alert()).
+// Wildcards:  ? = one-or-more '1's    * = one-or-more '0's
+// Default F1 = 1?0*1?0*1?  =>  (>=2 ones)(>=2 zeros)(>=2 ones)(>=2 zeros)(>=2 ones)
+// =============================================================================
+namespace NinjaTrader.NinjaScript.Indicators
+{
+    public class Alert_renko_layer1 : Indicator
+    {
+        private readonly StringBuilder rawString = new StringBuilder();
+        private string[] filter1Patterns = new string[0];
+        private int      barCount        = 0;
+        private DateTime lastAlertTime   = DateTime.MinValue;
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name                        = "Alert_renko_layer1";
+                Description                 = "ALERT-ONLY Renko Layer-1 (chart markers + sound). up=1/green, down=0/red. "
+                                            + "Matches F1 on the raw brick string; no orders. ?=1+ ones, *=1+ zeros.";
+                Calculate                   = Calculate.OnBarClose;
+                IsOverlay                   = true;   // draw ON the price panel
+                DisplayInDataBox            = false;
+                DrawOnPricePanel            = true;
+                PaintPriceMarkers           = false;
+                IsSuspendedWhileInactive    = false;
+
+                // 1. Alert
+                EnableAlert    = true;
+                Filter1Pattern = "1?0*1?0*1?";
+                AlertRepeat    = 5;
+                AlertSoundFile = "Alert4.wav";
+                RearmSeconds   = 5;
+                ShowText       = true;
+                MarkerColor    = Brushes.Orange;
+
+                // 2. Alert Hours
+                EnableAlertHours = true;
+                AlertStartHour   = 9;
+                AlertStartMinute = 30;
+                AlertEndHour     = 11;
+                AlertEndMinute   = 30;
+            }
+            else if (State == State.DataLoaded)
+            {
+                ParseFilter1Patterns();
+            }
+        }
+
+        protected override void OnBarUpdate()
+        {
+            if (State != State.Realtime) return;   // alert on live closed bricks only
+            if (CurrentBar < 1) return;
+
+            int bit;
+            if (Close[0] > Close[1])      bit = 1;   // up brick   (green)
+            else if (Close[0] < Close[1]) bit = 0;   // down brick (red)
+            else                          bit = 0;   // anomaly (no move) -> red/down
+
+            barCount++;
+            rawString.Append(bit);
+            if (rawString.Length > 2048)
+                rawString.Remove(0, rawString.Length - 2048);
+
+            if (!EnableAlert) return;
+            if (!InAlertWindow(Time[0])) return;
+            if ((Time[0] - lastAlertTime).TotalSeconds < RearmSeconds) return;
+
+            if (TailMatchesAny(rawString.ToString()))
+            {
+                lastAlertTime = Time[0];
+                FireAlert(bit);
+            }
+        }
+
+        private void FireAlert(int bit)
+        {
+            string tail = TailOf(rawString, 16);
+            string tag  = "AL" + barCount;
+
+            // (1) chart marker: arrow under the bar + optional text label
+            try
+            {
+                Draw.ArrowUp(this, "arw" + tag, true, 0, Low[0] - 2 * TickSize, MarkerColor);
+                if (ShowText)
+                    Draw.Text(this, "txt" + tag, "F1 " + tail, 0, High[0] + 3 * TickSize, MarkerColor);
+            }
+            catch { }
+
+            // (2) sound x N
+            string soundPath = ResolveSoundPath(AlertSoundFile);
+            for (int i = 0; i < Math.Max(1, AlertRepeat); i++)
+            {
+                try { PlaySound(soundPath); } catch { }
+            }
+
+            // (3) Alerts window entry (no Output window needed)
+            try
+            {
+                Alert(tag, Priority.High,
+                      "Renko F1 match  " + (Instrument != null ? Instrument.FullName : "") + "  tail=" + tail,
+                      soundPath, RearmSeconds, Brushes.Black, MarkerColor);
+            }
+            catch { }
+        }
+
+        private string ResolveSoundPath(string file)
+        {
+            if (string.IsNullOrWhiteSpace(file)) return "";
+            if (file.IndexOf('\\') >= 0 || file.IndexOf('/') >= 0) return file;
+            try { return NinjaTrader.Core.Globals.InstallDir + @"\sounds\" + file; }
+            catch { return file; }
+        }
+
+        private bool InAlertWindow(DateTime t)
+        {
+            if (!EnableAlertHours) return true;
+            int cur = t.Hour * 60 + t.Minute;
+            int s   = AlertStartHour * 60 + AlertStartMinute;
+            int e   = AlertEndHour   * 60 + AlertEndMinute;
+            return (s <= e) ? (cur >= s && cur <= e) : (cur >= s || cur <= e);
+        }
+
+        private void ParseFilter1Patterns()
+        {
+            var list = new System.Collections.Generic.List<string>();
+            if (!string.IsNullOrEmpty(Filter1Pattern))
+            {
+                foreach (string tokenRaw in Filter1Pattern.Split(','))
+                {
+                    string tok = (tokenRaw ?? "").Trim();
+                    if (tok.Length == 0) continue;
+                    bool ok = true;
+                    foreach (char c in tok)
+                        if (c != '0' && c != '1' && c != '*' && c != '?') { ok = false; break; }
+                    if (ok) list.Add(tok);
+                }
+            }
+            filter1Patterns = list.ToArray();
+        }
+
+        private bool TailMatchesAny(string text)
+        {
+            for (int i = 0; i < filter1Patterns.Length; i++)
+                if (TailMatches(text, filter1Patterns[i])) return true;
+            return false;
+        }
+
+        private static bool PatternHasWildcard(string pattern)
+        {
+            for (int i = 0; i < pattern.Length; i++)
+                if (pattern[i] == '*' || pattern[i] == '?') return true;
+            return false;
+        }
+
+        private static bool TailMatches(string text, string pattern)
+        {
+            if (string.IsNullOrEmpty(pattern) || text.Length == 0) return false;
+            if (!PatternHasWildcard(pattern))
+                return text.Length >= pattern.Length && text.EndsWith(pattern);
+            for (int start = text.Length - 1; start >= 0; start--)
+                if (MatchHere(text, start, pattern, 0)) return true;
+            return false;
+        }
+
+        private static bool MatchHere(string text, int ti, string pattern, int pi)
+        {
+            while (pi < pattern.Length)
+            {
+                char pc = pattern[pi];
+                if (pc == '*' || pc == '?')
+                {
+                    char want = (pc == '*') ? '0' : '1';
+                    if (ti >= text.Length || text[ti] != want) return false;
+                    ti++;
+                    int maxConsume = ti;
+                    while (maxConsume < text.Length && text[maxConsume] == want) maxConsume++;
+                    for (int consume = maxConsume; consume >= ti; consume--)
+                        if (MatchHere(text, consume, pattern, pi + 1)) return true;
+                    return false;
+                }
+                else
+                {
+                    if (ti >= text.Length || text[ti] != pc) return false;
+                    ti++; pi++;
+                }
+            }
+            return ti == text.Length;
+        }
+
+        private string TailOf(StringBuilder sb, int n)
+        {
+            int len = sb.Length;
+            if (len <= n) return sb.ToString();
+            return sb.ToString(len - n, n);
+        }
+
+        #region Properties
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Alert", Order = 1, GroupName = "1. Alert")]
+        public bool EnableAlert { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "F1 Pattern  (?=1+ ones, *=1+ zeros; comma = OR list)", Order = 2, GroupName = "1. Alert")]
+        public string Filter1Pattern { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 10)]
+        [Display(Name = "Alert sound repeats", Order = 3, GroupName = "1. Alert")]
+        public int AlertRepeat { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Alert sound file  (name in \\sounds\\ or full path)", Order = 4, GroupName = "1. Alert")]
+        public string AlertSoundFile { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 3600)]
+        [Display(Name = "Re-arm seconds", Order = 5, GroupName = "1. Alert")]
+        public int RearmSeconds { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show text label on chart", Order = 6, GroupName = "1. Alert")]
+        public bool ShowText { get; set; }
+
+        [XmlIgnore]
+        [Display(Name = "Marker color", Order = 7, GroupName = "1. Alert")]
+        public Brush MarkerColor { get; set; }
+
+        [Browsable(false)]
+        public string MarkerColorSerialize
+        {
+            get { return Serialize.BrushToString(MarkerColor); }
+            set { MarkerColor = Serialize.StringToBrush(value); }
+        }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Alert Hours", Order = 1, GroupName = "2. Alert Hours")]
+        public bool EnableAlertHours { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 23)]
+        [Display(Name = "Start Hour", Order = 2, GroupName = "2. Alert Hours")]
+        public int AlertStartHour { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 59)]
+        [Display(Name = "Start Minute", Order = 3, GroupName = "2. Alert Hours")]
+        public int AlertStartMinute { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 23)]
+        [Display(Name = "End Hour", Order = 4, GroupName = "2. Alert Hours")]
+        public int AlertEndHour { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 59)]
+        [Display(Name = "End Minute", Order = 5, GroupName = "2. Alert Hours")]
+        public int AlertEndMinute { get; set; }
+        #endregion
+    }
+}
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private Alert_renko_layer1[] cacheAlert_renko_layer1;
+		public Alert_renko_layer1 Alert_renko_layer1(bool enableAlert, string filter1Pattern, int alertRepeat, string alertSoundFile, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		{
+			return Alert_renko_layer1(Input, enableAlert, filter1Pattern, alertRepeat, alertSoundFile, rearmSeconds, showText, enableAlertHours, alertStartHour, alertStartMinute, alertEndHour, alertEndMinute);
+		}
+
+		public Alert_renko_layer1 Alert_renko_layer1(ISeries<double> input, bool enableAlert, string filter1Pattern, int alertRepeat, string alertSoundFile, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		{
+			if (cacheAlert_renko_layer1 != null)
+				for (int idx = 0; idx < cacheAlert_renko_layer1.Length; idx++)
+					if (cacheAlert_renko_layer1[idx] != null && cacheAlert_renko_layer1[idx].EnableAlert == enableAlert && cacheAlert_renko_layer1[idx].Filter1Pattern == filter1Pattern && cacheAlert_renko_layer1[idx].AlertRepeat == alertRepeat && cacheAlert_renko_layer1[idx].AlertSoundFile == alertSoundFile && cacheAlert_renko_layer1[idx].RearmSeconds == rearmSeconds && cacheAlert_renko_layer1[idx].ShowText == showText && cacheAlert_renko_layer1[idx].EnableAlertHours == enableAlertHours && cacheAlert_renko_layer1[idx].AlertStartHour == alertStartHour && cacheAlert_renko_layer1[idx].AlertStartMinute == alertStartMinute && cacheAlert_renko_layer1[idx].AlertEndHour == alertEndHour && cacheAlert_renko_layer1[idx].AlertEndMinute == alertEndMinute && cacheAlert_renko_layer1[idx].EqualsInput(input))
+						return cacheAlert_renko_layer1[idx];
+			return CacheIndicator<Alert_renko_layer1>(new Alert_renko_layer1(){ EnableAlert = enableAlert, Filter1Pattern = filter1Pattern, AlertRepeat = alertRepeat, AlertSoundFile = alertSoundFile, RearmSeconds = rearmSeconds, ShowText = showText, EnableAlertHours = enableAlertHours, AlertStartHour = alertStartHour, AlertStartMinute = alertStartMinute, AlertEndHour = alertEndHour, AlertEndMinute = alertEndMinute }, input, ref cacheAlert_renko_layer1);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.Alert_renko_layer1 Alert_renko_layer1(bool enableAlert, string filter1Pattern, int alertRepeat, string alertSoundFile, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		{
+			return indicator.Alert_renko_layer1(Input, enableAlert, filter1Pattern, alertRepeat, alertSoundFile, rearmSeconds, showText, enableAlertHours, alertStartHour, alertStartMinute, alertEndHour, alertEndMinute);
+		}
+
+		public Indicators.Alert_renko_layer1 Alert_renko_layer1(ISeries<double> input , bool enableAlert, string filter1Pattern, int alertRepeat, string alertSoundFile, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		{
+			return indicator.Alert_renko_layer1(input, enableAlert, filter1Pattern, alertRepeat, alertSoundFile, rearmSeconds, showText, enableAlertHours, alertStartHour, alertStartMinute, alertEndHour, alertEndMinute);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.Alert_renko_layer1 Alert_renko_layer1(bool enableAlert, string filter1Pattern, int alertRepeat, string alertSoundFile, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		{
+			return indicator.Alert_renko_layer1(Input, enableAlert, filter1Pattern, alertRepeat, alertSoundFile, rearmSeconds, showText, enableAlertHours, alertStartHour, alertStartMinute, alertEndHour, alertEndMinute);
+		}
+
+		public Indicators.Alert_renko_layer1 Alert_renko_layer1(ISeries<double> input , bool enableAlert, string filter1Pattern, int alertRepeat, string alertSoundFile, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		{
+			return indicator.Alert_renko_layer1(input, enableAlert, filter1Pattern, alertRepeat, alertSoundFile, rearmSeconds, showText, enableAlertHours, alertStartHour, alertStartMinute, alertEndHour, alertEndMinute);
+		}
+	}
+}
+
+#endregion
