@@ -238,7 +238,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 StartBehavior                = StartBehavior.WaitUntilFlat;
                 TimeInForce                  = TimeInForce.Gtc;
                 TraceOrders                  = false;
-                RealtimeErrorHandling        = RealtimeErrorHandling.StopCancelClose;
+                RealtimeErrorHandling        = RealtimeErrorHandling.StopCancelCloseIgnoreRejects;
                 StopTargetHandling           = StopTargetHandling.PerEntryExecution;
                 BarsRequiredToTrade          = 0;
                 IsUnmanaged                  = false;
