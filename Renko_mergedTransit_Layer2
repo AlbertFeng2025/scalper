@@ -77,7 +77,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             new (string pattern, int multiplier)[] { ("00", 2), ("000", 3), ("0000", 5) };
         private int currentQty = 1;
         private readonly StringBuilder sessionRealOutcome = new StringBuilder();
-        private int sessionDayKey = -1;
 
         // ── life / shutdown ───────────────────────────────────────────────────
         private DateTime strategyStartUtc = DateTime.MinValue;
@@ -87,8 +86,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // ── logging / gap ─────────────────────────────────────────────────────
         private string  activeLogFilePath = null;
-        private SessionIterator sessionIter = null;
-        private DateTime lastBrickTimeUtc = DateTime.MinValue;
+        private bool    seedPending      = false;   // feed the forming brick once after a clean enable
+        private bool    firstBrickDone   = false;
+        private int     lastProcessedBar = -1;      // brick-contiguity (hole) detection
 
         // ── parsed F1 list ────────────────────────────────────────────────────
         private System.Collections.Generic.List<string> filter1Patterns =
@@ -138,12 +138,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MaxRealLossInARow    = 5;
                 LogFolder            = @"C:\temp";
                 LogBaseName          = "Renko_mergedTransit_Layer2";
-                GapToleranceMinutes  = 7;
-            }
-            else if (State == State.DataLoaded)
-            {
-                if (BarsArray != null && BarsArray.Length > 0)
-                    sessionIter = new SessionIterator(BarsArray[0]);
+                SeedPendingBarOnStart = true;
+                RestartOnNewSession   = true;
             }
             else if (State == State.Realtime)
             {
@@ -151,11 +147,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     strategyStartUtc = DateTime.UtcNow;
                     lifeStarted      = true;
-                    if (sessionIter == null && BarsArray != null && BarsArray.Length > 0)
-                        sessionIter = new SessionIterator(BarsArray[0]);
-                    FreshStart("strategy entered real-time");
                     ParseFilter1Patterns();
                     ParseQtyRule();
+                    FreshStart("strategy enabled (fresh start)", SeedPendingBarOnStart);
                 }
             }
         }
@@ -170,23 +164,43 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (pendingFlatten) { DoFlatten(); return; }
 
-            // ── daily reset (3:00 PM PT session boundary uses the bar's day) ──
-            int dayKey = Time[0].DayOfYear + Time[0].Year * 1000;
-            if (dayKey != sessionDayKey)
+            // ── NEW SESSION: clean roll (reset qty/breaker; optionally fresh log + empty pipeline) ──
+            if (firstBrickDone && Bars.IsFirstBarOfSession)
             {
-                sessionDayKey = dayKey;
                 sessionRealOutcome.Clear();
                 realLossesInARow = 0;
+                if (RestartOnNewSession)
+                    FreshStart("new trading session", false);   // no seed: do NOT carry prior day across
             }
-
-            // ── gap fresh-start: too many market-open minutes since last brick ──
-            if (lastBrickTimeUtc != DateTime.MinValue)
+            // ── HOLE: bricks were skipped (a disconnect that MISSED bricks) -> clean restart, NO seed ──
+            else if (lastProcessedBar >= 0 && CurrentBar > lastProcessedBar + 1)
             {
-                int openMin = MarketOpenMinutesBetween(lastBrickTimeUtc, Time[0].ToUniversalTime());
-                if (openMin > GapToleranceMinutes)
-                    FreshStart("market-open minutes in gap = " + openMin + " > tolerance " + GapToleranceMinutes + "min");
+                FreshStart("brick gap: CurrentBar " + lastProcessedBar + " -> " + CurrentBar
+                    + " (missed " + (CurrentBar - lastProcessedBar - 1) + " brick(s))", false);
             }
-            lastBrickTimeUtc = Time[0].ToUniversalTime();
+            // (a short blip that missed NO bricks advances CurrentBar by exactly 1 -> we just continue)
+            lastProcessedBar = CurrentBar;
+            firstBrickDone   = true;
+
+            // ── SEED (one time, after a clean enable): feed the brick that was forming at enable,
+            //    recovered from Close[1] vs Close[2]. Observation only - it NEVER places an order. ──
+            if (seedPending)
+            {
+                seedPending = false;
+                if (CurrentBar >= 2)
+                {
+                    int seedBit;
+                    if (Close[1] > Close[2])      seedBit = 1;   // green
+                    else if (Close[1] < Close[2]) seedBit = 0;   // red
+                    else                          seedBit = 0;
+                    longStr.Append(seedBit == 1 ? "1" : "0");
+                    shortStr.Append(seedBit == 1 ? "0" : "1");
+                    prevBarBit = seedBit;
+                    barCount++;
+                    DiagLog("[SEED BAR #" + barCount + "] forming brick from Close[1] vs Close[2] bit="
+                        + seedBit + " (" + (seedBit == 1 ? "GREEN" : "RED") + ") - observation only, no order.");
+                }
+            }
 
             // ── life / bar-count / breaker shutdown checks ───────────────────
             if (StrategyLifeMinutes > 0 && (DateTime.UtcNow - strategyStartUtc).TotalMinutes >= StrategyLifeMinutes)
@@ -493,32 +507,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             return (s <= e) ? (cur >= s && cur <= e) : (cur >= s || cur <= e);
         }
 
-        private bool IsMarketOpenAt(DateTime localTime)
+        private void FreshStart(string reason, bool seed)
         {
-            try
-            {
-                if (sessionIter == null) return true;
-                return sessionIter.IsInSession(localTime, false, true);
-            }
-            catch { return true; }
-        }
-
-        private int MarketOpenMinutesBetween(DateTime aUtc, DateTime bUtc)
-        {
-            try
-            {
-                DateTime a = aUtc.ToLocalTime(), b = bUtc.ToLocalTime();
-                if (b <= a) return 0;
-                int mins = 0;
-                for (DateTime t = a; t < b && mins < GapToleranceMinutes + 9999; t = t.AddMinutes(1))
-                    if (IsMarketOpenAt(t)) mins++;
-                return mins;
-            }
-            catch { return 0; }
-        }
-
-        private void FreshStart(string reason)
-        {
+            seedPending = seed;
             longStr.Clear(); shortStr.Clear(); filter1Outcome.Clear();
             waitLongOutcome = false; waitShortOutcome = false; isArmed = false;
             prevBarBit = -1;
@@ -529,12 +520,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 activeLogFilePath = Path.Combine(LogFolder, LogBaseName + "_" + stamp + ".csv");
             }
             catch { activeLogFilePath = null; }
-            DiagLog("[FRESH START] " + reason + " | new log=" + activeLogFilePath
+            DiagLog("[FRESH START] " + reason + " | seed=" + seed + " | new log=" + activeLogFilePath
                 + " | pipeline EMPTY, will arm naturally (no real trades until a transit fires).");
             DiagLog(string.Format("{0} ready (MERGED L2). EnableRealOrder={1}, F1=[{2}], F2=[{3}], Stop={4}pt, Target={5}pt, "
-                + "ExitBit={6}({7}), MaxLossRow={8}, GapTol={9}min",
+                + "ExitBit={6}({7}), MaxLossRow={8}, Seed={9}, RestartOnNewSession={10}",
                 Name, EnableRealOrder, Filter1Pattern, Filter2Pattern, StopLossPoints, ProfitTargetPoints,
-                EnableTradeOutcomeExit, TradeOutcomeExitPattern, MaxRealLossInARow, GapToleranceMinutes));
+                EnableTradeOutcomeExit, TradeOutcomeExitPattern, MaxRealLossInARow, SeedPendingBarOnStart, RestartOnNewSession));
         }
 
         private void BeginShutdown(string reason)
@@ -645,8 +636,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Max Total Bar Count", Order=2, GroupName="5. Session")]
         public int MaxTotalBarCount { get; set; }
 
-        [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Gap Tolerance Minutes", Order=3, GroupName="5. Session")]
-        public int GapToleranceMinutes { get; set; }
+        [NinjaScriptProperty] [Display(Name="Seed forming brick on start", Order=3, GroupName="5. Session")]
+        public bool SeedPendingBarOnStart { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Restart clean on new session", Order=6, GroupName="5. Session")]
+        public bool RestartOnNewSession { get; set; }
 
         [NinjaScriptProperty] [Display(Name="Log Folder", Order=4, GroupName="5. Session")]
         public string LogFolder { get; set; }
