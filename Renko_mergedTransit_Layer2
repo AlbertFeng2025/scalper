@@ -93,6 +93,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ── parsed F1 list ────────────────────────────────────────────────────
         private System.Collections.Generic.List<string> filter1Patterns =
             new System.Collections.Generic.List<string>();
+        // parsed F2 list (multi-pattern OR on the merged outcome string)
+        private System.Collections.Generic.List<string> filter2Patterns =
+            new System.Collections.Generic.List<string>();
 
         protected override void OnStateChange()
         {
@@ -128,7 +131,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ProfitTargetPoints   = 20;
                 EnableRealOrder      = false;   // observation only until flipped
                 Filter1Pattern       = "10";
-                Filter2Pattern       = "000";
+                Filter2Pattern       = "100,01";
                 BaseQuantity         = 1;
                 EnableQtyIncrement   = false;
                 QtyRuleText          = "(\"00\":2),(\"000\":3),(\"0000\":5)";
@@ -148,6 +151,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     strategyStartUtc = DateTime.UtcNow;
                     lifeStarted      = true;
                     ParseFilter1Patterns();
+                    ParseFilter2Patterns();
                     ParseQtyRule();
                     FreshStart("strategy enabled (fresh start)", SeedPendingBarOnStart);
                 }
@@ -222,14 +226,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 waitLongOutcome = false;
                 filter1Outcome.Append(bit == 1 ? "1" : "0");
-                isArmed = TailMatches(filter1Outcome.ToString(), Filter2Pattern);
+                isArmed = TailMatchesAnyF2(filter1Outcome.ToString());
                 DiagLog(isArmed ? "[F2 MATCH] armed=true" : "[F2] armed=false");
             }
             if (waitShortOutcome)
             {
                 waitShortOutcome = false;
                 filter1Outcome.Append(bit == 0 ? "1" : "0");
-                isArmed = TailMatches(filter1Outcome.ToString(), Filter2Pattern);
+                isArmed = TailMatchesAnyF2(filter1Outcome.ToString());
                 DiagLog(isArmed ? "[F2 MATCH] armed=true" : "[F2] armed=false");
             }
             if (filter1Outcome.Length > 2048) filter1Outcome.Remove(0, filter1Outcome.Length - 2048);
@@ -455,6 +459,28 @@ namespace NinjaTrader.NinjaScript.Strategies
             return false;
         }
 
+        private void ParseFilter2Patterns()
+        {
+            filter2Patterns.Clear();
+            if (!string.IsNullOrEmpty(Filter2Pattern))
+                foreach (string tok in Filter2Pattern.Split(','))
+                {
+                    string t = (tok ?? "").Trim();
+                    if (t.Length == 0) continue;
+                    bool ok = true;
+                    foreach (char c in t) if (c != '0' && c != '1' && c != '*' && c != '?') { ok = false; break; }
+                    if (ok) filter2Patterns.Add(t);
+                }
+            DiagLog("[F2] active=[" + string.Join(",", filter2Patterns) + "]");
+        }
+
+        private bool TailMatchesAnyF2(string text)
+        {
+            for (int i = 0; i < filter2Patterns.Count; i++)
+                if (TailMatches(text, filter2Patterns[i])) return true;
+            return false;
+        }
+
         private static bool HasWild(string p)
         { for (int i = 0; i < p.Length; i++) if (p[i] == '*' || p[i] == '?') return true; return false; }
 
@@ -582,7 +608,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty] [Display(Name="F1 Pattern (comma OR; ?=1+ ones *=1+ zeros)", Order=2, GroupName="1. Core")]
         public string Filter1Pattern { get; set; }
 
-        [NinjaScriptProperty] [Display(Name="F2 Pattern (on MERGED outcome; arms next transit)", Order=8, GroupName="1. Core")]
+        [NinjaScriptProperty] [Display(Name="F2 Pattern (comma OR; on MERGED outcome; arms next transit)", Order=8, GroupName="1. Core")]
         public string Filter2Pattern { get; set; }
 
         [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Base Quantity", Order=3, GroupName="1. Core")]
