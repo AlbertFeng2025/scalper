@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""
+short_book_monitor.py — pre-committed keep/pull monitor for the 32/19 SHORT book.
+
+You set the decision rule ONCE, in advance, then feed it each week's IN-WINDOW
+numbers (9:30-11:30 ET, flat qty 1). It answers one of three things:
+KEEP COLLECTING, EDGE INTACT (keep trading), or PULL (stop).
+"""
+import math
+
+# ---- the pre-committed rule (tune here, never mid-stream) -------------------
+P1    = 0.74     # H1: edge INTACT  (your validated ~+6pt/trade win rate)
+P0    = 0.667    # H0: edge DEAD    (after-cost minimum-viable; gross breakeven is 0.6275)
+ALPHA = 0.05     # P(wrongly PULL a good book)
+BETA  = 0.10     # P(wrongly KEEP a dead book)
+
+# 32/19 geometry -> equity in R (1R = 32pt stop = $64 on 1 MNQ)
+R_WIN  =  19.0/32.0     # +0.594R
+R_LOSS = -1.0
+DOLLAR_PER_R = 64.0
+KILL_R = -20.0          # secondary drawdown safety (placeholder; set to your tolerance)
+
+# per-trade log-likelihood increments
+LW = math.log(P1/P0)                     # a WIN nudges toward INTACT
+LL = math.log((1-P1)/(1-P0))             # a LOSS nudges toward DEAD
+UPPER = math.log((1-BETA)/ALPHA)         # cross above -> EDGE INTACT
+LOWER = math.log(BETA/(1-ALPHA))         # cross below -> PULL
+
+weeks = []
+def add_week(label, n, wins, raw_baseline_pct):
+    weeks.append(dict(label=label, n=n, w=wins, l=n-wins, base=raw_baseline_pct))
+
+# ---- seeded history ----------------------------------------------------------
+add_week("Wk1 7/28-8/1", 40, 24, 0.647)   # last week, corrected window: 60% WR, -$112
+add_week("Wk2 8/3-8/7",  27, 20, 0.623)   # this week: 74.1% WR, +$312
+
+# ---- roll it up --------------------------------------------------------------
+def run():
+    print(f"  decision rule: H1(intact)={P1:.3f}  H0(dead)={P0:.3f}  alpha={ALPHA}  beta={BETA}")
+    print(f"  per-trade LLR:  win {LW:+.4f}   loss {LL:+.4f}   (loss moves {abs(LL/LW):.1f}x a win)")
+    print(f"  bounds:  PULL <= {LOWER:+.3f}   |   INTACT >= {UPPER:+.3f}\n")
+    hdr = f"  {'week':<14}{'n':>4}{'W':>4}{'L':>4}{'WR':>7}{'fired-base':>12}{'R':>8}{'$':>9}{'cumLLR':>9}"
+    print(hdr); print("  " + "-"*(len(hdr)-2))
+    llr = 0.0; cumR = 0.0; peakR = 0.0; maxDD = 0.0; cumW = cumL = 0
+    for wk in weeks:
+        llr += wk['w']*LW + wk['l']*LL
+        r    = wk['w']*R_WIN + wk['l']*R_LOSS
+        cumR += r; peakR = max(peakR, cumR); maxDD = min(maxDD, cumR-peakR)
+        cumW += wk['w']; cumL += wk['l']
+        wr   = wk['w']/wk['n']
+        fired_gap = wr - wk['base']           # decay fingerprint
+        flag = "" if fired_gap >= 0 else "  <-BELOW"
+        print(f"  {wk['label']:<14}{wk['n']:>4}{wk['w']:>4}{wk['l']:>4}{wr:>6.1%}"
+              f"{fired_gap:>+11.1%}{r:>8.2f}{r*DOLLAR_PER_R:>+9.0f}{llr:>9.3f}{flag}")
+    print("  " + "-"*(len(hdr)-2))
+    n = cumW+cumL
+    print(f"  cumulative: {n} trades, {cumW}W/{cumL}L = {cumW/n:.1%} WR   "
+          f"equity {cumR:+.2f}R = ${cumR*DOLLAR_PER_R:+,.0f}   maxDD {maxDD:.2f}R")
+
+    # verdict
+    if   llr >= UPPER: verdict = "EDGE INTACT — keep trading"
+    elif llr <= LOWER: verdict = "PULL — stop the book"
+    else:              verdict = "KEEP COLLECTING — not decisive yet"
+    print(f"\n  LLR = {llr:+.3f}   ->   {verdict}")
+
+    # how far from each line, in future net trades
+    if LOWER < llr < UPPER:
+        to_pull    = (LOWER - llr)/LL      # adding losses (LL<0) drives it down
+        to_confirm = (UPPER - llr)/LW
+        print(f"  distance:  ~{to_pull:.0f} more net losses would trip PULL   |   "
+              f"~{to_confirm:.0f} more net wins would confirm INTACT")
+    if maxDD <= KILL_R:
+        print(f"  ** drawdown kill line {KILL_R}R breached **")
+
+if __name__ == "__main__":
+    run()
