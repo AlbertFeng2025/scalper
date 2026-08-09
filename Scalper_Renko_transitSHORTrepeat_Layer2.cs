@@ -82,9 +82,10 @@ using NinjaTrader.NinjaScript.Strategies;
 //   StopLoss     = entry + StopLossPoints     (price up = bad)  = 1x brick
 //   ProfitTarget = entry - ProfitTargetPoints (price down = good) = 2x brick
 //
-// DEFAULT COMBO (user-specified):
-//   F1 = "1000"  (rawString ends with 1,0,0,0 = red-green-green-green)
-//   F2 = "000"   (filter1Outcome ends with 0,0,0 = 3 failed attempts)
+// DEFAULT COMBO (multi-pattern, comma OR -- CAUTIOUS, discretionary gamble):
+//   F1 = "10"      (rawString tail; comma-OR list ok, e.g. "10,100")
+//   F2 = "100,01"  (filter1Outcome tail; arms if it ends 1,0,0 OR 0,1)
+//   F2 matches the OUTCOME stream (1=win,0=loss), NOT rawString.
 //   Stop = 20pt, Target = 40pt  (for an 80-tick / 20pt brick)
 //
 // ============================================================================
@@ -120,6 +121,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool isArmed             = false;
         private bool waitingForF1Outcome = false;
         private bool nextIsMoney         = false;
+
+        // -- parsed multi-pattern lists (F1 vs rawString, F2 vs filter1Outcome) --
+        // Each of Filter1Pattern / Filter2Pattern may hold ONE OR MORE comma-
+        // delimited tail patterns, e.g. "100,01". A match fires if the tail
+        // matches ANY token (OR). Blank/junk -> empty list -> never matches.
+        private System.Collections.Generic.List<string> filter1Patterns =
+            new System.Collections.Generic.List<string>();
+        private System.Collections.Generic.List<string> filter2Patterns =
+            new System.Collections.Generic.List<string>();
 
         // ── real order state ─────────────────────────────────────────────────
         private bool   entryInFlight      = false;
@@ -215,8 +225,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 EnableTrailingStop   = false;
                 TrailDistancePoints  = 10;
                 EnableRealOrder      = false;   // observation only until flipped
-                Filter1Pattern       = "100";  // user-specified
-                Filter2Pattern       = "0100";   // user-specified
+                Filter1Pattern       = "10";  // multi-pattern OK (comma OR); default 10
+                Filter2Pattern       = "100,01";  // multi-pattern OR (comma) on filter1Outcome; win/loss/loss OR loss/win
                 BaseQuantity         = 1;
                 EnableQtyIncrement   = false;
                 QtyRuleText          = "(\"00\":2),(\"000\":3),(\"0000\":3),(\"00000\":4)";
@@ -271,6 +281,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (sessionIter == null && BarsArray != null && BarsArray.Length > 0)
                         sessionIter = new SessionIterator(BarsArray[0]);
 
+                    ParseFilter1Patterns();   // multi-pattern F1 (comma OR) - before warm/replay
+                    ParseFilter2Patterns();   // multi-pattern F2 (comma OR) - before warm/replay
                     StartupDecideAndLoad();
                     ParseQtyRule();   // after log path is set, so [QTY RULE] logs to the right file
                 }
@@ -569,18 +581,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string f1str = filter1Outcome.ToString();
                 DiagLog(string.Format("[F1 COLLECT] digit after F1='{0}' is '{1}' -> f1={2}",
                     Filter1Pattern, bit, f1str));
-                isArmed = TailMatches(f1str, Filter2Pattern);
+                isArmed = TailMatchesAnyF2(f1str);
                 DiagLog(isArmed ? "[F2 MATCH] isArmed=true" : "[F2 NO MATCH] isArmed=false");
             }
 
-            bool f1Match = TailMatches(raw, Filter1Pattern);
+            bool f1Match = TailMatchesAny(raw);
             if (f1Match)
             {
                 waitingForF1Outcome = true;
                 DiagLog("[F1 MATCH] rawString tail matches Filter1 -> next bit feeds filter1Outcome");
             }
 
-            nextIsMoney = isArmed && TailMatches(raw, Filter1Pattern);
+            nextIsMoney = isArmed && TailMatchesAny(raw);
 
             DiagLog(string.Format("[PIPELINE] raw({0})={1} | f1({2})={3} | waitF1={4} | isArmed={5} | nextIsMoney={6} | realLossRow={7}",
                 rawString.Length, TailOf(rawString, 12),
@@ -1058,9 +1070,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             string raw = rawString.ToString();
             string f1str = filter1Outcome.ToString();
-            isArmed = TailMatches(f1str, Filter2Pattern);
-            waitingForF1Outcome = TailMatches(raw, Filter1Pattern);
-            nextIsMoney = isArmed && TailMatches(raw, Filter1Pattern);
+            isArmed = TailMatchesAnyF2(f1str);
+            waitingForF1Outcome = TailMatchesAny(raw);
+            nextIsMoney = isArmed && TailMatchesAny(raw);
         }
 
         // =====================================================================
@@ -1075,6 +1087,55 @@ namespace NinjaTrader.NinjaScript.Strategies
         private static bool PatternHasWildcard(string pattern)
         {
             return pattern.IndexOf('*') >= 0 || pattern.IndexOf('?') >= 0;
+        }
+
+        // =====================================================================
+        // F1 / F2 multi-pattern parse + OR matchers  (?=1+ ones, *=1+ zeros)
+        // =====================================================================
+        private void ParseFilter1Patterns()
+        {
+            filter1Patterns.Clear();
+            if (!string.IsNullOrEmpty(Filter1Pattern))
+                foreach (string tok in Filter1Pattern.Split(','))
+                {
+                    string t = (tok ?? "").Trim();
+                    if (t.Length == 0) continue;
+                    bool ok = true;
+                    foreach (char c in t) if (c != '0' && c != '1' && c != '*' && c != '?') { ok = false; break; }
+                    if (ok) filter1Patterns.Add(t);
+                }
+            DiagLog("[F1] active=[" + string.Join(",", filter1Patterns) + "]");
+        }
+
+        private void ParseFilter2Patterns()
+        {
+            filter2Patterns.Clear();
+            if (!string.IsNullOrEmpty(Filter2Pattern))
+                foreach (string tok in Filter2Pattern.Split(','))
+                {
+                    string t = (tok ?? "").Trim();
+                    if (t.Length == 0) continue;
+                    bool ok = true;
+                    foreach (char c in t) if (c != '0' && c != '1' && c != '*' && c != '?') { ok = false; break; }
+                    if (ok) filter2Patterns.Add(t);
+                }
+            DiagLog("[F2] active=[" + string.Join(",", filter2Patterns) + "]");
+        }
+
+        // OR over the F1 list: true if the tail matches ANY F1 pattern (rawString).
+        private bool TailMatchesAny(string text)
+        {
+            for (int i = 0; i < filter1Patterns.Count; i++)
+                if (TailMatches(text, filter1Patterns[i])) return true;
+            return false;
+        }
+
+        // OR over the F2 list: true if the tail matches ANY F2 pattern (filter1Outcome).
+        private bool TailMatchesAnyF2(string text)
+        {
+            for (int i = 0; i < filter2Patterns.Count; i++)
+                if (TailMatches(text, filter2Patterns[i])) return true;
+            return false;
         }
 
         private static bool TailMatches(string text, string pattern)
@@ -1575,13 +1636,18 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool EnableRealOrder { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Filter 1 Pattern", Order = 2, GroupName = "5. Filter & Order",
-            Description = "Tail pattern on rawString. Wildcards: '*'=0+, '?'=1+. Default: 1000")]
+        [Display(Name = "Filter 1 Pattern  (comma OR; multiple patterns, use CAUTIOUS)", Order = 2, GroupName = "5. Filter & Order",
+            Description = "ONE or MORE comma-delimited tail patterns on rawString (spaces ignored), e.g. '10,100'. "
+                        + "Fires if the tail matches ANY (OR). Wildcards per pattern: '*'=1+ 0s, '?'=1+ 1s. "
+                        + "CAUTIOUS: 33.3% is BREAKEVEN, not an edge. Blank/junk -> never trades. Default: 10")]
         public string Filter1Pattern { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Filter 2 Pattern", Order = 3, GroupName = "5. Filter & Order",
-            Description = "Tail pattern on filter1Outcome. Default: 000")]
+        [Display(Name = "Filter 2 Pattern  (comma OR; multiple patterns, use CAUTIOUS)", Order = 3, GroupName = "5. Filter & Order",
+            Description = "ONE or MORE comma-delimited tail patterns on filter1Outcome - the string of "
+                        + "post-F1 outcome bits (1=win,0=loss). Arms if the tail matches ANY (OR). Wildcards: "
+                        + "'*'=1+ 0s, '?'=1+ 1s. NOTE F2 matches the OUTCOME stream, not rawString: e.g. '01' arms "
+                        + "right after a fresh WIN and arms often. CAUTIOUS discretionary gamble. Default: 100,01")]
         public string Filter2Pattern { get; set; }
 
         [NinjaScriptProperty]
