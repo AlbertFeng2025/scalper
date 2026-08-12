@@ -372,6 +372,54 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
+        // OnOrderUpdate — ORPHAN GUARD
+        // Managed mode auto-submits the stop/target when the entry fills, but a
+        // fast spike (fill far from brickClose) or an OCO/partial-fill cascade can
+        // get a protective leg REJECTED. RealtimeErrorHandling=IgnoreRejects means
+        // NT will NOT flatten on that reject -> the position is left NAKED. This
+        // strategy never MODIFIES a bracket, so a Stop-loss/Profit-target reject can
+        // only mean "the bracket failed to attach" -> the position has no protection.
+        // Rule: any protective reject -> flatten immediately at market and halt.
+        // (An entry reject with nothing filled just releases the serialization lock
+        //  so the strategy can't freeze; a partial-filled entry that rejects is
+        //  treated as a naked position and flattened too.)
+        // =====================================================================
+        protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice,
+            int quantity, int filled, double averageFillPrice, OrderState orderState, DateTime time,
+            ErrorCode error, string comment)
+        {
+            if (order == null || orderState != OrderState.Rejected) return;
+
+            string nm = order.Name ?? "";
+            bool isProtective = (nm == "Stop loss" || nm == "Profit target");
+            bool isEntry      = (nm == ENTRY_LONG || nm == ENTRY_SHORT);
+
+            if (isProtective)
+            {
+                DiagLog(string.Format("[ORPHAN GUARD] protective order '{0}' REJECTED ({1}) -> "
+                    + "position is unprotected, flattening at market now.", nm, error));
+                BeginShutdown("protective order rejected (orphan guard)");
+                return;
+            }
+
+            if (isEntry)
+            {
+                if (hasOpenPosition())
+                {
+                    DiagLog(string.Format("[ORPHAN GUARD] entry '{0}' REJECTED ({1}) but a partial "
+                        + "position exists -> flattening at market now.", nm, error));
+                    BeginShutdown("entry rejected with open position (orphan guard)");
+                }
+                else
+                {
+                    DiagLog(string.Format("[ORPHAN GUARD] entry '{0}' REJECTED ({1}), nothing filled "
+                        + "-> clearing in-flight state so the strategy does not freeze.", nm, error));
+                    awaitingClose = false; entryInFlight = false; tradeSide = 0;
+                }
+            }
+        }
+
+        // =====================================================================
         // Qty rule (merged sessionRealOutcome) — longest-tail match wins
         // =====================================================================
         private int CalcQty()
