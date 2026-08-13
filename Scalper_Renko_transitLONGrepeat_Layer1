@@ -758,6 +758,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
+            // ── ORPHAN GUARD ────────────────────────────────────
+            // A protective leg (Stop loss / Profit target) rejected means the managed
+            // bracket failed to attach -> the position is NAKED. This strategy never
+            // MODIFIES a bracket, so any protective reject can only mean 'no protection'.
+            // RealtimeErrorHandling=IgnoreRejects stops NT from flattening for us, so we
+            // flatten immediately at market and halt. (Entry rejects are handled above.)
+            if ((oName == "Stop loss" || oName == "Profit target")
+                && orderState == OrderState.Rejected)
+            {
+                DiagLog(string.Format("[ORPHAN GUARD] protective order '{0}' REJECTED ({1}) -> "
+                    + "position unprotected, flattening at market now. native={2}",
+                    oName, error, string.IsNullOrEmpty(nativeError) ? "-" : nativeError));
+                BeginShutdown("protective order rejected (orphan guard)");
+                return;
+            }
+
             if (error != ErrorCode.NoError || orderState == OrderState.Rejected)
                 DiagLog(string.Format("ORDER WARN: {0} state={1} err={2} native={3}",
                     oName, orderState, error, string.IsNullOrEmpty(nativeError) ? "-" : nativeError));
