@@ -143,7 +143,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ── strategy lifecycle ────────────────────────────────────────────────
         private DateTime strategyStartUtc;
         private bool     lifeStarted  = false;
-        private bool     seedChecked  = false;  // one-shot: seed the pending brick on the first realtime bar
+        private bool     seedChecked  = false;  // one-shot: seed the PRIOR CLOSED bar (bar before the forming one) on first realtime bar
         private bool     disabledSelf = false;
 
         private int      barCount      = 0;   // processed Renko bars
@@ -368,11 +368,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             CheckTradingDayRollover();
 
             // ── ONE-TIME SEED OF THE PENDING BRICK ────────────────────────────
-            // On the FIRST realtime bar only, optionally recover the brick that was
-            // still forming when the strategy was ENABLED. NinjaTrader hands that
-            // brick's close over while it is still classified historical/transition,
-            // so the State!=Realtime guard above drops it; by this first realtime turn
-            // it has shifted to Close[1]. We recompute its bit from Close[1] vs Close[2]
+            // On the FIRST realtime bar only, optionally prepend ONE extra bit of history.
+            // The brick that was forming when you ENABLED has just closed and is Close[0]
+            // (it becomes bar #2, the first live brick, counted normally). The seed instead
+            // takes Close[1] - the bar ALREADY CLOSED at enable, the one just BEFORE the
+            // forming brick. VERIFIED 2026-08-14 (merged, identical seed mechanism): the
+            // seeded brick's closeTime PREDATED enable -> it is the PRIOR CLOSED bar, NOT
+            // the forming bar. We recompute its bit from Close[1] vs Close[2]
             // and push it through the pipeline as bar #1, so rawString starts ONE brick
             // earlier. It is CONTIGUOUS with the first live brick (no gap), so this does
             // NOT reintroduce the stale-resume problem. The seed brick NEVER places an
@@ -392,7 +394,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     barCount++;
                     prevBarBit = seedBit;
                     DiagLog(string.Format(
-                        "[SEED BAR #{0}] pending brick recovered: Close={1:F2} PrevClose={2:F2} "
+                        "[SEED BAR #{0}] prior closed bar seeded: Close={1:F2} PrevClose={2:F2} "
                         + "closeTime={3:yyyy-MM-dd HH:mm:ss} -> bit={4} ({5}). "
                         + "Fed to pipeline as first bit; will NOT place an order.",
                         barCount, Close[1], Close[2], Time[1], seedBit, seedBit == 1 ? "RED/down" : "GREEN/up"));
@@ -1659,9 +1661,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Display(Name = "Seed pending brick on start", Order = 20, GroupName = "5. Filter & Order",
-            Description = "When ON, the brick that was still forming when you ENABLED the "
-                        + "strategy becomes the FIRST bit of rawString (computed from Close[1] "
-                        + "vs Close[2] on the first realtime brick), saving one brick of warm-up. "
+            Description = "When ON, the previously-closed bar (the bar just BEFORE the one "
+                        + "forming at enable) becomes the FIRST bit of rawString, recovered from Close[1] "
+                        + "vs Close[2] on the first realtime brick, saving one brick of warm-up. "
                         + "The seed brick NEVER places an order; it only seeds the string, logged "
                         + "as bar #1 with a _SEED tag. CAUTION: a Renko brick has no fixed duration, "
                         + "so the seeded brick may have largely formed BEFORE you enabled. Default OFF.")]
