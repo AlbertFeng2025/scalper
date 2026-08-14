@@ -194,7 +194,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     shortStr.Append(seedBit == 1 ? "0" : "1");
                     prevBarBit = seedBit;
                     barCount++;
-                    DiagLog("[SEED BAR #" + barCount + "] forming brick from Close[1] vs Close[2] bit="
+                    DiagLog("[SEED BAR #" + barCount + "] seededClose=" + Close[1].ToString("F2")
+                        + " seededCloseTime=" + Time[1].ToString("yyyy-MM-dd HH:mm:ss")
+                        + " (compare to enable time: before=previous-closed bar, after=forming bar)"
+                        + " prevClose=" + Close[2].ToString("F2") + " bit="
                         + seedBit + " (" + (seedBit == 1 ? "GREEN" : "RED") + ") - observation only, no order.");
                 }
             }
