@@ -140,8 +140,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 SeedPendingBarOnStart = true;
                 RestartOnNewSession   = true;
                 EnableMarginCutoff    = true;   // early EOD before broker overnight-margin snapshot
-                MarginCutoffHour      = 16;     // 16:45 ET = 3:45 CT = Tradovate/NinjaTrader overnight-margin cutoff
-                MarginCutoffMinute    = 45;
+                MarginCutoffHour      = 16;     // 16:35 NY cutoff -> flatten 16:30 NY (15 min before the 16:45 NY snapshot)
+                MarginCutoffMinute    = 35;
                 MarginCutoffLeadMin   = 5;      // flatten 5 min before -> 16:40 ET
             }
             else if (State == State.Configure)
