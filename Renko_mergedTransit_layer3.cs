@@ -111,9 +111,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // ── logging / gap ─────────────────────────────────────────────────────
         private string  activeLogFilePath = null;
-        private bool    seedPending      = false;   // feed the forming brick once after a clean enable
+        private bool    seedPending      = false;   // prepend the previously-closed bar once after a clean enable (NOT the forming bar)
         private bool    firstBrickDone   = false;
         private int     lastProcessedBar = -1;      // brick-contiguity (hole) detection
+        private bool    marginActive     = false;   // inside the margin-cutoff flat window
+        private bool    marginLogged     = false;   // one-shot 'window active' log
 
         // ── parsed F1 list ────────────────────────────────────────────────────
         private System.Collections.Generic.List<string> filter1Patterns =
@@ -173,6 +175,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 LogBaseName          = "Renko_mergedTransit_layer3";
                 SeedPendingBarOnStart = true;
                 RestartOnNewSession   = true;
+                EnableMarginCutoff    = true;   // early EOD before broker overnight-margin snapshot
+                MarginCutoffHour      = 16;     // 16:35 NY cutoff -> flatten 16:30 NY (15 min before the 16:45 NY snapshot)
+                MarginCutoffMinute    = 35;
+                MarginCutoffLeadMin   = 5;      // flatten 5 min before -> 16:30 NY
+            }
+            else if (State == State.Configure)
+            {
+                // 1-minute clock series: reliable heartbeat so the margin cutoff fires on time
+                // even when Renko bricks are sparse (thin post-RTH tape).
+                AddDataSeries(BarsPeriodType.Minute, 1);
             }
             else if (State == State.Realtime)
             {
@@ -195,9 +207,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         protected override void OnBarUpdate()
         {
             if (State != State.Realtime) return;
+            if (BarsInProgress == 1) { CheckMarginCutoff(); return; }   // 1-min clock series
+            if (BarsInProgress != 0) return;                            // ignore any other series
             if (CurrentBar < 1) return;
 
             if (pendingFlatten) { DoFlatten(); return; }
+            // margin-cutoff backup: also flatten on a brick close inside the window
+            // (guaranteed-correct order context; the 1-min series covers quiet tape).
+            if (marginActive && Position.MarketPosition != MarketPosition.Flat) { MarginFlatten(); return; }
 
             // ── NEW SESSION: clean roll (reset qty/breaker; optionally fresh log + empty pipeline) ──
             if (firstBrickDone && Bars.IsFirstBarOfSession)
@@ -227,8 +244,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     + "An RTH template resets the pipeline at the 09:30 session open (when RestartOnNewSession=true) -> no warm-up.");
             }
 
-            // ── SEED (one time, after a clean enable): feed the brick that was forming at enable,
-            //    recovered from Close[1] vs Close[2]. Observation only - it NEVER places an order. ──
+            // ── SEED (one time, after a clean enable): prepend the PREVIOUSLY-CLOSED bar (the bar just BEFORE the one forming at enable),
+            //    recovered from Close[1] vs Close[2] on the first realtime brick. (Verified 2026-08-14: seededCloseTime predated enable -> this is the prior closed bar; the forming bar is captured normally as the first live brick / Close[0].) Observation only - it NEVER places an order. ──
             if (seedPending)
             {
                 seedPending = false;
@@ -343,6 +360,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (EnableTradingHours && !WithinTradingHours())
             { DiagLog("[OUTSIDE HOURS] suppressed"); return; }
+            if (EnableMarginCutoff && marginActive)
+            { DiagLog("[MARGIN CUTOFF] entry blocked (early EOD before overnight-margin snapshot)"); return; }
 
             currentQty = CalcQty();
             if (currentQty <= 0) { DiagLog("[QTY SKIP] qty rule returned 0"); return; }
@@ -661,7 +680,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private bool WithinTradingHours()
         {
-            DateTime t = Time[0];
+            DateTime t = EasternNow();   // New York time
             int cur = t.Hour * 60 + t.Minute;
             int s = TradingStartHour * 60 + TradingStartMinute;
             int e = TradingEndHour * 60 + TradingEndMinute;
@@ -685,9 +704,19 @@ namespace NinjaTrader.NinjaScript.Strategies
             DiagLog("[FRESH START] " + reason + " | seed=" + seed + " | new log=" + activeLogFilePath
                 + " | pipeline EMPTY, will arm naturally (no real trades until a transit fires).");
             DiagLog(string.Format("{0} ready (MERGED L3). EnableRealOrder={1}, F1=[{2}], F2=[{3}], F3=[{11}], Stop={4}pt, Target={5}pt, "
-                + "ExitBit={6}({7}), MaxLossRow={8}, Seed={9}, RestartOnNewSession={10}",
+                + "ExitBit={6}({7}), MaxLossRow={8}, Seed={9}, RestartOnNewSession={10} | "
+                + "Hours={12}({13:00}:{14:00}-{15:00}:{16:00} NY) | MarginCutoff={17} flat@{18:00}:{19:00} NY "
+                + "(cutoff {20:00}:{21:00} lead {22}m)",
                 Name, EnableRealOrder, Filter1Pattern, Filter2Pattern, StopLossPoints, ProfitTargetPoints,
-                EnableTradeOutcomeExit, TradeOutcomeExitPattern, MaxRealLossInARow, SeedPendingBarOnStart, RestartOnNewSession, Filter3Pattern));
+                EnableTradeOutcomeExit, TradeOutcomeExitPattern, MaxRealLossInARow, SeedPendingBarOnStart, RestartOnNewSession, Filter3Pattern,
+                EnableTradingHours ? "ON" : "OFF", TradingStartHour, TradingStartMinute, TradingEndHour, TradingEndMinute,
+                EnableMarginCutoff ? "ON" : "OFF",
+                (MarginCutoffHour * 60 + MarginCutoffMinute - MarginCutoffLeadMin) / 60,
+                (MarginCutoffHour * 60 + MarginCutoffMinute - MarginCutoffLeadMin) % 60,
+                MarginCutoffHour, MarginCutoffMinute, MarginCutoffLeadMin));
+            DiagLog(string.Format("[CLOCK] Strategy follows NEW YORK time (Wall St. bell). New York now={0:HH:mm:ss}, "
+                + "this platform/log clock={1:HH:mm:ss}. All hour params are New York time; log timestamps are platform time.",
+                EasternNow(), DateTime.Now));
         }
 
         private void BeginShutdown(string reason)
@@ -699,6 +728,91 @@ namespace NinjaTrader.NinjaScript.Strategies
             DoFlatten();
         }
 
+        // =====================================================================
+        // NEW YORK (ET) CLOCK. All hour parameters (trading hours + margin cutoff) are
+        // NEW YORK time. We derive it from UTC so DST is automatic and the platform/chart
+        // timezone and the user's location are irrelevant - type New York numbers, always.
+        // (Live/realtime uses the true current time. NOTE: Playback/Replay uses the real
+        //  wall clock, not the replayed session time.) Log timestamps stay in platform time;
+        // the [CLOCK] startup line prints both so the offset is obvious.
+        // =====================================================================
+        private TimeZoneInfo _etZone = null;
+        private bool _etWarned = false;
+        private TimeZoneInfo EasternZone()
+        {
+            if (_etZone != null) return _etZone;
+            try { _etZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"); }
+            catch
+            {
+                try { _etZone = TimeZoneInfo.FindSystemTimeZoneById("America/New_York"); }
+                catch { _etZone = null; }
+            }
+            return _etZone;
+        }
+        private DateTime EasternNow()
+        {
+            TimeZoneInfo z = EasternZone();
+            if (z == null)
+            {
+                if (!_etWarned) { DiagLog("[CLOCK] WARNING: New York time zone not found; using platform local time - hour params may be wrong."); _etWarned = true; }
+                return DateTime.Now;
+            }
+            return TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, z);
+        }
+
+        // =====================================================================
+        // Margin cutoff - an EARLY end-of-day, before the broker's overnight-margin
+        // snapshot (Tradovate/NinjaTrader: 16:45 ET = 3:45 CT). Driven by the 1-min
+        // clock series so it fires on time even if Renko bricks are sparse. At the
+        // cutoff it flattens any open position and refuses new entries through the
+        // real session close (~17:00 ET), releasing at the 18:00 ET reopen. Flatten
+        // ONLY - it does not disable the strategy; it resumes next session. Turn off
+        // via EnableMarginCutoff if the account is well-funded for overnight margin.
+        // =====================================================================
+        private void CheckMarginCutoff()
+        {
+            if (!EnableMarginCutoff) { marginActive = false; marginLogged = false; return; }
+            if (State != State.Realtime) return;
+            if (CurrentBars.Length < 2 || CurrentBars[1] < 0) return;
+
+            DateTime t = EasternNow();                      // true New York time (UTC-derived, DST-safe)
+            int nowMin     = t.Hour * 60 + t.Minute;
+            int flattenMin = MarginCutoffHour * 60 + MarginCutoffMinute - MarginCutoffLeadMin;
+            // Block window is RELATIVE to the flatten time (not a fixed 18:00), so any cutoff
+            // works - including evening test times. ~80 min covers flatten -> ~market reopen
+            // for the default 16:40 cutoff (16:40 -> 18:00), keeping you flat through the 16:45
+            // snapshot and the 17:00-18:00 break.
+            const int blockMinutes = 80;
+            bool active    = (nowMin >= flattenMin && nowMin < flattenMin + blockMinutes);
+
+            if (active && !marginLogged)
+            {
+                DiagLog(string.Format("[MARGIN CUTOFF] window active (New York now {0:HH:mm}) - flatten @ {1:00}:{2:00} "
+                    + "New York: early EOD, no new entries (before {3:00}:{4:00} New York overnight-margin snapshot).",
+                    t, flattenMin / 60, flattenMin % 60, MarginCutoffHour, MarginCutoffMinute));
+                marginLogged = true;
+            }
+            if (!active) marginLogged = false;
+            marginActive = active;
+
+            if (marginActive && Position.MarketPosition != MarketPosition.Flat)
+                MarginFlatten();
+        }
+
+        private void MarginFlatten()
+        {
+            try
+            {
+                // barsInProgressIndex=0 forces the exit onto the PRIMARY series even when this
+                // is called from the 1-min clock (BarsInProgress==1), per NinjaTrader's rule that
+                // same-instrument orders must target the first bars context.
+                if (Position.MarketPosition == MarketPosition.Short)
+                    ExitShort(0, Math.Abs(Position.Quantity), "ML2_MarginFlat", ENTRY_SHORT);
+                else if (Position.MarketPosition == MarketPosition.Long)
+                    ExitLong(0, Math.Abs(Position.Quantity), "ML2_MarginFlat", ENTRY_LONG);
+            }
+            catch (Exception ex) { DiagLog("[MARGIN CUTOFF] flatten error: " + ex.Message); }
+        }
         private void DoFlatten()
         {
             try
@@ -783,16 +897,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty] [Display(Name="Enable Trading Hours", Order=1, GroupName="4. Hours")]
         public bool EnableTradingHours { get; set; }
 
-        [NinjaScriptProperty] [Range(0,23)] [Display(Name="Start Hour", Order=2, GroupName="4. Hours")]
+        [NinjaScriptProperty] [Range(0,23)] [Display(Name="Start Hour (New York time)", Order=2, GroupName="4. Hours")]
         public int TradingStartHour { get; set; }
 
-        [NinjaScriptProperty] [Range(0,59)] [Display(Name="Start Minute", Order=3, GroupName="4. Hours")]
+        [NinjaScriptProperty] [Range(0,59)] [Display(Name="Start Minute (New York)", Order=3, GroupName="4. Hours")]
         public int TradingStartMinute { get; set; }
 
-        [NinjaScriptProperty] [Range(0,23)] [Display(Name="End Hour", Order=4, GroupName="4. Hours")]
+        [NinjaScriptProperty] [Range(0,23)] [Display(Name="End Hour (New York time)", Order=4, GroupName="4. Hours")]
         public int TradingEndHour { get; set; }
 
-        [NinjaScriptProperty] [Range(0,59)] [Display(Name="End Minute", Order=5, GroupName="4. Hours")]
+        [NinjaScriptProperty] [Range(0,59)] [Display(Name="End Minute (New York)", Order=5, GroupName="4. Hours")]
         public int TradingEndMinute { get; set; }
 
         [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Strategy Life Minutes", Order=1, GroupName="5. Session")]
@@ -812,6 +926,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty] [Display(Name="Log Base Name", Order=5, GroupName="5. Session")]
         public string LogBaseName { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Enable margin cutoff (early EOD before overnight-margin)", Order=1, GroupName="6. Margin")]
+        public bool EnableMarginCutoff { get; set; }
+
+        [NinjaScriptProperty] [Range(0,23)] [Display(Name="Broker margin cutoff Hour (New York time)", Order=2, GroupName="6. Margin")]
+        public int MarginCutoffHour { get; set; }
+
+        [NinjaScriptProperty] [Range(0,59)] [Display(Name="Broker margin cutoff Minute (New York)", Order=3, GroupName="6. Margin")]
+        public int MarginCutoffMinute { get; set; }
+
+        [NinjaScriptProperty] [Range(0,120)] [Display(Name="Flatten lead minutes (before cutoff)", Order=4, GroupName="6. Margin")]
+        public int MarginCutoffLeadMin { get; set; }
         #endregion
     }
 }
