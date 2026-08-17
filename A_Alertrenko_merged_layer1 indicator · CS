@@ -110,12 +110,21 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             catch { }
 
-            // (2) sound x N
+            // (2) sound x N  — LOUD PC beep via the system speaker / default audio device.
+            //     Console.Beep goes straight to the PC's default audio device and ignores
+            //     NinjaTrader's alert-volume slider, so it is reliably louder than a WAV.
+            //     It runs on a background thread so beeping never blocks brick processing.
+            //     The WAV is still passed to Alert() below as a quiet backup.
             string soundPath = ResolveSoundPath(AlertSoundFile);
-            for (int i = 0; i < Math.Max(1, AlertRepeat); i++)
+            int beeps = Math.Max(1, AlertRepeat);
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
             {
-                try { PlaySound(soundPath); } catch { }
-            }
+                for (int i = 0; i < beeps; i++)
+                {
+                    try { Console.Beep(1000, 300); } catch { }   // 1000 Hz, 300 ms tone
+                    try { System.Threading.Thread.Sleep(120); } catch { }   // gap between pulses
+                }
+            });
 
             // (3) Alerts window entry (no Output window needed)
             try
