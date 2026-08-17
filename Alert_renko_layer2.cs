@@ -1,0 +1,395 @@
+#region Using declarations
+using System;
+using System.Text;
+using System.ComponentModel.DataAnnotations;
+using System.Windows.Media;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
+using System.ComponentModel;
+using System.Xml.Serialization;
+#endregion
+
+// =============================================================================
+// Alert_renko_layer2  —  ALERT-ONLY merged Renko Layer-2 INDICATOR (chart + sound)
+//
+// Same merged F1/F2 engine as Renko_mergedTransit_Layer2, but places NO orders.
+//
+//   Bit convention (merged / long-string):  Close rose = GREEN = 1
+//                                            Close fell = RED   = 0
+//   shortStr = bitwise flip of longStr.
+//
+//   F1 (transit) is tested against BOTH strings on each closed brick:
+//       longStr  tail matches F1  ->  a LONG  transit
+//       shortStr tail matches F1  ->  a SHORT transit
+//   Each transit's NEXT-brick outcome is appended to the merged F1-OUTCOME
+//   string, win-encoded:  long win = next brick green (1),  short win = next
+//   brick red (0).  (This is exactly the strategy's filter1Outcome.)
+//
+//   F2 is tested on that F1-OUTCOME (win/loss) string. When F2 matches, the
+//   indicator is ARMED. The alert fires on the NEXT transit that occurs while
+//   armed — i.e. the very brick where the L2 strategy would place its money
+//   trade. The arm is then spent (one alert per arm).
+//
+//   Wildcards:  ? = one-or-more '1's    * = one-or-more '0's    (comma = OR list)
+//   Default F1 = 01      Default F2 = 0*10*
+//        0*10* on the WIN/LOSS string = (>=2 zeros)(single 1)(>=2 zeros)
+//                                     = two+ losses, one win, two+ losses.
+//
+//   Alert-only: arrow (up=LONG / down=SHORT) + text at the signal bar, a LOUD
+//   PC beep x N, and an Alerts-window entry. No order / stop / target / qty /
+//   margin / log parameters — just the alert knobs, for easy setup.
+// =============================================================================
+namespace NinjaTrader.NinjaScript.Indicators
+{
+    public class Alert_renko_layer2 : Indicator
+    {
+        // ── merged pipeline strings (green=1/red=0) ──────────────────────────
+        private readonly StringBuilder longStr        = new StringBuilder();
+        private readonly StringBuilder shortStr       = new StringBuilder();
+        private readonly StringBuilder filter1Outcome = new StringBuilder(); // merged, win-encoded
+
+        private int      prevBarBit       = -1;
+        private int      barCount         = 0;
+        private bool     waitLongOutcome  = false;
+        private bool     waitShortOutcome = false;
+        private bool     isArmed          = false;   // F2 matched on the outcome string
+        private DateTime lastAlertTime    = DateTime.MinValue;
+
+        private System.Collections.Generic.List<string> filter1Patterns =
+            new System.Collections.Generic.List<string>();
+        private System.Collections.Generic.List<string> filter2Patterns =
+            new System.Collections.Generic.List<string>();
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name                     = "Alert_renko_layer2";
+                Description              = "ALERT-ONLY merged Renko Layer-2 (chart arrow + sound + Alerts window). "
+                                         + "green=1/red=0. F1 = transit on long/short strings; F2 arms on the F1 "
+                                         + "win/loss outcome string; the alert fires on the next armed transit. "
+                                         + "?=1+ ones, *=1+ zeros, comma=OR. No orders.";
+                Calculate                = Calculate.OnBarClose;
+                IsOverlay                = true;
+                DisplayInDataBox         = false;
+                DrawOnPricePanel         = true;
+                PaintPriceMarkers        = false;
+                IsSuspendedWhileInactive = false;
+
+                // 1. Alert
+                EnableAlert      = true;
+                Filter1Pattern   = "01";
+                Filter2Pattern   = "0*10*";
+                AlertRepeat      = 5;
+                RearmSeconds     = 5;
+                ShowText         = true;
+
+                // 2. Alert Hours
+                EnableAlertHours = true;
+                AlertStartHour   = 9;
+                AlertStartMinute = 30;
+                AlertEndHour     = 11;
+                AlertEndMinute   = 30;
+            }
+            else if (State == State.DataLoaded)
+            {
+                ParseFilter1Patterns();
+                ParseFilter2Patterns();
+            }
+        }
+
+        protected override void OnBarUpdate()
+        {
+            if (State != State.Realtime) return;   // live closed bricks only
+            if (CurrentBar < 1) return;
+
+            // ── derive brick bit (green=1 / red=0) ───────────────────────────
+            int bit;
+            if (Close[0] > Close[1])      bit = 1;
+            else if (Close[0] < Close[1]) bit = 0;
+            else                          bit = (prevBarBit >= 0) ? prevBarBit : 0;
+            prevBarBit = bit;
+            barCount++;
+
+            // ── resolve prior transit outcomes -> outcome string -> re-test F2 (arm) ──
+            // long win = green next (bit==1);  short win = red next (bit==0)
+            if (waitLongOutcome)
+            {
+                waitLongOutcome = false;
+                filter1Outcome.Append(bit == 1 ? "1" : "0");
+                isArmed = TailMatchesAnyF2(filter1Outcome.ToString());
+            }
+            if (waitShortOutcome)
+            {
+                waitShortOutcome = false;
+                filter1Outcome.Append(bit == 0 ? "1" : "0");
+                isArmed = TailMatchesAnyF2(filter1Outcome.ToString());
+            }
+            if (filter1Outcome.Length > 2048) filter1Outcome.Remove(0, filter1Outcome.Length - 2048);
+
+            // ── append bit to both books ─────────────────────────────────────
+            longStr.Append(bit == 1 ? "1" : "0");
+            shortStr.Append(bit == 1 ? "0" : "1");
+            if (longStr.Length  > 2048) longStr.Remove(0, longStr.Length - 2048);
+            if (shortStr.Length > 2048) shortStr.Remove(0, shortStr.Length - 2048);
+
+            // ── test F1 (transit) on both books ──────────────────────────────
+            bool longMatch  = TailMatchesAnyF1(longStr.ToString());
+            bool shortMatch = TailMatchesAnyF1(shortStr.ToString());
+
+            // arm the NEXT outcome collection (regardless of alerting)
+            if (longMatch)  waitLongOutcome  = true;
+            if (shortMatch) waitShortOutcome = true;
+
+            // ── ALERT: an armed transit = the L2 money-trade brick ───────────
+            if (!EnableAlert) return;
+            if (!isArmed) return;
+            if (!(longMatch || shortMatch)) return;
+            if (!InAlertWindow(Time[0])) return;
+            if ((Time[0] - lastAlertTime).TotalSeconds < RearmSeconds) return;
+
+            int side = longMatch ? +1 : -1;   // LONG first if both (symmetric F1)
+            lastAlertTime = Time[0];
+            isArmed = false;                  // arm is spent by this signal (one alert per arm)
+            FireAlert(side);
+        }
+
+        private void FireAlert(int side)
+        {
+            string oTail = TailOf(filter1Outcome, 16);
+            string bTail = TailOf(longStr, 16);
+            string tag   = "AL2_" + barCount;
+            Brush  col   = (side > 0) ? Brushes.LimeGreen : Brushes.Red;
+            string dir   = (side > 0) ? "LONG" : "SHORT";
+
+            // (1) chart marker: arrow (up=LONG below bar / down=SHORT above bar) + text
+            try
+            {
+                if (side > 0)
+                    Draw.ArrowUp(this, "arw" + tag, true, 0, Low[0]  - 2 * TickSize, col);
+                else
+                    Draw.ArrowDown(this, "arw" + tag, true, 0, High[0] + 2 * TickSize, col);
+
+                if (ShowText)
+                    Draw.Text(this, "txt" + tag, "L2 " + dir + " out=" + oTail, 0,
+                              side > 0 ? High[0] + 3 * TickSize : Low[0] - 4 * TickSize, col);
+            }
+            catch { }
+
+            // (2) LOUD PC beep x N (background thread; ignores NT's alert-volume slider)
+            int beeps = Math.Max(1, AlertRepeat);
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                for (int i = 0; i < beeps; i++)
+                {
+                    try { Console.Beep(1000, 300); } catch { }   // 1000 Hz, 300 ms tone
+                    try { System.Threading.Thread.Sleep(120); } catch { }   // gap between pulses
+                }
+            });
+
+            // (3) Alerts-window entry (sound = "" so only the loud beep sounds)
+            try
+            {
+                Alert(tag, Priority.High,
+                      "Renko L2 " + dir + " armed transit  "
+                      + (Instrument != null ? Instrument.FullName : "")
+                      + "  F1out=" + oTail + "  brick=" + bTail,
+                      "", RearmSeconds, Brushes.Black, col);
+            }
+            catch { }
+        }
+
+        private bool InAlertWindow(DateTime t)
+        {
+            if (!EnableAlertHours) return true;
+            int cur = t.Hour * 60 + t.Minute;
+            int s   = AlertStartHour * 60 + AlertStartMinute;
+            int e   = AlertEndHour   * 60 + AlertEndMinute;
+            return (s <= e) ? (cur >= s && cur <= e) : (cur >= s || cur <= e);
+        }
+
+        // ── F1 / F2 parse + shared wildcard matcher (identical to the strategy) ──
+        private void ParseFilter1Patterns() { ParseInto(Filter1Pattern, filter1Patterns); }
+        private void ParseFilter2Patterns() { ParseInto(Filter2Pattern, filter2Patterns); }
+
+        private static void ParseInto(string src, System.Collections.Generic.List<string> list)
+        {
+            list.Clear();
+            if (!string.IsNullOrEmpty(src))
+                foreach (string tok in src.Split(','))
+                {
+                    string t = (tok ?? "").Trim();
+                    if (t.Length == 0) continue;
+                    bool ok = true;
+                    foreach (char c in t) if (c != '0' && c != '1' && c != '*' && c != '?') { ok = false; break; }
+                    if (ok) list.Add(t);
+                }
+        }
+
+        private bool TailMatchesAnyF1(string text)
+        {
+            for (int i = 0; i < filter1Patterns.Count; i++)
+                if (TailMatches(text, filter1Patterns[i])) return true;
+            return false;
+        }
+
+        private bool TailMatchesAnyF2(string text)
+        {
+            for (int i = 0; i < filter2Patterns.Count; i++)
+                if (TailMatches(text, filter2Patterns[i])) return true;
+            return false;
+        }
+
+        private static bool HasWild(string p)
+        { for (int i = 0; i < p.Length; i++) if (p[i] == '*' || p[i] == '?') return true; return false; }
+
+        private static bool TailMatches(string text, string pattern)
+        {
+            if (string.IsNullOrEmpty(pattern) || string.IsNullOrEmpty(text)) return false;
+            if (!HasWild(pattern)) return text.Length >= pattern.Length && text.EndsWith(pattern);
+            for (int start = text.Length - 1; start >= 0; start--)
+                if (MatchHere(text, start, pattern, 0)) return true;
+            return false;
+        }
+
+        private static bool MatchHere(string text, int ti, string pattern, int pi)
+        {
+            while (pi < pattern.Length)
+            {
+                char pc = pattern[pi];
+                if (pc == '*' || pc == '?')
+                {
+                    char want = (pc == '*') ? '0' : '1';
+                    if (ti >= text.Length || text[ti] != want) return false;
+                    ti++;
+                    int maxC = ti;
+                    while (maxC < text.Length && text[maxC] == want) maxC++;
+                    for (int c = maxC; c >= ti; c--) if (MatchHere(text, c, pattern, pi + 1)) return true;
+                    return false;
+                }
+                else { if (ti >= text.Length || text[ti] != pc) return false; ti++; pi++; }
+            }
+            return ti == text.Length;
+        }
+
+        private string TailOf(StringBuilder sb, int n)
+        {
+            int len = sb.Length;
+            if (len <= n) return sb.ToString();
+            return sb.ToString(len - n, n);
+        }
+
+        #region Properties
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Alert", Order = 1, GroupName = "1. Alert")]
+        public bool EnableAlert { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "F1 Pattern  (transit; ?=1+ ones, *=1+ zeros; comma = OR)", Order = 2, GroupName = "1. Alert")]
+        public string Filter1Pattern { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "F2 Pattern  (on F1 win/loss outcome; arms the alert; comma = OR)", Order = 3, GroupName = "1. Alert")]
+        public string Filter2Pattern { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 10)]
+        [Display(Name = "Alert sound repeats", Order = 4, GroupName = "1. Alert")]
+        public int AlertRepeat { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 3600)]
+        [Display(Name = "Re-arm seconds", Order = 5, GroupName = "1. Alert")]
+        public int RearmSeconds { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show text label on chart", Order = 6, GroupName = "1. Alert")]
+        public bool ShowText { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Alert Hours", Order = 1, GroupName = "2. Alert Hours")]
+        public bool EnableAlertHours { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 23)]
+        [Display(Name = "Start Hour", Order = 2, GroupName = "2. Alert Hours")]
+        public int AlertStartHour { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 59)]
+        [Display(Name = "Start Minute", Order = 3, GroupName = "2. Alert Hours")]
+        public int AlertStartMinute { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 23)]
+        [Display(Name = "End Hour", Order = 4, GroupName = "2. Alert Hours")]
+        public int AlertEndHour { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 59)]
+        [Display(Name = "End Minute", Order = 5, GroupName = "2. Alert Hours")]
+        public int AlertEndMinute { get; set; }
+        #endregion
+    }
+}
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private Alert_renko_layer2[] cacheAlert_renko_layer2;
+		public Alert_renko_layer2 Alert_renko_layer2(bool enableAlert, string filter1Pattern, string filter2Pattern, int alertRepeat, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		{
+			return Alert_renko_layer2(Input, enableAlert, filter1Pattern, filter2Pattern, alertRepeat, rearmSeconds, showText, enableAlertHours, alertStartHour, alertStartMinute, alertEndHour, alertEndMinute);
+		}
+
+		public Alert_renko_layer2 Alert_renko_layer2(ISeries<double> input, bool enableAlert, string filter1Pattern, string filter2Pattern, int alertRepeat, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		{
+			if (cacheAlert_renko_layer2 != null)
+				for (int idx = 0; idx < cacheAlert_renko_layer2.Length; idx++)
+					if (cacheAlert_renko_layer2[idx] != null && cacheAlert_renko_layer2[idx].EnableAlert == enableAlert && cacheAlert_renko_layer2[idx].Filter1Pattern == filter1Pattern && cacheAlert_renko_layer2[idx].Filter2Pattern == filter2Pattern && cacheAlert_renko_layer2[idx].AlertRepeat == alertRepeat && cacheAlert_renko_layer2[idx].RearmSeconds == rearmSeconds && cacheAlert_renko_layer2[idx].ShowText == showText && cacheAlert_renko_layer2[idx].EnableAlertHours == enableAlertHours && cacheAlert_renko_layer2[idx].AlertStartHour == alertStartHour && cacheAlert_renko_layer2[idx].AlertStartMinute == alertStartMinute && cacheAlert_renko_layer2[idx].AlertEndHour == alertEndHour && cacheAlert_renko_layer2[idx].AlertEndMinute == alertEndMinute && cacheAlert_renko_layer2[idx].EqualsInput(input))
+						return cacheAlert_renko_layer2[idx];
+			return CacheIndicator<Alert_renko_layer2>(new Alert_renko_layer2(){ EnableAlert = enableAlert, Filter1Pattern = filter1Pattern, Filter2Pattern = filter2Pattern, AlertRepeat = alertRepeat, RearmSeconds = rearmSeconds, ShowText = showText, EnableAlertHours = enableAlertHours, AlertStartHour = alertStartHour, AlertStartMinute = alertStartMinute, AlertEndHour = alertEndHour, AlertEndMinute = alertEndMinute }, input, ref cacheAlert_renko_layer2);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.Alert_renko_layer2 Alert_renko_layer2(bool enableAlert, string filter1Pattern, string filter2Pattern, int alertRepeat, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		{
+			return indicator.Alert_renko_layer2(Input, enableAlert, filter1Pattern, filter2Pattern, alertRepeat, rearmSeconds, showText, enableAlertHours, alertStartHour, alertStartMinute, alertEndHour, alertEndMinute);
+		}
+
+		public Indicators.Alert_renko_layer2 Alert_renko_layer2(ISeries<double> input , bool enableAlert, string filter1Pattern, string filter2Pattern, int alertRepeat, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		{
+			return indicator.Alert_renko_layer2(input, enableAlert, filter1Pattern, filter2Pattern, alertRepeat, rearmSeconds, showText, enableAlertHours, alertStartHour, alertStartMinute, alertEndHour, alertEndMinute);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.Alert_renko_layer2 Alert_renko_layer2(bool enableAlert, string filter1Pattern, string filter2Pattern, int alertRepeat, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		{
+			return indicator.Alert_renko_layer2(Input, enableAlert, filter1Pattern, filter2Pattern, alertRepeat, rearmSeconds, showText, enableAlertHours, alertStartHour, alertStartMinute, alertEndHour, alertEndMinute);
+		}
+
+		public Indicators.Alert_renko_layer2 Alert_renko_layer2(ISeries<double> input , bool enableAlert, string filter1Pattern, string filter2Pattern, int alertRepeat, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		{
+			return indicator.Alert_renko_layer2(input, enableAlert, filter1Pattern, filter2Pattern, alertRepeat, rearmSeconds, showText, enableAlertHours, alertStartHour, alertStartMinute, alertEndHour, alertEndMinute);
+		}
+	}
+}
+
+#endregion
