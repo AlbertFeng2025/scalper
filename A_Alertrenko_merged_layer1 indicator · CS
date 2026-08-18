@@ -42,7 +42,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (State == State.SetDefaults)
             {
                 Name                        = "Alert_renko_layer1";
-                Description                 = "ALERT-ONLY Renko Layer-1 (chart markers + sound). up=1/green, down=0/red. "
+                Description                 = "ALERT-ONLY Renko Layer-1 (chart markers + sound). Based on the NATURAL raw "
+                                            + "Renko brick string (single book), NOT the merged Layer-2 result. up=1/green, down=0/red. "
                                             + "Matches F1 on the raw brick string; no orders. ?=1+ ones, *=1+ zeros.";
                 Calculate                   = Calculate.OnBarClose;
                 IsOverlay                   = true;   // draw ON the price panel
