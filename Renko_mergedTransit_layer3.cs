@@ -326,6 +326,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 barCount, Close[0], Close[1], bit, bit == 1 ? "GREEN/up" : "RED/down",
                 TailOf(longStr, 12), TailOf(shortStr, 12)));
 
+            // outcome bit-strings (win=1/loss=0, next-brick "would-trade" proxy) for eyeballing.
+            // f1out = every F1 transit; f2out = F2-armed transits only (sparser subsequence).
+            DiagLog(string.Format("[OUT   #{0}] f1out={1} f2out={2}",
+                barCount, TailOf(filter1Outcome, 24), TailOf(filter2Outcome, 24)));
+
             // ── test F1 against BOTH books ───────────────────────────────────
             bool longMatch  = TailMatchesAny(longStr.ToString());
             bool shortMatch = TailMatchesAny(shortStr.ToString());
