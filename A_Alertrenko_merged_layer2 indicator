@@ -85,7 +85,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
                 // 1. Alert
                 EnableAlert      = true;
-                Filter1Pattern   = "01";
+                Filter1Pattern   = "10";
                 Filter2Pattern   = "0*10*";
                 AlertRepeat      = 5;
                 RearmSeconds     = 5;
