@@ -1,5 +1,6 @@
 #region Using declarations
 using System;
+using System.IO;
 using System.Text;
 using System.ComponentModel.DataAnnotations;
 using System.Windows.Media;
@@ -33,6 +34,8 @@ namespace NinjaTrader.NinjaScript.Indicators
         private string[] filter1Patterns = new string[0];
         private int      barCount        = 0;
         private DateTime lastAlertTime   = DateTime.MinValue;
+        private string   activeLogFilePath = null;
+        private bool     logHeaderWritten  = false;
 
         protected override void OnStateChange()
         {
@@ -55,7 +58,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                 AlertSoundFile = "Alert4.wav";
                 RearmSeconds   = 5;
                 ShowText       = true;
-                MarkerColor    = Brushes.Orange;
+                MarkerColor    = Brushes.DarkSlateGray;   // darker, higher-contrast marker/text
+                EnableBarLog   = true;
+                LogFolder      = @"C:\temp";
 
                 // 2. Alert Hours
                 EnableAlertHours = true;
@@ -85,11 +90,23 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (rawString.Length > 2048)
                 rawString.Remove(0, rawString.Length - 2048);
 
-            if (!EnableAlert) return;
-            if (!InAlertWindow(Time[0])) return;
-            if ((Time[0] - lastAlertTime).TotalSeconds < RearmSeconds) return;
+            // ── diagnostics for the bar log (computed on every brick) ────────
+            bool f1        = TailMatchesAny(rawString.ToString());
+            bool inWin     = InAlertWindow(Time[0]);
+            bool rearmOk   = (Time[0] - lastAlertTime).TotalSeconds >= RearmSeconds;
+            bool willAlert = EnableAlert && f1 && inWin && rearmOk;
 
-            if (TailMatchesAny(rawString.ToString()))
+            string note = !EnableAlert ? "alert-disabled"
+                        : !f1          ? "no-match"
+                        : !inWin       ? "match-OUTSIDE-window"
+                        : !rearmOk     ? "match-rearm-hold"
+                        :                "MATCH-ALERT";
+
+            BarLog(string.Format("{0},{1},{2},{3},{4},{5},{6},{7}",
+                barCount, bit, bit == 1 ? "G" : "R", TailOf(rawString, 24),
+                f1, inWin, willAlert, note));
+
+            if (willAlert)
             {
                 lastAlertTime = Time[0];
                 FireAlert(bit);
@@ -227,6 +244,33 @@ namespace NinjaTrader.NinjaScript.Indicators
             return sb.ToString(len - n, n);
         }
 
+        // ── bar log: one CSV row per closed brick (+ mirror to Output window) ──
+        private void EnsureLogFile()
+        {
+            if (logHeaderWritten) return;
+            logHeaderWritten = true;
+            if (!EnableBarLog) return;
+            try
+            {
+                if (!Directory.Exists(LogFolder)) Directory.CreateDirectory(LogFolder);
+                string stamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+                activeLogFilePath = Path.Combine(LogFolder, "Alert_renko_layer1_" + stamp + ".csv");
+                File.AppendAllText(activeLogFilePath,
+                    "time,barCount,bit,GR,rawTail,f1Match,inWindow,willAlert,note" + Environment.NewLine);
+            }
+            catch { activeLogFilePath = null; }
+        }
+
+        private void BarLog(string csv)
+        {
+            if (!EnableBarLog) return;
+            EnsureLogFile();
+            string line = Time[0].ToString("yyyy-MM-dd HH:mm:ss") + "," + csv;
+            try { if (activeLogFilePath != null) File.AppendAllText(activeLogFilePath, line + Environment.NewLine); }
+            catch { }
+            Print(Name + "  " + line);
+        }
+
         #region Properties
         [NinjaScriptProperty]
         [Display(Name = "Enable Alert", Order = 1, GroupName = "1. Alert")]
@@ -264,6 +308,12 @@ namespace NinjaTrader.NinjaScript.Indicators
             get { return Serialize.BrushToString(MarkerColor); }
             set { MarkerColor = Serialize.StringToBrush(value); }
         }
+
+        [Display(Name = "Enable Bar Log (CSV + Output)", Order = 8, GroupName = "1. Alert")]
+        public bool EnableBarLog { get; set; }
+
+        [Display(Name = "Log Folder", Order = 9, GroupName = "1. Alert")]
+        public string LogFolder { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Enable Alert Hours", Order = 1, GroupName = "2. Alert Hours")]
