@@ -82,6 +82,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool     lifeStarted      = false;
         private bool     pendingFlatten   = false;
         private string   pendingReason    = string.Empty;
+        private bool     flattenSubmitted = false;              // shutdown: market flatten sent once
+        private DateTime flattenStartUtc  = DateTime.MinValue;  // watchdog start
+        private bool     flattenWarned    = false;              // watchdog warned once
+        private const int FlattenTimeoutSeconds = 20;           // warn if we can't confirm clean
 
         // ── logging / gap ─────────────────────────────────────────────────────
         private string  activeLogFilePath = null;
@@ -267,6 +271,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             // ── fire (serialized): LONG first, then SHORT if still free ───────
             bool busy = hasOpenPosition() || entryInFlight || awaitingClose;
 
+            // ── dirty-book guard: flat & idle but a stray order is still live (e.g. a
+            //    reduce-to-zero leftover). Cancel it and SKIP entry this brick so a new
+            //    trade never stacks on an orphan; the book is clean by the next brick.
+            //    Only this strategy's own orders; never runs during a trade or shutdown.
+            if (!busy && !pendingFlatten && HasLiveOrders())
+            {
+                DiagLog("[RECONCILE] flat & idle but stray order(s) live -> canceling, skipping entry this brick.");
+                CancelMyLiveOrders();
+                busy = true;
+            }
+
             if (longMatch)
             {
                 if (!busy && EnableRealOrder) { TryOpenRealTrade(+1); busy = true; }
@@ -367,6 +382,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 bool win = (tradeSide > 0) ? (price > entryFillPrice) : (price < entryFillPrice);
                 RecordTradeOutcome(win, price);
             }
+
+            // NEW: re-drive shutdown completion on every fill (e.g. the flatten just filled).
+            if (pendingFlatten) DoFlatten();
         }
 
         private void RecordTradeOutcome(bool win, double exitPrice)
@@ -410,12 +428,26 @@ namespace NinjaTrader.NinjaScript.Strategies
             int quantity, int filled, double averageFillPrice, OrderState orderState, DateTime time,
             ErrorCode error, string comment)
         {
-            if (order == null || orderState != OrderState.Rejected) return;
+            if (order == null) return;
 
             string nm = order.Name ?? "";
             bool isProtective = (nm == "Stop loss" || nm == "Profit target");
             bool isEntry      = (nm == ENTRY_LONG || nm == ENTRY_SHORT);
 
+            // NEW: a modify/REPLACE reject (e.g. NinjaTrader's OCO reduce-to-zero on a
+            // partial-fill exit) leaves the protective order LIVE at the broker. Force-cancel
+            // that leftover so it cannot fill later as an orphan. No shutdown here.
+            if (error == ErrorCode.UnableToChangeOrder && isProtective
+                && (orderState == OrderState.Working || orderState == OrderState.Accepted
+                    || orderState == OrderState.PartiallyFilled))
+            {
+                DiagLog(string.Format("[ORPHAN GUARD] '{0}' modify rejected ({1}) -> force-canceling leftover order.", nm, error));
+                try { CancelOrder(order); } catch { }
+            }
+
+            // EXISTING (unchanged): a REJECTED protective order -> flatten + shutdown (8:22 case).
+            if (orderState == OrderState.Rejected)
+            {
             if (isProtective)
             {
                 DiagLog(string.Format("[ORPHAN GUARD] protective order '{0}' REJECTED ({1}) -> "
@@ -439,6 +471,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     awaitingClose = false; entryInFlight = false; tradeSide = 0;
                 }
             }
+            }
+
+            // NEW: while shutting down, re-drive the flatten/terminate check on every order
+            // state change (e.g. a cancel just confirmed) so we finish once flat AND order-free.
+            if (pendingFlatten) DoFlatten();
         }
 
         // =====================================================================
@@ -695,22 +732,75 @@ namespace NinjaTrader.NinjaScript.Strategies
             catch (Exception ex) { DiagLog("[MARGIN CUTOFF] flatten error: " + ex.Message); }
         }
 
+        // Cancel THIS strategy's own live orders only (the 'Orders' collection is this
+        // instance's orders, never the account's) so no leftover stop/target/partial can
+        // linger and fill later as an orphan. Includes PartiallyFilled.
+        private void CancelMyLiveOrders()
+        {
+            var snap = new System.Collections.Generic.List<Order>();
+            foreach (Order o in Orders) if (o != null) snap.Add(o);
+            foreach (Order o in snap)
+            {
+                OrderState s = o.OrderState;
+                if (s == OrderState.Working || s == OrderState.Accepted
+                    || s == OrderState.PartiallyFilled || s == OrderState.Submitted
+                    || s == OrderState.ChangePending)
+                { try { CancelOrder(o); } catch { } }
+            }
+        }
+
+        // True if any of THIS strategy's orders could still fill (not yet terminal).
+        private bool HasLiveOrders()
+        {
+            foreach (Order o in Orders)
+            {
+                if (o == null) continue;
+                OrderState s = o.OrderState;
+                if (s == OrderState.Working || s == OrderState.Accepted
+                    || s == OrderState.PartiallyFilled || s == OrderState.Submitted
+                    || s == OrderState.ChangePending || s == OrderState.CancelPending)
+                    return true;
+            }
+            return false;
+        }
+
         private void DoFlatten()
         {
             try
             {
-                if (Position.MarketPosition == MarketPosition.Short)
-                    ExitShort(Math.Abs(Position.Quantity), "ML1_Flatten", ENTRY_SHORT);
-                else if (Position.MarketPosition == MarketPosition.Long)
-                    ExitLong(Math.Abs(Position.Quantity), "ML1_Flatten", ENTRY_LONG);
+                // (1) Cancel our own live orders FIRST (incl. PartiallyFilled). A cancel is a
+                //     request, not a confirmation, so we only terminate below once they clear.
+                CancelMyLiveOrders();
+
+                // (2) Flatten any remaining position at market (submit once).
+                if (!flattenSubmitted && Position.MarketPosition != MarketPosition.Flat)
+                {
+                    if (Position.MarketPosition == MarketPosition.Short)
+                        ExitShort(Math.Abs(Position.Quantity), "ML1_Flatten", ENTRY_SHORT);
+                    else if (Position.MarketPosition == MarketPosition.Long)
+                        ExitLong(Math.Abs(Position.Quantity), "ML1_Flatten", ENTRY_LONG);
+                    flattenSubmitted = true;
+                }
             }
             catch (Exception ex) { DiagLog("[SHUTDOWN] flatten error: " + ex.Message); }
 
-            if (Position.MarketPosition == MarketPosition.Flat)
+            // (3) Terminate ONLY when flat AND no live orders remain (both confirmed).
+            if (Position.MarketPosition == MarketPosition.Flat && !HasLiveOrders())
             {
-                try { DiagLog("[SHUTDOWN] flat -> disabling."); } catch { }
+                try { DiagLog("[SHUTDOWN] flat & no working orders -> disabling."); } catch { }
                 pendingFlatten = false;
                 try { SetState(State.Terminated); } catch { }
+                return;
+            }
+
+            // (4) Watchdog: if we can't confirm clean, keep retrying (never terminate with a
+            //     stray) and log one loud warning so it can be checked manually.
+            if (flattenStartUtc == DateTime.MinValue) flattenStartUtc = DateTime.UtcNow;
+            if (!flattenWarned && (DateTime.UtcNow - flattenStartUtc).TotalSeconds > FlattenTimeoutSeconds)
+            {
+                flattenWarned = true;
+                try { DiagLog("[SHUTDOWN][WATCHDOG] could not confirm flat & order-free after "
+                    + FlattenTimeoutSeconds + "s -> STILL RETRYING. CHECK ACCOUNT for stray orders/position."); } catch { }
             }
         }
 
