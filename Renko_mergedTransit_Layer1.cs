@@ -439,7 +439,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             // that leftover so it cannot fill later as an orphan. No shutdown here.
             if (error == ErrorCode.UnableToChangeOrder && isProtective
                 && (orderState == OrderState.Working || orderState == OrderState.Accepted
-                    || orderState == OrderState.PartiallyFilled))
+                    || orderState == OrderState.PartFilled))
             {
                 DiagLog(string.Format("[ORPHAN GUARD] '{0}' modify rejected ({1}) -> force-canceling leftover order.", nm, error));
                 try { CancelOrder(order); } catch { }
@@ -734,7 +734,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // Cancel THIS strategy's own live orders only (the 'Orders' collection is this
         // instance's orders, never the account's) so no leftover stop/target/partial can
-        // linger and fill later as an orphan. Includes PartiallyFilled.
+        // linger and fill later as an orphan. Includes PartFilled.
         private void CancelMyLiveOrders()
         {
             var snap = new System.Collections.Generic.List<Order>();
@@ -743,7 +743,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 OrderState s = o.OrderState;
                 if (s == OrderState.Working || s == OrderState.Accepted
-                    || s == OrderState.PartiallyFilled || s == OrderState.Submitted
+                    || s == OrderState.PartFilled || s == OrderState.Submitted
                     || s == OrderState.ChangePending)
                 { try { CancelOrder(o); } catch { } }
             }
@@ -757,7 +757,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (o == null) continue;
                 OrderState s = o.OrderState;
                 if (s == OrderState.Working || s == OrderState.Accepted
-                    || s == OrderState.PartiallyFilled || s == OrderState.Submitted
+                    || s == OrderState.PartFilled || s == OrderState.Submitted
                     || s == OrderState.ChangePending || s == OrderState.CancelPending)
                     return true;
             }
@@ -768,7 +768,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             try
             {
-                // (1) Cancel our own live orders FIRST (incl. PartiallyFilled). A cancel is a
+                // (1) Cancel our own live orders FIRST (incl. PartFilled). A cancel is a
                 //     request, not a confirmation, so we only terminate below once they clear.
                 CancelMyLiveOrders();
 
