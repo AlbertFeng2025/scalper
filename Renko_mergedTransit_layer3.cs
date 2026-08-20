@@ -122,6 +122,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime entryFillUtc     = DateTime.MinValue;  // when the current entry last filled
         private bool     openModifyRejectLogged = false;        // throttle the open-modify-reject note
         private const int NakedGraceSeconds = 3;                // grace before the naked-position guard fires
+        private DateTime nakedFirstSeenUtc = DateTime.MinValue;  // first moment we saw "open + no live stop" (needs 2nd look)
+        private const int NakedConfirmSeconds = 2;               // must STILL be open+unprotected this long before flattening
 
         // ── logging / gap ─────────────────────────────────────────────────────
         private string  activeLogFilePath = null;
@@ -235,14 +237,40 @@ namespace NinjaTrader.NinjaScript.Strategies
             // could not re-size, or an over-fill that flipped us into a bare position. The grace
             // window (from the entry fill) prevents misfires during the normal entry->bracket
             // handshake. Only this instance is affected; other strategies are untouched.
-            if (Position.MarketPosition != MarketPosition.Flat && !entryInFlight && !pendingFlatten
+            // TWO-LOOK CONFIRMATION. A stop that JUST FILLED also makes HasLiveStop() false for an
+            // instant while the position still reads open -- that is a NORMAL stop-out closing us,
+            // NOT a naked position. Firing there would flatten a position the stop already closed and
+            // could FLIP us. So on the FIRST sight of "open + no live stop" we only STAMP the time and
+            // wait; we flatten only if it is STILL open + unprotected NakedConfirmSeconds later. A
+            // filling stop will have gone flat by then -> we clear the stamp and do nothing (the loss
+            // is recorded normally and, under MaxLossRow, trading continues). A genuinely dropped stop
+            // stays open + bare across both looks -> we flatten.
+            bool openAndUnprotected =
+                Position.MarketPosition != MarketPosition.Flat && !entryInFlight && !pendingFlatten
                 && entryFillUtc != DateTime.MinValue
                 && (DateTime.UtcNow - entryFillUtc).TotalSeconds > NakedGraceSeconds
-                && !HasLiveStop())
+                && !HasLiveStop();
+
+            if (!openAndUnprotected)
             {
-                DiagLog("[NAKED GUARD] open position with no live stop -> flatten + disable this instance.");
-                BeginShutdown("naked position (no live stop)");
-                return;
+                nakedFirstSeenUtc = DateTime.MinValue;   // flat or protected again -> reset the confirmation
+            }
+            else
+            {
+                if (nakedFirstSeenUtc == DateTime.MinValue)
+                {
+                    nakedFirstSeenUtc = DateTime.UtcNow;  // FIRST look: wait, don't act (may be a filling stop)
+                    DiagLog("[NAKED GUARD] saw open + no live stop -> waiting " + NakedConfirmSeconds
+                        + "s to confirm (a just-filled stop looks the same; will clear itself if it was one).");
+                }
+                else if ((DateTime.UtcNow - nakedFirstSeenUtc).TotalSeconds >= NakedConfirmSeconds)
+                {
+                    DiagLog("[NAKED GUARD] STILL open + no live stop after " + NakedConfirmSeconds
+                        + "s -> genuinely unprotected -> flatten + disable this instance.");
+                    nakedFirstSeenUtc = DateTime.MinValue;
+                    BeginShutdown("naked position (no live stop)");
+                    return;
+                }
             }
 
             // ── NEW SESSION: clean roll (reset qty/breaker; optionally fresh log + empty pipeline) ──
