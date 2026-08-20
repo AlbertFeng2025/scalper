@@ -164,6 +164,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Order  workingEntryOrder  = null;
         private double entryFillPrice     = 0.0;
         private int    entryFillQty       = 0;
+        private int    winQtyThisTrade    = 0;   // contracts this trade closed on Profit target
+        private int    lossQtyThisTrade   = 0;   // contracts this trade closed on Stop loss (or unknown)
 
         // ── real loss streak ─────────────────────────────────────────────────
         private int realLossesInARow = 0;
@@ -200,6 +202,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ── shutdown ─────────────────────────────────────────────────────────
         private bool   pendingFlatten = false;
         private string pendingReason  = string.Empty;
+        private int      flattenAttempts  = 0;                  // bounded flatten passes
+        private DateTime lastFlattenUtc   = DateTime.MinValue;  // throttle: <= 1 flatten/second
+        private bool     flattenGaveUp    = false;              // stop after MaxFlattenAttempts
+        private bool     inFlatten        = false;              // re-entrancy guard
+        private const int MaxFlattenAttempts = 8;               // hard cap so we can NEVER spam orders
         private bool   marginActive   = false;   // inside the margin-cutoff flat window
         private bool   marginLogged   = false;   // one-shot 'window active' log
 
@@ -542,6 +549,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             // ── ENTER REAL SHORT ─────────────────────────────────────────────
             awaitingClose     = true;
+            winQtyThisTrade   = 0;   // reset per-trade majority-quantity tally
+            lossQtyThisTrade  = 0;
             entryInFlight     = true;
             workingEntryOrder = null;
 
@@ -648,6 +657,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 DiagLog(string.Format("ENTRY {0} fill: qty={1} @ {2:F2} total={3}",
                     isFull ? "FULL" : "PARTIAL", quantity, price, entryFillQty));
                 if (isFull) { entryInFlight = false; workingEntryOrder = null; }
+                if (pendingFlatten) ProcessShutdown();   // chase a growing entry during shutdown
                 return;
             }
 
@@ -662,19 +672,42 @@ namespace NinjaTrader.NinjaScript.Strategies
                                  || oName.IndexOf("SR1_Flatten",    StringComparison.OrdinalIgnoreCase) >= 0;
             bool isExitFill = !(oName == ENTRY_SIGNAL);
 
-            if (isFull && isExitFill && !isStopFill && !isTargetFill && !isOurForceClose
-                && Position.MarketPosition == MarketPosition.Flat
-                && awaitingClose)
-            {
-                int bit = 0;
-                DiagLog(string.Format(
-                    "[EOD FLATTEN] Trade closed by session-close/forced exit (name='{0}'). "
-                    + "Recording as LOSS (bit=0) conservatively.", oName));
+            // MAJORITY-QUANTITY scoring. Tally which bracket closed each contract, then record
+            // ONE bit for the whole trade once the position is flat:
+            //   Stop loss -> loss contracts;  Profit target -> win contracts;
+            //   our flatten -> does NOT vote (forced cleanup);
+            //   anything else (e.g. session-close forced exit) -> loss (conservative).
+            // A force-flattened trade (no stop/target fills, or mostly stop) therefore records a
+            // LOSS (0), so MaxRealLossInARow finally counts reject-and-flatten trades.
+            if      (isStopFill)      lossQtyThisTrade += quantity;
+            else if (isTargetFill)    winQtyThisTrade  += quantity;
+            else if (isOurForceClose) { /* our flatten: does not vote */ }
+            else                      lossQtyThisTrade += quantity;   // unknown/session-close -> loss
 
-                realTradeOutcome.Append("0");
-                RecordSessionOutcome(0);
-                realLossesInARow++;
-                DiagLog("[REAL LOSS eod] realLossesInARow=" + realLossesInARow);
+            if (Position.MarketPosition == MarketPosition.Flat && awaitingClose)
+            {
+                int bit = (winQtyThisTrade > lossQtyThisTrade) ? 1 : 0;   // tie or loss-majority -> loss
+                double pnl = (entryFillPrice - price)
+                             * entryFillQty * Instrument.MasterInstrument.PointValue;
+
+                DiagLog(string.Format("MONEY TRADE CLOSED {0}: entry={1:F2} exit={2:F2} qty={3} "
+                    + "winQty={4} lossQty={5} pnl={6:0.00} bit={7}",
+                    bit == 1 ? "WIN" : "LOSS", entryFillPrice, price, entryFillQty,
+                    winQtyThisTrade, lossQtyThisTrade, pnl, bit));
+
+                realTradeOutcome.Append(bit.ToString());
+                RecordSessionOutcome(bit);
+                if (bit == 0) { realLossesInARow++; DiagLog("[REAL LOSS] realLossesInARow=" + realLossesInARow); }
+                else { if (realLossesInARow > 0) DiagLog("[REAL WIN] reset " + realLossesInARow + "->0"); realLossesInARow = 0; }
+
+                if (EnableTradeOutcomeExit
+                    && !string.IsNullOrEmpty(TradeOutcomeExitPattern)
+                    && sessionRealOutcome.ToString().EndsWith(TradeOutcomeExitPattern))
+                {
+                    DiagLog("[OUTCOME EXIT] real-outcome tail matched '" + TradeOutcomeExitPattern
+                        + "' -> halting session. session=" + sessionRealOutcome.ToString());
+                    BeginShutdown("trade-outcome exit '" + TradeOutcomeExitPattern + "' matched");
+                }
 
                 awaitingClose = false; entryInFlight = false; workingEntryOrder = null;
 
@@ -682,53 +715,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 int    logFillQty   = entryFillQty;
                 entryFillPrice = 0.0; entryFillQty = 0;
 
-                WriteLogRow(logFillPrice, price, 0.0, bit, logFillQty, time);
-                return;
+                WriteLogRow(logFillPrice, price, pnl, bit, logFillQty, time);
             }
 
             // ── normal bracket exit ───────────────────────────────────────────
-            if ((isStopFill || isTargetFill) && isFull)
-            {
-                if (Position.MarketPosition == MarketPosition.Flat)
-                {
-                    // Fill-based P&L (SHORT): sold at entryFillPrice, bought back at
-                    // 'price'. Uses ACTUAL fills, so it reflects real slippage rather
-                    // than the nominal 20/40. The win/loss BIT still comes from which
-                    // bracket filled (stop vs target), which now matches the brick.
-                    int bit = isStopFill ? 0 : 1;
-                    double pnl = (entryFillPrice - price)
-                                 * entryFillQty * Instrument.MasterInstrument.PointValue;
-
-                    DiagLog(string.Format("MONEY TRADE CLOSED {0}: entry={1:F2} exit={2:F2} qty={3} pnl={4:0.00} bit={5}",
-                        isStopFill ? "STOP" : "TARGET", entryFillPrice, price, entryFillQty, pnl, bit));
-
-                    realTradeOutcome.Append(bit.ToString());
-                    RecordSessionOutcome(bit);
-                    if (bit == 0) { realLossesInARow++; DiagLog("[REAL LOSS] realLossesInARow=" + realLossesInARow); }
-                    else { if (realLossesInARow > 0) DiagLog("[REAL WIN] reset " + realLossesInARow + "->0"); realLossesInARow = 0; }
-
-                    // Trade-outcome exit: HALT the session when the real-outcome tail
-                    // matches TradeOutcomeExitPattern (plain endsWith, NO wildcard).
-                    // Operates on sessionRealOutcome (real trade W/L; 1=win,0=loss) --
-                    // NOT bricks and NOT filter1Outcome. Default "1" = stop after a win.
-                    if (EnableTradeOutcomeExit
-                        && !string.IsNullOrEmpty(TradeOutcomeExitPattern)
-                        && sessionRealOutcome.ToString().EndsWith(TradeOutcomeExitPattern))
-                    {
-                        DiagLog("[OUTCOME EXIT] real-outcome tail matched '" + TradeOutcomeExitPattern
-                            + "' -> halting session. session=" + sessionRealOutcome.ToString());
-                        BeginShutdown("trade-outcome exit '" + TradeOutcomeExitPattern + "' matched");
-                    }
-
-                    awaitingClose = false; entryInFlight = false; workingEntryOrder = null;
-
-                    double logFillPrice = entryFillPrice;
-                    int    logFillQty   = entryFillQty;
-                    entryFillPrice = 0.0; entryFillQty = 0;
-
-                    WriteLogRow(logFillPrice, price, pnl, bit, logFillQty, time);
-                }
-            }
+            if (pendingFlatten) ProcessShutdown();   // drive termination once the flatten has filled
         }
 
         // =====================================================================
@@ -879,6 +870,21 @@ namespace NinjaTrader.NinjaScript.Strategies
                     (MarginCutoffHour*60+MarginCutoffMinute-MarginCutoffLeadMin)/60,
                     (MarginCutoffHour*60+MarginCutoffMinute-MarginCutoffLeadMin)%60,
                     MarginCutoffHour, MarginCutoffMinute, MarginCutoffLeadMin));
+            // One-time reminder when REAL orders are live: the biggest naked-position risk on a
+            // disconnect is NOT in this strategy code -- it is NinjaTrader's connection-loss
+            // handling, a PLATFORM setting this strategy cannot see or control. Make the user think.
+            if (EnableRealOrder)
+            {
+                DiagLog("[!! CHECK PLATFORM SETTING !!] Real orders are ON. Before trading, review "
+                    + "Tools -> Options -> Strategies -> 'On connection loss'. If a disconnect lasts "
+                    + "longer than your Disconnect-delay, NinjaTrader can STOP this strategy and (with "
+                    + "Recalculate + WaitUntilFlat) CANCEL your stop/target -> leaving a NAKED position "
+                    + "that NO code here can protect while the feed is down. Decide deliberately: "
+                    + "'Recalculate' vs 'Keep Running', and how many seconds to ride out a brief drop. "
+                    + "This depends on how reliable YOUR connection is and what you want to happen if it "
+                    + "isn't -- learn how both options behave before choosing. (Platform setting; applies "
+                    + "to ALL strategies on this connection, not just this one.)");
+            }
             DiagLog(string.Format("[CLOCK] Strategy follows NEW YORK time (Wall St. bell). New York now={0:HH:mm:ss}, "
                 + "this platform/log clock={1:HH:mm:ss}. All hour params are New York time; log timestamps are platform time.",
                 EasternNow(), DateTime.Now));
@@ -1540,28 +1546,88 @@ namespace NinjaTrader.NinjaScript.Strategies
             DiagLog("Shutdown: " + reason + " | bars=" + barCount + " | lossRow=" + realLossesInARow);
         }
 
+        private bool HasLiveOrders()
+        {
+            foreach (Order o in Orders)
+            {
+                if (o == null) continue;
+                OrderState s = o.OrderState;
+                if (s == OrderState.Working || s == OrderState.Accepted
+                    || s == OrderState.PartFilled || s == OrderState.Submitted
+                    || s == OrderState.ChangePending || s == OrderState.CancelPending)
+                    return true;
+            }
+            return false;
+        }
+
         private void ProcessShutdown()
         {
-            if (entryInFlight && workingEntryOrder != null)
+            if (inFlatten) return;   // re-entrancy guard: an order submit can call back synchronously
+            inFlatten = true;
+            try
             {
-                var os = workingEntryOrder.OrderState;
-                if (os == OrderState.Working || os == OrderState.Accepted || os == OrderState.Submitted)
+                if (entryInFlight && workingEntryOrder != null)
                 {
-                    try { CancelOrder(workingEntryOrder); }
-                    catch { entryInFlight = false; awaitingClose = false; workingEntryOrder = null; }
+                    var os = workingEntryOrder.OrderState;
+                    if (os == OrderState.Working || os == OrderState.Accepted || os == OrderState.Submitted)
+                    {
+                        try { CancelOrder(workingEntryOrder); }
+                        catch { entryInFlight = false; awaitingClose = false; workingEntryOrder = null; }
+                    }
                 }
-                return;
+
+                // Cancel OUR OWN live orders first (never our own SR1_Flatten), then close the LIVE
+                // position -- direction AND size fresh each pass (an oversized stop can overfill and
+                // FLIP the position the other way) -- with an EMPTY-signal market exit (not tied to
+                // any entry, so NinjaTrader cannot ignore it). Bounded + throttled: never loops/spams.
+                if (!flattenGaveUp
+                    && (DateTime.UtcNow - lastFlattenUtc).TotalSeconds >= 1.0
+                    && (Position.MarketPosition != MarketPosition.Flat || HasLiveOrders()))
+                {
+                    if (flattenAttempts < MaxFlattenAttempts)
+                    {
+                        foreach (Order o in Orders)
+                        {
+                            if (o == null) continue;
+                            if ((o.Name ?? "") == "SR1_Flatten") continue;
+                            OrderState s = o.OrderState;
+                            if (s == OrderState.Working || s == OrderState.Accepted
+                                || s == OrderState.PartFilled || s == OrderState.Submitted
+                                || s == OrderState.ChangePending)
+                            { try { CancelOrder(o); } catch { } }
+                        }
+
+                        if (Position.MarketPosition == MarketPosition.Long)
+                        {
+                            int q = Math.Abs(Position.Quantity);
+                            ExitLong(0, q, "SR1_Flatten", "");
+                            DiagLog("[SHUTDOWN] pass " + (flattenAttempts + 1) + "/" + MaxFlattenAttempts + ": closing LONG " + q + ".");
+                        }
+                        else if (Position.MarketPosition == MarketPosition.Short)
+                        {
+                            int q = Math.Abs(Position.Quantity);
+                            ExitShort(0, q, "SR1_Flatten", "");
+                            DiagLog("[SHUTDOWN] pass " + (flattenAttempts + 1) + "/" + MaxFlattenAttempts + ": closing SHORT " + q + ".");
+                        }
+                        else
+                        {
+                            DiagLog("[SHUTDOWN] pass " + (flattenAttempts + 1) + "/" + MaxFlattenAttempts + ": flat, canceling leftover order(s).");
+                        }
+                        flattenAttempts++;
+                        lastFlattenUtc = DateTime.UtcNow;
+                    }
+                    else
+                    {
+                        flattenGaveUp = true;
+                        DiagLog("[SHUTDOWN][FLATTEN FAILED] not flat & order-free after " + MaxFlattenAttempts
+                            + " passes -> STOPPING (no more orders). CHECK ACCOUNT AND FLATTEN BY HAND.");
+                    }
+                }
+
+                if (Position.MarketPosition == MarketPosition.Flat && !entryInFlight && !HasLiveOrders())
+                    FinalizeTermination();
             }
-            if (Position.MarketPosition == MarketPosition.Flat && !entryInFlight)
-            {
-                FinalizeTermination();
-                return;
-            }
-            if (Position.MarketPosition == MarketPosition.Short)
-            {
-                try { ExitShort(Math.Abs(Position.Quantity), "SR1_Flatten", ENTRY_SIGNAL); }
-                catch { }
-            }
+            finally { inFlatten = false; }
         }
 
         private void FinalizeTermination()
