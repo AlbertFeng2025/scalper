@@ -1,0 +1,2222 @@
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.Gui;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.Strategies;
+#endregion
+
+// scalper_LONGrepeat_Layer2  v4  (reconnect-survival + file-per-session + EOD)
+//
+// ============================================================================
+// WHAT CHANGED IN v4  (vs v3)
+// ============================================================================
+//  PROBLEM v3 had:
+//    On any new strategy instance (NT auto-disables+re-enables on every
+//    connection drop, or you manually re-enable), ALL in-memory pipeline
+//    state was lost: rawString, filter1Outcome, isArmed, realLossesInARow
+//    reset to empty/zero, and the log file was OVERWRITTEN. The pipeline had
+//    to warm up from scratch every time, and the loss-streak breaker was
+//    silently bypassed. A 3 AM connection blip wiped the whole pipeline.
+//
+//  FIX in v4 — "the file boundary IS the pipeline-continuity boundary":
+//    On startup, the strategy reads its OWN most-recent log file and decides,
+//    from the GAP since the last recorded bit, whether to:
+//
+//      RESUME  — the gap was small / only the maintenance break: reload
+//                rawString, filter1Outcome, realTradeOutcome, re-derive the
+//                pipeline flags, and RESTORE realLossesInARow (breaker
+//                survives the reconnect). Keep appending to the SAME file.
+//                Crosses the daily maintenance break with no warm-up.
+//
+//      FRESH   — the gap was big (a real outage, a weekend, or > ceiling):
+//                the old string has a HOLE and cannot be trusted, so start a
+//                BRAND-NEW timestamped file with an empty pipeline. Trades
+//                naturally as soon as the pipeline re-arms (no special gate).
+//
+//    Decision rule (in order):
+//      no log / empty                         -> FRESH
+//      a weekend (Sat/Sun) falls in the gap   -> FRESH
+//      wall-clock gap > GapCeilingHours (4h)  -> FRESH
+//      MARKET-OPEN minutes in gap > GapToleranceMinutes (5) -> FRESH
+//      otherwise                              -> RESUME
+//
+//    "Market-open minutes" is computed via the data series' Trading Hours
+//    template (SessionIterator), so the ~1h maintenance break counts as 0
+//    open-minutes and is always crossable, while a real mid-session outage
+//    is caught.
+//
+//  REMOVED in v4:
+//    StartMode, RawStringFilePath, MaxFileAgeMinutes, LoadAndReplayRawString.
+//    The strategy's OWN log is now the single source of truth. It no longer
+//    depends on the separate recorder file.
+//
+//  EOD handling in v4:
+//    With IsExitOnSessionCloseStrategy=true, NT flattens any open position at
+//    the session close. We do NOT know if that flatten was a win or loss, so
+//    CONSERVATIVELY we record it as a LOSS ('0') in BOTH rawString and
+//    realTradeOutcome, increment the loss streak, and run the pipeline so the
+//    string stays continuous. (A rare EOD trade that was actually a small win
+//    will show as a loss — accepted, conservative, infrequent.)
+//
+//  IMPORTANT — STRATEGY TAB CANNOT TELL YOU FRESH vs RESUME:
+//    After a big-gap wipe, the strategy still shows "enabled" in the tab even
+//    though its pipeline silently reset and is warming up. To know the true
+//    state you MUST read the log: a clear [FRESH START] or [RESUME] line is
+//    written at startup with the gap details.
+//
+// ============================================================================
+// PIPELINE (unchanged — matches Python trade_filter.py exactly):
+//   Every slice closes:
+//     1. append bit to rawString
+//     2. rawString tail matches Filter1Pattern? YES -> append bit to filter1Outcome
+//     3. filter1Outcome tail matches Filter2Pattern? YES -> isArmed=true else false
+//     4. isArmed AND rawString tail matches Filter1Pattern? YES -> next slice = money
+//   TARGET = 1 = price UP (LONG).
+// ============================================================================
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    // #####################################################################
+    // ## READ ME — HOW TO INTERPRET THE LOG (esp. if verifying in Python) ##
+    // #####################################################################
+    //
+    // 1) rawString RESETS EVERY TRADING DAY (3:00 PM PT -> 3:00 PM PT).
+    //    The research/backtest starts each trading day with an EMPTY pipeline,
+    //    warms up through the overnight bits, and fires in the morning window.
+    //    This strategy does the same, so live reproduces the backtest.
+    //    => In the CSV rawString grows through the session then STARTS OVER at
+    //       ~15:00 PT. That is CORRECT, not a bug.
+    //    => If you copy a rawString out of this log to re-check a filter in
+    //       Python, use bits from ONE trading day only. Do NOT concatenate
+    //       across the 15:00 PT boundary.
+    //
+    // 2) slice_num is PER STRATEGY INSTANCE, not global.
+    //    NinjaTrader creates a NEW instance on every disable/re-enable —
+    //    including its own automatic restarts after a lost price connection.
+    //    Each new instance restarts slice_num at 1 while rawString is RESUMED
+    //    from the log, so slice_num WILL jump back to 1 mid-file. Expected.
+    //    Order events by TIMESTAMP, not slice_num.
+    //
+    // 3) THIS STRATEGY'S rawString WILL NOT MATCH THE STANDALONE RECORDER'S
+    //    BIT STRING, BIT FOR BIT — AND THAT IS FINE.
+    //    Both slice with identical logic, but they are INDEPENDENT slicers with
+    //    independent 1-second throttle phases, so their slice boundaries (and
+    //    therefore their bits) differ. Each string is internally consistent;
+    //    neither is "wrong". Do not try to reconcile them slice-by-slice.
+    //
+    // 4) The "side" column tells you WHY a slice did not trade:
+    //       Short / Long        -> a REAL order was placed
+    //       FAKE_Short/_Long    -> ordinary observation slice (filter not armed)
+    //       OBS_OUTSIDE_HOURS   -> armed, but outside the trading window
+    //       OBS_ACCOUNT_BUSY    -> armed, but another strategy/manual held it
+    //       OBS_QTY_SKIP        -> armed, but the qty rule returned 0
+    //       WOULDBE_TRADE       -> filter ARMED, but EnableRealOrder=false
+    //                              (observation mode: this is the trade it WOULD
+    //                               have taken — use these to forward-log a book
+    //                               you are not trading live yet)
+    //    The OBS_* rows are trades the strategy WOULD have taken but did not.
+    //
+    // 5) Resets per trading day: rawString, filter1Outcome, isArmed,
+    //    waiting flags, sessionRealOutcome (qty history).
+    //    Does NOT reset: realTradeOutcome (audit), realLossesInARow (breaker).
+    //
+    // #####################################################################
+
+    public class scalper_LONGrepeat_Layer2 : Strategy
+    {
+        // ── strategy lifecycle ────────────────────────────────────────────────
+        private DateTime strategyStartUtc;
+        private bool     lifeStarted  = false;
+        private bool     disabledSelf = false;
+
+        private DateTime lastCheckTime = DateTime.MinValue;
+        private int      sliceCount    = 0;   // all slices (fake + real)
+
+        // ── pipeline strings ─────────────────────────────────────────────────
+        private StringBuilder rawString         = new StringBuilder(); // Layer 0: all bricks
+        private StringBuilder filter1Outcome    = new StringBuilder(); // Layer 1: after F1 match
+        private StringBuilder realTradeOutcome  = new StringBuilder(); // real money trade results only
+
+        // ── pipeline state ───────────────────────────────────────────────────
+        private bool isArmed             = false;
+        private bool waitingForF1Outcome = false;
+        private bool nextIsMoney         = false;
+
+        // ── slice state ──────────────────────────────────────────────────────
+        private bool   inSlice        = false;
+        private bool   isMoneySlice   = false;
+        private double sliceEntryPrice = 0.0;
+        private double sliceStopPrice  = 0.0;
+        private double sliceTargetPrice= 0.0;
+
+        // ── real order state ─────────────────────────────────────────────────
+        private bool   entryInFlight      = false;
+        private bool   awaitingClose      = false;
+        private Order  workingEntryOrder  = null;
+        private double entryFillPrice     = 0.0;
+        private int    entryFillQty       = 0;
+        private int    winQtyThisTrade    = 0;   // contracts this trade closed on Profit target
+        private int    lossQtyThisTrade   = 0;   // contracts this trade closed on Stop loss (or unknown)
+
+        // ── real loss streak ─────────────────────────────────────────────────
+        private int realLossesInARow = 0;
+
+        // ── session iterator (for market-open-minutes gap measure) ────────────
+        private SessionIterator sessionIter = null;
+
+        // ── active log file path (timestamped; chosen fresh or resumed) ───────
+        private string activeLogFilePath = null;
+
+        // ── qty multiplier table ──────────────────────────────────────────────
+        // LONGEST-MATCHING pattern wins (order-independent; see CalcQty). Patterns
+        // are matched against the tail of the PER-DAY session real outcome string
+        // (sessionRealOutcome), so the qty rule resets every trading day.
+        // NO wildcards here — literal 0/1 only.
+        //
+        // DESIGN (researched {'0':2} extended into a layered loss-run rule):
+        //   Every pattern starts with '1' (a WIN) on purpose — this is a bug-guard.
+        //   Sizing only kicks in on a loss run that FOLLOWED a win in the session.
+        //   If the day opens with losses (e.g. "0000..." from a data/logic bug),
+        //   NONE of these match, so those trades stay at BASE qty (x1) and never
+        //   double into a disaster. The hard stop is MaxRealLossInARow.
+        //
+        //   "10","100","1000"        -> x2  (win then 1-3 losses: our validated edge)
+        //   "10000","100000","1000000" -> 0 (win then 4-6 losses: SKIP the trade)
+        //
+        //   qty 0 == DO NOT place a real order (observe only). See CalcQty caller.
+        //
+        // *** COUPLING WARNING ***
+        //   This table must be reviewed whenever MaxRealLossInARow changes. The x0
+        //   "skip" lines only cover loss-runs up to their length; a run LONGER than
+        //   the longest pattern reverts to base qty (the leading '1' scrolls out of
+        //   range and nothing matches). With MaxRealLossInARow=3 the x0 lines are
+        //   dormant (breaker halts first). If you raise the breaker (e.g. to 7),
+        //   extend the x0 lines so every loss up to the breaker is covered.
+        // NOTE: default below is overwritten at startup by ParseQtyRule() from the
+        // UI-editable QtyRuleText parameter (no recompile needed to change it).
+        private (string pattern, int multiplier)[] qtyTable =
+            new (string pattern, int multiplier)[] {
+                ("10", 2), ("100", 2), ("1000", 2),
+                ("10000", 0), ("100000", 0), ("1000000", 0) };
+
+        private int currentQty = 1;
+
+        // Why was a would-be money slice demoted to an observation slice?
+        // Written into the log's "side" column so the CSV can distinguish:
+        //   null                  -> ordinary fake slice (filter simply not armed)
+        //   "OBS_OUTSIDE_HOURS"   -> armed, but outside the trading window
+        //   "OBS_ACCOUNT_BUSY"    -> armed, but another strategy/manual held the instrument
+        //   "OBS_QTY_SKIP"        -> armed, but the qty rule returned 0
+        // This matters for the forward-log: it tells you which trades the strategy
+        // WOULD have taken but did not, which is otherwise unmeasurable.
+        private string suppressReason = null;
+
+        // ── per-day (session) real outcome, drives the qty rule; resets daily ──
+        private StringBuilder sessionRealOutcome = new StringBuilder();
+        private int sessionDayKey = -1;          // yyyymmdd (trading day) of the qty session
+        private int currentTradingDayKey = -1;   // trading day the pipeline belongs to
+
+        // ── shutdown ─────────────────────────────────────────────────────────
+        private bool   pendingFlatten = false;
+        private bool   marginActive   = false;   // inside the margin-cutoff flat window
+        private bool   marginLogged   = false;   // one-shot 'window active' log
+        private bool   _etWarned      = false;
+        private TimeZoneInfo _etZone   = null;
+        private string pendingReason  = string.Empty;
+        private int      flattenAttempts  = 0;                  // bounded flatten passes
+        private DateTime lastFlattenUtc   = DateTime.MinValue;  // throttle: <= 1 flatten/second
+        private bool     flattenGaveUp    = false;              // stop after MaxFlattenAttempts
+        private bool     inFlatten        = false;              // re-entrancy guard
+        private const int MaxFlattenAttempts = 8;               // hard cap so we can NEVER spam orders
+
+        private const string ENTRY_SIGNAL = "LR_Entry";
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Description = "LONG scalper v4. Reconnect-survival: reloads its own log "
+                            + "and RESUMES the pipeline across reconnect / maintenance break, "
+                            + "or FRESH-starts a new file when the gap is too big. "
+                            + "Pipeline matches Python trade_filter.py. Target=1=price UP.";
+                Name        = "scalper_LONGrepeat_Layer2";
+
+                Calculate                    = Calculate.OnEachTick;
+                EntriesPerDirection          = 1;
+                EntryHandling                = EntryHandling.AllEntries;
+                IsExitOnSessionCloseStrategy = true;   // EOD flatten ON (see reminder)
+                ExitOnSessionCloseSeconds    = 30;
+                IsFillLimitOnTouch           = false;
+                MaximumBarsLookBack          = MaximumBarsLookBack.TwoHundredFiftySix;
+                OrderFillResolution          = OrderFillResolution.Standard;
+                Slippage                     = 0;
+                StartBehavior                = StartBehavior.WaitUntilFlat;
+                TimeInForce                  = TimeInForce.Gtc;
+                TraceOrders                  = false;
+                RealtimeErrorHandling        = RealtimeErrorHandling.StopCancelCloseIgnoreRejects;
+                StopTargetHandling           = StopTargetHandling.PerEntryExecution;
+                BarsRequiredToTrade          = 0;
+                IsUnmanaged                  = false;
+
+                // ── defaults (researched LONG 32/19; regime-dependent) ─────────
+                // Validated: LONG 32/19, F1=10? (=101+), F2=110, morning window
+                // 09:30–11:30 ET. LONG is REGIME-DEPENDENT (makes almost all its
+                // money on up-days), so it ships with real orders OFF: enable it
+                // MANUALLY only on days you judge to be up-days. {'0':2} qty rule
+                // available (per-day) but off by default.
+                EnableTradingHours   = true;    // restrict to the researched window
+                TradingStartHour     = 9;       // 09:30 ET = morning_open start (6:30 PT)
+                TradingStartMinute   = 30;
+                TradingEndHour       = 11;      // 11:30 ET = morning_open end (8:30 PT)
+                TradingEndMinute     = 30;
+                StrategyLifeMinutes  = 1440;   // 24h; lifetime no longer the main control
+                CheckIntervalSeconds = 1;
+                UseMarketEntry       = true;
+                LimitOffsetPoints    = 5;
+                StopLossPoints       = 32;      // researched LONG stop
+                ProfitTargetPoints   = 19;      // researched LONG target
+                EnableTrailingStop   = false;
+                TrailDistancePoints  = 10;
+                EnableRealOrder      = false;   // MANUAL enable only on believed up-days
+                Filter1Pattern       = "10?";   // 101+  (V-recovery)
+                Filter2Pattern       = "110";    // LONG-side L1 confirm (win-win-loss)
+                BaseQuantity         = 1;
+                EnableQtyIncrement   = false;   // {'0':2} rule; enable after live-validating
+                QtyRuleText          = "(\"10\":2),(\"100\":2),(\"1000\":2),(\"10000\":0),(\"100000\":0),(\"1000000\":0)";
+                EnableTradeOutcomeExit  = false;
+                TradeOutcomeExitPattern = "1111111";
+                MaxTotalSliceCount   = 100000; // high; not the main control anymore
+                MaxRealLossInARow    = 5;       // plan for MCL up to 5-6 (backtest MCL=3 is a floor)
+
+                // logging — folder + base name; timestamp appended per session
+                LogFolder            = @"C:\temp";
+                LogBaseName          = "scalper_LONGrepeat_Layer2";
+
+                // gap thresholds
+                GapToleranceMinutes  = 7;
+                GapCeilingHours      = 4;
+
+                EnableMarginCutoff   = true;   // early EOD before broker overnight-margin snapshot
+                MarginCutoffHour     = 16;     // 16:35 NY cutoff -> flatten 16:30 NY (15 min before the 16:45 NY snapshot)
+                MarginCutoffMinute   = 35;
+                MarginCutoffLeadMin  = 5;      // flatten 5 min before -> 16:30 NY
+            }
+            else if (State == State.Configure)
+            {
+                if (EnableTrailingStop)
+                    SetTrailStop  (ENTRY_SIGNAL, CalculationMode.Ticks,
+                        (int)Math.Round(TrailDistancePoints / TickSize), false);
+                else
+                    SetStopLoss   (ENTRY_SIGNAL, CalculationMode.Ticks,
+                        (int)Math.Round(StopLossPoints / TickSize), false);
+
+                SetProfitTarget(ENTRY_SIGNAL, CalculationMode.Ticks,
+                    (int)Math.Round(ProfitTargetPoints / TickSize));
+            }
+            else if (State == State.DataLoaded)
+            {
+                if (BarsArray != null && BarsArray.Length > 0)
+                    sessionIter = new SessionIterator(BarsArray[0]);
+            }
+            else if (State == State.Realtime)
+            {
+                if (!lifeStarted)
+                {
+                    strategyStartUtc = DateTime.UtcNow;
+                    lifeStarted      = true;
+
+                    if (sessionIter == null && BarsArray != null && BarsArray.Length > 0)
+                        sessionIter = new SessionIterator(BarsArray[0]);
+
+                    // ── decide FRESH vs RESUME from own log, then warm/restore ──
+                    StartupDecideAndLoad();
+                    ParseQtyRule();   // after log path is set, so [QTY RULE] logs to the right file
+                }
+            }
+        }
+
+        protected override void OnBarUpdate()
+        {
+            if (State != State.Realtime) return;
+            if (!lifeStarted) return;
+
+            // margin cutoff: runs every tick (Calculate.OnEachTick). Flattens + holds flat
+            // through the block window, then resumes next session. See MarginProcess.
+            if (EnableMarginCutoff) UpdateMarginActive();
+            if (marginActive) { MarginProcess(); return; }
+
+            if (disabledSelf || pendingFlatten)
+            {
+                ProcessShutdown();
+                return;
+            }
+
+            if (inSlice && !isMoneySlice)
+            {
+                CheckFakeSlice();
+                return;
+            }
+
+            if (inSlice && isMoneySlice)
+                return;
+
+            DateTime nowUtc = DateTime.UtcNow;
+
+            if ((nowUtc - strategyStartUtc).TotalMinutes >= StrategyLifeMinutes)
+            {
+                BeginShutdown("strategy life of " + StrategyLifeMinutes + " min reached");
+                return;
+            }
+
+            if (sliceCount >= MaxTotalSliceCount)
+            {
+                BeginShutdown("MaxTotalSliceCount (" + MaxTotalSliceCount + ") reached");
+                return;
+            }
+
+            if (realLossesInARow >= MaxRealLossInARow)
+            {
+                BeginShutdown("MaxRealLossInARow (" + MaxRealLossInARow
+                    + ") reached. realLossesInARow=" + realLossesInARow);
+                return;
+            }
+
+            if ((DateTime.Now - lastCheckTime).TotalSeconds < CheckIntervalSeconds)
+                return;
+            lastCheckTime = DateTime.Now;
+
+            // Reset the pipeline at the 3:00 PM PT trading-day boundary (matches the
+            // research). Checked BEFORE a new slice starts, so a slice straddling the
+            // boundary completes and is attributed to the day it ENTERED in.
+            CheckTradingDayRollover();
+
+            // *** DO NOT GATE SLICING ON TRADING HOURS ***
+            // Slices must run 24h so the pipeline gets its OVERNIGHT WARM-UP.
+            // The research/backtest feeds the filter the FULL day sequence
+            // (overnight + morning) and only COUNTS fires in the trading window.
+            // If we skipped slicing outside the window, rawString would start
+            // empty at 09:30 ET with no warm-up, the filter would arm differently,
+            // and the live strategy would NOT reproduce the backtest.
+            //
+            // The trading-hours check now lives in StartNextSlice(), where it
+            // demotes a money slice to an OBSERVATION slice (records the bit,
+            // places no order) — same mechanism as [ACCOUNT BUSY] / [QTY SKIP].
+
+            if (!ReadyForNewSlice())
+                return;
+
+            StartNextSlice();
+        }
+
+        // =====================================================================
+        // STARTUP: decide FRESH vs RESUME, set the active log file, restore or
+        // initialize the pipeline. Writes a clear [FRESH START] / [RESUME] line.
+        // =====================================================================
+        private void StartupDecideAndLoad()
+        {
+            // baseline (fresh) state
+            isArmed             = false;
+            waitingForF1Outcome = false;
+            nextIsMoney         = false;
+            realLossesInARow    = 0;
+            currentQty          = BaseQuantity;
+            rawString.Clear();
+            filter1Outcome.Clear();
+            realTradeOutcome.Clear();
+
+            string latest = FindMostRecentLogFile();   // null if none
+
+            bool   doFresh = true;
+            string reason  = "no prior log file";
+            DateTime lastBitLocal = DateTime.MinValue;
+
+            if (!string.IsNullOrEmpty(latest))
+            {
+                // read last bit time + cumulative strings from that file
+                PipelineSnapshot snap = ReadLastSnapshot(latest);
+                if (snap == null || !snap.valid)
+                {
+                    doFresh = true;
+                    reason  = "prior log unreadable/empty";
+                }
+                else
+                {
+                    lastBitLocal = snap.lastBitLocal;
+                    GapDecision gd = DecideGap(snap.lastBitLocal, DateTime.Now);
+                    if (gd.fresh)
+                    {
+                        doFresh = true;
+                        reason  = gd.reason;
+                    }
+                    else
+                    {
+                        // RESUME: restore pipeline from snapshot
+                        doFresh = false;
+                        rawString.Append(snap.rawString);
+                        filter1Outcome.Append(snap.filter1Outcome);
+                        realTradeOutcome.Append(snap.realTradeOutcome);
+                        // BREAKER RESTORE (day-aware): count only TODAY's trailing real
+                        // losses. realTradeOutcome is cumulative and spans days, so using it
+                        // directly would drag yesterday's losses in and re-trip the breaker
+                        // on every restart.
+                        realLossesInARow = CountTodaysTrailingLosses(latest, CurrentTradingDayKey());
+                        ReDerivePipelineFlags();
+                        activeLogFilePath = latest;     // keep same file
+                        reason = gd.reason;
+
+                        // Per-day qty session: on RESUME we start the qty session
+                        // FRESH (empty) and set the day key to the current NY day.
+                        // RESUME only happens for small same-session gaps, so the
+                        // first post-reconnect real trade simply uses base qty until
+                        // a new real loss occurs — conservative and safe. (The
+                        // cumulative loss-streak breaker above is still restored.)
+                        // If the restored snapshot belongs to a PREVIOUS trading day,
+                        // the pipeline must start EMPTY for the new day (research resets
+                        // every trading day). Otherwise we drag yesterday's bits into today.
+                        int snapKey = TradingDayKeyOfLocal(snap.lastBitLocal);
+                        int nowKey  = CurrentTradingDayKey();
+                        if (snapKey > 0 && nowKey > 0 && snapKey != nowKey)
+                        {
+                            DiagLog(string.Format(
+                                "[RESUME ACROSS DAY BOUNDARY] snapshot is trading day {0}, now {1}. "
+                                + "Discarding restored pipeline; new day starts EMPTY (matches research).",
+                                snapKey, nowKey));
+                            rawString.Clear();
+                            filter1Outcome.Clear();
+                            isArmed             = false;
+                            waitingForF1Outcome = false;
+                            nextIsMoney         = false;
+                        }
+                        currentTradingDayKey = nowKey;
+
+                        // Per-day qty session: on RESUME, REBUILD today's qty history
+                        // from the log (same source the breaker uses) instead of
+                        // clearing it -> the qty rule survives disable/enable & reconnect.
+                        // New day / no real trades today -> "" -> clean start.
+                        sessionRealOutcome.Clear();
+                        sessionRealOutcome.Append(ReadTodaysRealOutcomes(latest, nowKey));
+                        sessionDayKey = nowKey;
+                        DiagLog("[QTY RESUME] rebuilt today's qty history from log: sessionReal='"
+                            + sessionRealOutcome.ToString() + "'");
+                    }
+                }
+            }
+
+            if (doFresh)
+            {
+                activeLogFilePath = BuildNewLogFilePath();
+                EnsureLogHeader(activeLogFilePath);
+                DiagLog("[FRESH START] " + reason
+                    + " | new log file = " + activeLogFilePath
+                    + " | pipeline EMPTY, will arm naturally (no real trades until armed)."
+                    + " NOTE: strategy tab shows 'enabled' even though this is a fresh "
+                    + "instance — this log line is the only way to know.");
+            }
+            else
+            {
+                DiagLog("[RESUME] " + reason
+                    + " | continuing log file = " + activeLogFilePath
+                    + " | restored rawString.len=" + rawString.Length
+                    + " filter1Outcome.len=" + filter1Outcome.Length
+                    + " realTradeOutcome=" + realTradeOutcome.ToString()
+                    + " realLossesInARow=" + realLossesInARow
+                    + " isArmed=" + isArmed
+                    + " waitingForF1Outcome=" + waitingForF1Outcome
+                    + " nextIsMoney=" + nextIsMoney
+                    + " | last bit was " + lastBitLocal.ToString("yyyy-MM-dd HH:mm:ss")
+                    + ". Breaker intact across reconnect.");
+            }
+
+            DiagLog("[NOTE] rawString RESETS at 3:00 PM PT each trading day (matches research). "
+                  + "slice_num restarts at 1 on every strategy instance. "
+                  + "This string will NOT match the standalone recorder bit-for-bit "
+                  + "(independent slicers / throttle phase) — that is expected.");
+            DiagLog(Name + " ready (LONG). EnableRealOrder=" + EnableRealOrder
+                + ", Filter1=[" + Filter1Pattern + "], Filter2=[" + Filter2Pattern + "]"
+                + ", MaxRealLossInARow=" + MaxRealLossInARow
+                + ", Stop=" + StopLossPoints + "pt, Target=" + ProfitTargetPoints + "pt"
+                + ", GapTolerance=" + GapToleranceMinutes + "min, GapCeiling=" + GapCeilingHours + "h"
+                + " | MarginCutoff=" + (EnableMarginCutoff ? "ON" : "OFF")
+                + string.Format(" flat@{0:00}:{1:00} NY (cutoff {2:00}:{3:00} lead {4}m)",
+                    (MarginCutoffHour*60+MarginCutoffMinute-MarginCutoffLeadMin)/60,
+                    (MarginCutoffHour*60+MarginCutoffMinute-MarginCutoffLeadMin)%60,
+                    MarginCutoffHour, MarginCutoffMinute, MarginCutoffLeadMin));
+            DiagLog(string.Format("[CLOCK] Strategy follows NEW YORK time (Wall St. bell). New York now={0:HH:mm:ss}, "
+                + "this platform/log clock={1:HH:mm:ss}. All hour params are New York time; log timestamps are platform time.",
+                EasternNow(), DateTime.Now));
+        }
+
+        // ── gap decision ──────────────────────────────────────────────────────
+        private class GapDecision { public bool fresh; public string reason; }
+
+        private GapDecision DecideGap(DateTime lastBitLocal, DateTime nowLocal)
+        {
+            var d = new GapDecision();
+
+            // 1) weekend in the gap -> fresh
+            if (WeekendInGap(lastBitLocal, nowLocal))
+            {
+                d.fresh = true;
+                d.reason = "weekend fell within the gap (Fri pipeline not continuous with reopen)";
+                return d;
+            }
+
+            // 2) wall-clock ceiling -> fresh
+            double wallHours = (nowLocal - lastBitLocal).TotalHours;
+            if (wallHours > GapCeilingHours)
+            {
+                d.fresh = true;
+                d.reason = "wall-clock gap " + wallHours.ToString("F1")
+                         + "h exceeds ceiling " + GapCeilingHours + "h";
+                return d;
+            }
+
+            // 3) market-open minutes in gap -> fresh if over tolerance
+            int openMin = MarketOpenMinutesInGap(lastBitLocal, nowLocal);
+            if (openMin > GapToleranceMinutes)
+            {
+                d.fresh = true;
+                d.reason = "market-open minutes in gap = " + openMin
+                         + " > tolerance " + GapToleranceMinutes + "min (real hole in string)";
+                return d;
+            }
+
+            d.fresh = false;
+            d.reason = "gap small: " + openMin + " market-open min (<= " + GapToleranceMinutes
+                     + "min), wall-clock " + wallHours.ToString("F2") + "h, no weekend";
+            return d;
+        }
+
+        private bool WeekendInGap(DateTime a, DateTime b)
+        {
+            if (b <= a) return false;
+            // step day by day; if any calendar day is Sat or Sun, weekend in gap
+            DateTime cur = a.Date;
+            while (cur <= b.Date)
+            {
+                if (cur.DayOfWeek == DayOfWeek.Saturday || cur.DayOfWeek == DayOfWeek.Sunday)
+                    return true;
+                cur = cur.AddDays(1);
+            }
+            return false;
+        }
+
+        // Count how many minutes between a and b the market was OPEN, per the
+        // data series Trading Hours template. Bounded by GapCeilingHours so the
+        // loop can never run long (we only reach here when wall gap <= ceiling).
+        private int MarketOpenMinutesInGap(DateTime a, DateTime b)
+        {
+            try
+            {
+                if (sessionIter == null || b <= a) return 0;
+                int openCount = 0;
+                DateTime t = a;
+                int safety = GapCeilingHours * 60 + 5;   // hard cap on iterations
+                while (t < b && safety-- > 0)
+                {
+                    DateTime next = t.AddMinutes(1);
+                    // Is the market open at minute 't'? Use TradingHours.
+                    if (IsMarketOpenAt(t))
+                        openCount++;
+                    t = next;
+                }
+                return openCount;
+            }
+            catch (Exception ex)
+            {
+                DiagLog("MarketOpenMinutesInGap error: " + ex.Message
+                    + " -> treating as OPEN (conservative -> fresh).");
+                // On error, return a large number so we FRESH-start (safe).
+                return GapToleranceMinutes + 9999;
+            }
+        }
+
+        // Determine if the market is open at a given LOCAL time, via the
+        // SessionIterator (which reads the data series' Trading Hours template).
+        private bool IsMarketOpenAt(DateTime localTime)
+        {
+            try
+            {
+                if (sessionIter == null) return true;  // fail-open -> caller fresh-starts (safe)
+                // IsInSession(timeLocal, includesEndTimeStamp, isIntraDay)
+                // isIntraDay=true so the time-of-day is considered (not just the date).
+                return sessionIter.IsInSession(localTime, true, true);
+            }
+            catch
+            {
+                // If the API differs in your NT build, default to OPEN so a gap
+                // is treated as a real hole (fresh start) — the safe direction.
+                return true;
+            }
+        }
+
+        // =====================================================================
+        // CalcQty (unchanged)
+        // =====================================================================
+        // =====================================================================
+        // CalcQty — researched layered per-day loss-run rule (see QtyMultiplierTable)
+        // Returns the real order quantity, or 0 meaning "SKIP the trade" (the
+        // caller must NOT place a real order when this returns 0).
+        // LONGEST-matching pattern wins (order-independent).
+        // =====================================================================
+        // Parse QtyRuleText into qtyTable. Lenient: strips ( ) " then scans for every
+        // "<pattern>:<qty>" pair (pattern = run of 0/1, qty >= 0) and ignores the rest.
+        // Warns on duplicate-length patterns (longest-match keeps the first at a length).
+        // On any failure keeps the built-in default and logs.
+        private const int QTY_MULT_CAP = 20;   // hard ceiling: any multiplier above this is REFUSED
+
+        // Parse QtyRuleText into qtyTable. Reads the CONTENT INSIDE each (...) group,
+        // so a MISSING COMMA between groups is harmless -- each parenthesised pair is
+        // read on its own and a qty can never merge into the next pattern's digits.
+        // If no parens are present, falls back to splitting the bare string on commas.
+        // SAFETY: any multiplier > QTY_MULT_CAP is REFUSED (a typo can never inflate
+        // size). Logs the full ACTIVE table so it can be verified at a glance.
+        private void ParseQtyRule()
+        {
+            try
+            {
+                string src = QtyRuleText ?? "";
+                var units = new System.Collections.Generic.List<string>();
+                var groups = System.Text.RegularExpressions.Regex.Matches(src, @"\(([^)]*)\)");
+                if (groups.Count > 0)
+                    foreach (System.Text.RegularExpressions.Match g in groups) units.Add(g.Groups[1].Value);
+                else
+                    units.AddRange(src.Split(','));   // bare (no-paren) fallback
+
+                var list = new System.Collections.Generic.List<(string pattern, int multiplier)>();
+                foreach (string u in units)
+                {
+                    var m = System.Text.RegularExpressions.Regex.Match(u, @"([01]+)\s*""?\s*:\s*(\d+)");
+                    if (!m.Success)
+                    {
+                        if (u.Trim().Length > 0) DiagLog("[QTY RULE] ignored '" + u.Trim() + "'");
+                        continue;
+                    }
+                    string pat = m.Groups[1].Value;
+                    int    q   = int.Parse(m.Groups[2].Value, System.Globalization.CultureInfo.InvariantCulture);
+                    if (q > QTY_MULT_CAP)
+                    {
+                        DiagLog("[QTY RULE] DANGER '" + pat + "':" + q + " exceeds cap " + QTY_MULT_CAP
+                            + " -> REFUSED (check the format!).");
+                        continue;
+                    }
+                    list.Add((pat, q));
+                }
+
+                if (list.Count > 0)
+                {
+                    qtyTable = list.ToArray();
+                    var sb = new StringBuilder();
+                    foreach (var e in list) sb.Append(e.pattern + "->x" + e.multiplier + "  ");
+                    DiagLog("[QTY RULE] ACTIVE: " + sb.ToString().Trim());
+                }
+                else DiagLog("[QTY RULE] no valid pairs in '" + src + "' -> keeping default.");
+            }
+            catch (Exception ex)
+            {
+                DiagLog("[QTY RULE] parse error: " + ex.Message + " -> keeping default.");
+            }
+        }
+
+        // Trade-outcome exit: HALT the session (same shutdown as the breaker -> manual
+        // re-enable) when the REAL trade-outcome tail (sessionRealOutcome; 1=win,0=loss)
+        // ends with TradeOutcomeExitPattern (plain endsWith, NO wildcard). Called ONLY on
+        // a CLEAN stop/target resolution -- not on forced-close or EOD paths. Slice
+        // default pattern "1111111" + disabled = effectively inert.
+        private void CheckTradeOutcomeExit()
+        {
+            if (EnableTradeOutcomeExit
+                && !string.IsNullOrEmpty(TradeOutcomeExitPattern)
+                && sessionRealOutcome.ToString().EndsWith(TradeOutcomeExitPattern))
+            {
+                DiagLog("[OUTCOME EXIT] real-outcome tail matched '" + TradeOutcomeExitPattern
+                    + "' -> halting session. session=" + sessionRealOutcome.ToString());
+                BeginShutdown("trade-outcome exit '" + TradeOutcomeExitPattern + "' matched");
+            }
+        }
+
+        private int CalcQty()
+        {
+            if (!EnableQtyIncrement) return BaseQuantity;
+
+            // Qty rule is driven by the PER-DAY session outcome string so it
+            // resets every trading day (each day is a brand-new sizing sequence).
+            string outcome = sessionRealOutcome.ToString();
+            if (outcome.Length == 0) return BaseQuantity;
+
+            // Longest-matching pattern wins, regardless of table order. We scan
+            // all entries and keep the match whose pattern is the longest.
+            int  bestLen  = -1;
+            int  bestMult = 1;
+            bool matched  = false;
+            foreach (var entry in qtyTable)
+            {
+                if (entry.pattern.Length > bestLen && TailMatches(outcome, entry.pattern))
+                {
+                    bestLen  = entry.pattern.Length;
+                    bestMult = entry.multiplier;
+                    matched  = true;
+                }
+            }
+
+            if (!matched) return BaseQuantity;
+
+            int qty = BaseQuantity * bestMult;   // bestMult may be 0 -> skip
+            DiagLog(string.Format("[QTY] longest match len={0} -> x{1} -> qty={2} (sessionReal={3})",
+                bestLen, bestMult, qty, outcome));
+            return qty;
+        }
+
+        // =====================================================================
+        // TRADING-DAY KEY  (3:00 PM Pacific -> 3:00 PM Pacific)
+        // =====================================================================
+        // MUST match the research slicer exactly:
+        //     trading_day(t) = date(t) if t >= 15:00 PT, else date(t) - 1
+        // Everything that "resets per trading day" (the filter pipeline AND the qty
+        // session) rolls on THIS boundary, so live reproduces the backtest.
+        private TimeZoneInfo PacificZone()
+        {
+            try   { return TimeZoneInfo.FindSystemTimeZoneById("Pacific Standard Time"); }
+            catch { try { return TimeZoneInfo.FindSystemTimeZoneById("America/Los_Angeles"); } catch { return null; } }
+        }
+
+        private int TradingDayKeyOfLocal(DateTime localTime)
+        {
+            try
+            {
+                TimeZoneInfo pt = PacificZone();
+                DateTime ptTime;
+                if (pt == null) { ptTime = localTime; }
+                else
+                {
+                    DateTime utc = TimeZoneInfo.ConvertTimeToUtc(
+                        DateTime.SpecifyKind(localTime, DateTimeKind.Unspecified), TimeZoneInfo.Local);
+                    ptTime = TimeZoneInfo.ConvertTimeFromUtc(utc, pt);
+                }
+                DateTime d = (ptTime.TimeOfDay >= new TimeSpan(15, 0, 0))
+                             ? ptTime.Date : ptTime.Date.AddDays(-1);
+                return d.Year * 10000 + d.Month * 100 + d.Day;
+            }
+            catch { return -1; }
+        }
+
+        private int CurrentTradingDayKey() { return TradingDayKeyOfLocal(DateTime.Now); }
+
+        // =====================================================================
+        // CheckTradingDayRollover — RESET THE PIPELINE AT 3:00 PM PT
+        // =====================================================================
+        // The research starts EVERY trading day with an EMPTY pipeline, warms up
+        // through the overnight bits, and fires in the morning window. Every
+        // published number was produced that way. If the live strategy carried
+        // yesterday's bits into today it would arm differently and would NOT
+        // reproduce the backtest — with no visible symptom. So we clear here.
+        //
+        // RESETS: rawString, filter1Outcome, isArmed, waiting flags, nextIsMoney,
+        //         sessionRealOutcome (qty history)
+        // KEPT  : realTradeOutcome (audit trail), realLossesInARow (safety breaker)
+        private void CheckTradingDayRollover()
+        {
+            int key = CurrentTradingDayKey();
+            if (key < 0) return;
+
+            if (currentTradingDayKey == -1) { currentTradingDayKey = key; return; }
+
+            if (key != currentTradingDayKey)
+            {
+                DiagLog(string.Format(
+                    "[TRADING DAY ROLLOVER] {0} -> {1} (3:00 PM PT boundary). "
+                    + "Clearing pipeline to match the research. prev raw({2}). "
+                    + "realTradeOutcome and realLossesInARow are KEPT.",
+                    currentTradingDayKey, key, rawString.Length));
+
+                rawString.Clear();
+                filter1Outcome.Clear();
+                isArmed             = false;
+                waitingForF1Outcome = false;
+                nextIsMoney         = false;
+
+                sessionRealOutcome.Clear();
+                sessionDayKey = key;
+
+                // DAILY CIRCUIT BREAKER: a new trading day is a brand-new day for
+                // EVERYTHING except realTradeOutcome (the cumulative audit trail).
+                // If we blew through MaxRealLossInARow yesterday, that is over — today
+                // starts clean. Without this the streak would carry forever and, on
+                // restart, the breaker would re-trip instantly, bricking the strategy.
+                if (realLossesInARow > 0)
+                    DiagLog("[BREAKER RESET] new trading day -> realLossesInARow "
+                          + realLossesInARow + " -> 0");
+                realLossesInARow = 0;
+
+                currentTradingDayKey = key;
+            }
+        }
+
+        // Append a real outcome bit to the per-day session string, rolling to a
+        // fresh session string when the NY day changes.
+        private void RecordSessionOutcome(int bit)
+        {
+            int key = CurrentTradingDayKey();   // same 3PM-PT boundary as the pipeline
+            if (key != sessionDayKey)
+            {
+                if (sessionDayKey != -1)
+                    DiagLog(string.Format("[QTY SESSION ROLL] new trading day {0} (was {1}) -> qty session reset. "
+                        + "prev sessionReal={2}", key, sessionDayKey, sessionRealOutcome.ToString()));
+                sessionDayKey = key;
+                sessionRealOutcome.Clear();
+            }
+            sessionRealOutcome.Append(bit.ToString());
+        }
+
+        // =====================================================================
+        // StartNextSlice (unchanged logic)
+        // =====================================================================
+        private void StartNextSlice()
+        {
+            bool startMoney = nextIsMoney;
+            nextIsMoney = false;
+
+            sliceCount++;
+            double refPrice = GetCurrentBid();
+            if (refPrice <= 0) { sliceCount--; return; }
+
+            if (!UseMarketEntry)
+                refPrice = Instrument.MasterInstrument.RoundToTickSize(refPrice - LimitOffsetPoints);
+
+            sliceEntryPrice  = refPrice;
+            sliceStopPrice   = Instrument.MasterInstrument.RoundToTickSize(sliceEntryPrice - StopLossPoints);
+            sliceTargetPrice = Instrument.MasterInstrument.RoundToTickSize(sliceEntryPrice + ProfitTargetPoints);
+            inSlice          = true;
+            isMoneySlice     = startMoney && EnableRealOrder;
+            suppressReason   = null;   // reset; set by the guards below if demoted
+
+            // OBSERVATION MODE: when EnableRealOrder=false, isMoneySlice is always false,
+            // so none of the guards below fire and every row would log as a plain FAKE_*.
+            // That would hide the whole point of observation mode — WHICH SLICES THE
+            // FILTER ARMED FOR. 'startMoney' holds that, so mark it explicitly.
+            if (startMoney && !EnableRealOrder)
+            {
+                suppressReason = "WOULDBE_TRADE";
+                DiagLog(string.Format(
+                    "[WOULD-BE TRADE] Slice #{0} the filter ARMED and this WOULD have been a "
+                    + "real order, but EnableRealOrder=false. Bit recorded; no order placed.",
+                    sliceCount));
+            }
+
+            // ── GUARD 1: TRADING HOURS (order-only gate) ───────────────────────
+            // Outside the trading window we still SLICE and RECORD the bit (the
+            // pipeline needs 24h data for its overnight warm-up — see OnBarUpdate),
+            // but we place NO order. Demote to an observation slice.
+            if (isMoneySlice && EnableTradingHours && !WithinTradingHours())
+            {
+                DiagLog(string.Format(
+                    "[OUTSIDE HOURS] Slice #{0} -> NO real order, OBSERVATION ONLY "
+                    + "(outside {1:00}:{2:00}-{3:00}:{4:00} NY/Eastern). Bit still recorded.",
+                    sliceCount, TradingStartHour, TradingStartMinute,
+                    TradingEndHour, TradingEndMinute));
+                isMoneySlice   = false;
+                suppressReason = "OBS_OUTSIDE_HOURS";
+            }
+
+            // ── GUARD 2: MULTI-STRATEGY (same instrument only) ─────────────────
+            // If ANY position or live order exists on THIS instrument — placed by
+            // another strategy (e.g. the other direction's book), or by you manually
+            // / via ATM — then we do NOT place an order. We demote this money slice
+            // to an OBSERVATION slice: it still runs, still resolves, and still feeds
+            // the pipeline, so the bit string stays continuous and the filters stay
+            // valid. Only the ORDER is suppressed.
+            //
+            // This is what lets LONG and SHORT run on the same account/instrument
+            // simultaneously without ever double-positioning. First to fire wins;
+            // the other records the bit but sits out that trade.
+            if (isMoneySlice && AccountBusyOnThisInstrument())
+            {
+                DiagLog(string.Format(
+                    "[ACCOUNT BUSY] Slice #{0} -> NO real order, OBSERVATION ONLY "
+                    + "(instrument already has a position/order from another strategy or manual). "
+                    + "Bit will still be recorded.", sliceCount));
+                isMoneySlice   = false;   // run as a fake/observation slice
+                suppressReason = "OBS_ACCOUNT_BUSY";
+            }
+
+            // Compute qty up front. A qty of 0 means the qty rule says SKIP this
+            // trade (e.g. deep into a loss run). We demote it to an OBSERVATION
+            // slice: no real order is placed, but the slice still resolves and
+            // feeds the pipeline so the bit string stays continuous.
+            if (isMoneySlice)
+            {
+                currentQty = CalcQty();
+                if (currentQty <= 0)
+                {
+                    DiagLog(string.Format(
+                        "[QTY SKIP] Slice #{0} qty rule returned 0 -> NO real order, observe only. sessionReal={1}",
+                        sliceCount, sessionRealOutcome.ToString()));
+                    isMoneySlice   = false;   // run as a fake/observation slice
+                    suppressReason = "OBS_QTY_SKIP";
+                }
+            }
+
+            if (isMoneySlice)
+            {
+                awaitingClose     = true;
+                winQtyThisTrade   = 0;   // reset per-trade majority-quantity tally
+                lossQtyThisTrade  = 0;
+                entryInFlight     = true;
+                workingEntryOrder = null;
+                try
+                {
+                    if (UseMarketEntry)
+                    {
+                        workingEntryOrder = EnterLong(currentQty, ENTRY_SIGNAL);
+                        DiagLog(string.Format(
+                            "MONEY SLICE #{0} MARKET qty={1} entry~{2:F2} stop={3:F2} target={4:F2} | raw={5} | f1={6} | real={7}",
+                            sliceCount, currentQty, sliceEntryPrice, sliceStopPrice, sliceTargetPrice,
+                            TailOf(rawString, 8), TailOf(filter1Outcome, 8), TailOf(realTradeOutcome, 8)));
+                    }
+                    else
+                    {
+                        double limitPx = Instrument.MasterInstrument.RoundToTickSize(
+                            GetCurrentBid() - LimitOffsetPoints);
+                        workingEntryOrder = EnterLongLimit(0, true, currentQty, limitPx, ENTRY_SIGNAL);
+                        DiagLog(string.Format(
+                            "MONEY SLICE #{0} LIMIT qty={1} limit={2:F2} | raw={3} | f1={4} | real={5}",
+                            sliceCount, currentQty, limitPx,
+                            TailOf(rawString, 8), TailOf(filter1Outcome, 8), TailOf(realTradeOutcome, 8)));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    DiagLog("StartNextSlice money error: " + ex.Message);
+                    sliceCount--;
+                    inSlice = false; isMoneySlice = false;
+                    awaitingClose = false; entryInFlight = false; workingEntryOrder = null;
+                }
+            }
+            else
+            {
+                DiagLog(string.Format(
+                    "FAKE SLICE #{0} entry={1:F2} stop={2:F2} target={3:F2} | isArmed={4} | rawTail={5} | f1={6}",
+                    sliceCount, sliceEntryPrice, sliceStopPrice, sliceTargetPrice,
+                    isArmed, TailOf(rawString, 8), TailOf(filter1Outcome, 8)));
+            }
+        }
+
+        // =====================================================================
+        // CheckFakeSlice (unchanged logic)
+        // =====================================================================
+        private void CheckFakeSlice()
+        {
+            try
+            {
+                double bid = GetCurrentBid();
+                double ask = GetCurrentAsk();
+                if (bid <= 0 || ask <= 0) return;
+
+                bool stopHit   = bid <= sliceStopPrice;
+                bool targetHit = ask >= sliceTargetPrice;
+                if (!stopHit && !targetHit) return;
+
+                int    bit       = stopHit ? 0 : 1;
+                double exitPrice = stopHit ? sliceStopPrice : sliceTargetPrice;
+                double pnl       = stopHit
+                    ? -(StopLossPoints     * Instrument.MasterInstrument.PointValue)
+                    : +(ProfitTargetPoints * Instrument.MasterInstrument.PointValue);
+
+                bool wasMoneySlice = isMoneySlice;
+                inSlice      = false;
+                isMoneySlice = false;
+
+                double logEntryPrice = sliceEntryPrice;
+                sliceEntryPrice = 0.0; sliceStopPrice = 0.0; sliceTargetPrice = 0.0;
+
+                if (wasMoneySlice)
+                {
+                    if (Position.MarketPosition == MarketPosition.Flat
+                        && workingEntryOrder != null
+                        && (workingEntryOrder.OrderState == OrderState.Working
+                            || workingEntryOrder.OrderState == OrderState.Accepted
+                            || workingEntryOrder.OrderState == OrderState.Submitted))
+                    {
+                        DiagLog(string.Format("[BRICK CLEANUP Case1] Slice #{0} order never filled. Cancel. No bit.", sliceCount));
+                        try { CancelOrder(workingEntryOrder); } catch (Exception ex) { DiagLog("CancelOrder error: " + ex.Message); }
+                        workingEntryOrder = null; entryInFlight = false; awaitingClose = false;
+                        sliceCount--;
+                        WriteLogRowCancelled(logEntryPrice);
+                        return;
+                    }
+
+                    if (Position.MarketPosition == MarketPosition.Long)
+                    {
+                        DiagLog(string.Format("[BRICK CLEANUP Case2] Slice #{0} position still open. Force close. bit={1}", sliceCount, bit));
+                        try { ExitLong(Math.Abs(Position.Quantity), "LR_ForceClose", ENTRY_SIGNAL); }
+                        catch (Exception ex) { DiagLog("ForceClose error: " + ex.Message); }
+                        awaitingClose = false; entryInFlight = false; workingEntryOrder = null;
+                        // MONEY: bracket did NOT fill, force-closed -> conservative LOSS (0).
+                        realTradeOutcome.Append("0");
+                        RecordSessionOutcome(0);
+                        realLossesInARow++;
+                        DiagLog("[REAL LOSS forced-close] realLossesInARow=" + realLossesInARow);
+                        // PATTERN (data feed): cross-line bit.
+                        UpdatePipeline(bit);
+                        WriteLogRow(entryFillPrice > 0 ? entryFillPrice : logEntryPrice,
+                            exitPrice, pnl, bit, entryFillQty > 0 ? entryFillQty : currentQty, DateTime.Now);
+                        entryFillPrice = 0.0; entryFillQty = 0;
+                        return;
+                    }
+
+                    if (Position.MarketPosition == MarketPosition.Flat && !awaitingClose)
+                    {
+                        // Money already recorded by OnExecutionUpdate (real bracket fill). Still
+                        // record the PATTERN bit here from the data feed (cross-line), every slice.
+                        DiagLog(string.Format("[BRICK CLEANUP Case3] Slice #{0} closed by bracket. Pattern bit={1}.", sliceCount, bit));
+                        UpdatePipeline(bit);
+                        return;
+                    }
+                }
+
+                DiagLog(string.Format("FAKE SLICE #{0} {1}: entry={2:F2} exit={3:F2} pnl={4:0.00} bit={5}",
+                    sliceCount, stopHit ? "LOSS" : "WIN", logEntryPrice, exitPrice, pnl, bit));
+
+                UpdatePipeline(bit);
+                WriteLogRowFake(logEntryPrice, exitPrice, pnl, bit);
+            }
+            catch (Exception ex)
+            {
+                DiagLog("CheckFakeSlice error: " + ex.Message);
+                inSlice = false; isMoneySlice = false;
+            }
+        }
+
+        // =====================================================================
+        // UpdatePipeline (unchanged)
+        // =====================================================================
+        private void UpdatePipeline(int bit)
+        {
+            rawString.Append(bit.ToString());
+            string raw = rawString.ToString();
+
+            if (waitingForF1Outcome)
+            {
+                waitingForF1Outcome = false;
+                filter1Outcome.Append(bit.ToString());
+                string f1str = filter1Outcome.ToString();
+                DiagLog(string.Format("[F1 COLLECT] digit after F1='{0}' is '{1}' -> f1={2}",
+                    Filter1Pattern, bit, f1str));
+                isArmed = TailMatches(f1str, Filter2Pattern);
+                DiagLog(isArmed ? "[F2 MATCH] isArmed=true" : "[F2 NO MATCH] isArmed=false");
+            }
+
+            bool f1Match = TailMatches(raw, Filter1Pattern);
+            if (f1Match)
+            {
+                waitingForF1Outcome = true;
+                DiagLog("[F1 MATCH] rawString tail matches Filter1 -> next bit feeds filter1Outcome");
+            }
+
+            nextIsMoney = isArmed && TailMatches(raw, Filter1Pattern);
+
+            DiagLog(string.Format("[PIPELINE] raw({0})={1} | f1({2})={3} | waitF1={4} | isArmed={5} | nextIsMoney={6} | realLossRow={7}",
+                rawString.Length, TailOf(rawString, 8),
+                filter1Outcome.Length, TailOf(filter1Outcome, 8),
+                waitingForF1Outcome, isArmed, nextIsMoney, realLossesInARow));
+        }
+
+        // Re-derive isArmed / waitingForF1Outcome / nextIsMoney from the loaded
+        // rawString + filter1Outcome (used on RESUME). We recompute the flags
+        // that the next-bit logic depends on, from the cumulative strings.
+        private void ReDerivePipelineFlags()
+        {
+            string raw   = rawString.ToString();
+            string f1str = filter1Outcome.ToString();
+
+            // isArmed: does filter1Outcome currently end with Filter2Pattern?
+            isArmed = TailMatches(f1str, Filter2Pattern);
+
+            // waitingForF1Outcome: did the LAST bit complete an F1 match whose
+            // "digit after" has not yet arrived? We cannot perfectly know if the
+            // next bit was already consumed, so we set it from the current tail:
+            // if rawString currently ends with Filter1Pattern, the next real bit
+            // should feed filter1Outcome.
+            waitingForF1Outcome = TailMatches(raw, Filter1Pattern);
+
+            // nextIsMoney consistent with UpdatePipeline's definition
+            nextIsMoney = isArmed && TailMatches(raw, Filter1Pattern);
+        }
+
+        // =====================================================================
+        // OnExecutionUpdate — real money fills + EOD-flatten handling
+        // =====================================================================
+        protected override void OnExecutionUpdate(Execution execution, string executionId,
+            double price, int quantity, MarketPosition marketPosition,
+            string orderId, DateTime time)
+        {
+            if (execution == null || execution.Order == null) return;
+
+            string oName  = execution.Order.Name ?? "";
+            bool   isFull = execution.Order.OrderState == OrderState.Filled;
+            bool   isPart = execution.Order.OrderState == OrderState.PartFilled;
+
+            // ── entry fill ────────────────────────────────────────────────────
+            if (oName == ENTRY_SIGNAL && (isFull || isPart))
+            {
+                if (entryFillPrice == 0.0) entryFillPrice = price;
+                entryFillQty += quantity;
+                DiagLog(string.Format("ENTRY {0} fill: qty={1} @ {2:F2} total={3}",
+                    isFull ? "FULL" : "PARTIAL", quantity, price, entryFillQty));
+                if (isFull) { entryInFlight = false; workingEntryOrder = null; }
+                if (pendingFlatten) ProcessShutdown();   // chase a growing entry during shutdown
+                return;
+            }
+
+            // ── recognized bracket exit (stop / target) ───────────────────────
+            bool isStopFill   = oName.IndexOf("Stop",   StringComparison.OrdinalIgnoreCase) >= 0
+                             || oName.IndexOf("StopCancelClose", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool isTargetFill = oName.IndexOf("Profit", StringComparison.OrdinalIgnoreCase) >= 0
+                             || oName.IndexOf("Target", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            // ── EOD / forced flatten detection ────────────────────────────────
+            // Any exit that flattens the position but is NOT our stop/target and
+            // NOT our own LR_ForceClose is treated as an EOD/session-close flatten.
+            // We do not trust its price -> record as LOSS, conservatively.
+            bool isOurForceClose = oName.IndexOf("LR_ForceClose",  StringComparison.OrdinalIgnoreCase) >= 0
+                                 || oName.IndexOf("LR_Flatten",    StringComparison.OrdinalIgnoreCase) >= 0
+                                 || oName.IndexOf("LR_MarginFlat", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool isExitFill = !(oName == ENTRY_SIGNAL);
+
+            // MONEY (broker side): MAJORITY-QUANTITY. Tally which bracket closed each contract,
+            // then record ONE money bit once flat. Stop -> loss, Target -> win, our flatten -> no vote,
+            // unknown -> loss. Tie/loss-majority -> 0. This writes ONLY the money string, never rawString.
+            if      (isStopFill)      lossQtyThisTrade += quantity;
+            else if (isTargetFill)    winQtyThisTrade  += quantity;
+            else if (isOurForceClose) { /* our flatten: does not vote */ }
+            else                      lossQtyThisTrade += quantity;
+
+            if (marketPosition == MarketPosition.Flat && awaitingClose)
+            {
+                int bit = (winQtyThisTrade > lossQtyThisTrade) ? 1 : 0;
+                double pnl = (winQtyThisTrade * ProfitTargetPoints - lossQtyThisTrade * StopLossPoints)
+                             * Instrument.MasterInstrument.PointValue;
+
+                DiagLog(string.Format("MONEY SLICE #{0} CLOSED {1}: entry={2:F2} exit={3:F2} qty={4} "
+                    + "winQty={5} lossQty={6} pnl={7:0.00} bit={8}",
+                    sliceCount, bit == 1 ? "WIN" : "LOSS", entryFillPrice, price, entryFillQty,
+                    winQtyThisTrade, lossQtyThisTrade, pnl, bit));
+
+                realTradeOutcome.Append(bit.ToString());
+                RecordSessionOutcome(bit);
+                if (bit == 0) { realLossesInARow++; DiagLog("[REAL LOSS] realLossesInARow=" + realLossesInARow); }
+                else { if (realLossesInARow > 0) DiagLog("[REAL WIN] reset " + realLossesInARow + "->0"); realLossesInARow = 0; }
+                CheckTradeOutcomeExit();
+
+                awaitingClose = false; entryInFlight = false; workingEntryOrder = null;
+                inSlice = false; isMoneySlice = false;
+
+                double logFillPrice = entryFillPrice;
+                int    logFillQty   = entryFillQty;
+                entryFillPrice = 0.0; entryFillQty = 0;
+
+                // NOTE: rawString (pattern) is written ONLY by CheckFakeSlice (data-feed cross-line).
+                WriteLogRow(logFillPrice, price, pnl, bit, logFillQty, time);
+            }
+
+            if (pendingFlatten) ProcessShutdown();   // drive termination once the flatten has filled
+        }
+
+        // =====================================================================
+        // OnOrderUpdate (unchanged)
+        // =====================================================================
+        protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice,
+            int quantity, int filled, double averageFillPrice, OrderState orderState,
+            DateTime time, ErrorCode error, string nativeError)
+        {
+            if (order == null) return;
+            string oName = order.Name ?? "";
+
+            if (oName == ENTRY_SIGNAL
+                && (orderState == OrderState.Cancelled || orderState == OrderState.Rejected))
+            {
+                DiagLog(string.Format("Entry order {0} (filled={1}). Resetting.", orderState, filled));
+                if (filled == 0)
+                {
+                    sliceCount--;
+                    entryInFlight = false; awaitingClose = false; workingEntryOrder = null;
+                    entryFillPrice = 0.0; entryFillQty = 0; inSlice = false; isMoneySlice = false;
+                }
+                else
+                {
+                    entryInFlight = false; workingEntryOrder = null;
+                }
+                return;
+            }
+
+            if (error != ErrorCode.NoError || orderState == OrderState.Rejected)
+                DiagLog(string.Format("ORDER WARN: {0} state={1} err={2} native={3}",
+                    oName, orderState, error, string.IsNullOrEmpty(nativeError) ? "-" : nativeError));
+        }
+
+        // =====================================================================
+        // ReadyForNewSlice  — "is THIS strategy free to start a new slice?"
+        // =====================================================================
+        // *** MULTI-STRATEGY CHANGE — READ THIS ***
+        // This method now checks ONLY THIS STRATEGY'S OWN state. It deliberately
+        // does NOT look at the account, at other strategies, or at manual trades.
+        //
+        // WHY: a slice must ALWAYS be allowed to start, because a slice is how we
+        // record a bit. If we blocked the slice when another strategy held a
+        // position, this strategy would record NOTHING for that period and its
+        // rawString would develop a HOLE — which silently corrupts every filter
+        // (the pipeline state is computed from an unbroken string).
+        //
+        // The account-level check has MOVED to StartNextSlice(), where it demotes
+        // a money slice to an OBSERVATION slice (records the bit, places no order)
+        // instead of skipping the slice entirely. See [ACCOUNT BUSY] there.
+        //
+        // NOTE: 'Position' in NinjaScript is THIS STRATEGY's position, not the
+        // account's. That is exactly what we want here.
+        private bool ReadyForNewSlice()
+        {
+            if (inSlice)       return false;   // this strategy is already in a slice
+            if (awaitingClose) return false;   // this strategy's money trade is still closing
+            if (entryInFlight) return false;   // this strategy has an entry order in flight
+            if (Position.MarketPosition != MarketPosition.Flat) return false;  // THIS strategy holds a position
+
+            return true;
+        }
+
+        // =====================================================================
+        // AccountBusyOnThisInstrument  — "does ANYONE hold this instrument now?"
+        // =====================================================================
+        // *** MULTI-STRATEGY CHANGE — READ THIS ***
+        // Returns TRUE if the ACCOUNT has, on THIS INSTRUMENT (same instrument
+        // only — option (a)):
+        //     - any open position (from ANY strategy, or a manual/ATM trade), OR
+        //     - any working / accepted / submitted / part-filled order.
+        //
+        // When this returns TRUE, StartNextSlice() demotes the money slice to an
+        // OBSERVATION slice: NO real order is placed, but the slice still runs,
+        // still resolves, and still feeds the pipeline — so the bit string stays
+        // continuous and the filters remain valid.
+        //
+        // PURPOSE: allows LONG and SHORT (and any other strategies) to run on the
+        // SAME account and SAME instrument at once without ever double-positioning.
+        // First strategy to fire wins the slot; the others record but do not trade.
+        //
+        // IMPORTANT CONSEQUENCE: whichever strategy fires first takes the trade.
+        // The others will MISS that trade even if they were armed. This means live
+        // fire counts will be LOWER than each strategy's standalone backtest, and
+        // that interaction was never backtested. If you run a weaker book alongside
+        // a stronger one, the weaker one can STEAL a slot from the stronger one.
+        // Recommended: keep EnableRealOrder=false on the weaker book.
+        //
+        // ON ERROR: fail SAFE -> return true (treat as busy -> observation only,
+        // no order). Never risk placing an order when we cannot verify the account.
+        private bool AccountBusyOnThisInstrument()
+        {
+            try
+            {
+                if (Account == null) return true;   // cannot verify -> do not trade
+
+                // 1) any open position on this instrument (any strategy / manual)?
+                lock (Account.Positions)
+                {
+                    foreach (Position p in Account.Positions)
+                    {
+                        if (p.Instrument == Instrument
+                            && p.MarketPosition != MarketPosition.Flat)
+                        {
+                            DiagLog(string.Format(
+                                "[ACCOUNT BUSY] open position on {0}: {1} qty={2} (another strategy or manual).",
+                                Instrument.FullName, p.MarketPosition, p.Quantity));
+                            return true;
+                        }
+                    }
+                }
+
+                // 2) any live order on this instrument (any strategy / manual)?
+                lock (Account.Orders)
+                {
+                    foreach (Order ord in Account.Orders)
+                    {
+                        if (ord.Instrument == Instrument
+                            && (ord.OrderState == OrderState.Working
+                                || ord.OrderState == OrderState.Accepted
+                                || ord.OrderState == OrderState.Submitted
+                                || ord.OrderState == OrderState.PartFilled))
+                        {
+                            DiagLog(string.Format(
+                                "[ACCOUNT BUSY] live order on {0}: '{1}' state={2} (another strategy or manual).",
+                                Instrument.FullName, ord.Name ?? "", ord.OrderState));
+                            return true;
+                        }
+                    }
+                }
+
+                return false;   // account is clear on this instrument
+            }
+            catch (Exception ex)
+            {
+                DiagLog("[ACCOUNT BUSY] scan error: " + ex.Message
+                    + " -> treating as BUSY (observation only, no order). Fail-safe.");
+                return true;
+            }
+        }
+
+        // =====================================================================
+        // WithinTradingHours (unchanged)
+        // =====================================================================
+        private bool WithinTradingHours()
+        {
+            if (!EnableTradingHours) return true;
+            TimeZoneInfo et;
+            try   { et = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"); }
+            catch { try { et = TimeZoneInfo.FindSystemTimeZoneById("America/New_York"); } catch { return true; } }
+            DateTime nyNow    = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, et);
+            int      curMin   = nyNow.Hour * 60 + nyNow.Minute;
+            int      startMin = TradingStartHour * 60 + TradingStartMinute;
+            int      endMin   = TradingEndHour   * 60 + TradingEndMinute;
+            return curMin >= startMin && curMin <= endMin;
+        }
+
+        // =====================================================================
+        // Shutdown (unchanged)
+        // =====================================================================
+        private void BeginShutdown(string reason)
+        {
+            if (disabledSelf || pendingFlatten) return;
+            pendingReason  = reason;
+            pendingFlatten = true;
+            DiagLog(Name + " shutdown requested: " + reason
+                + " | sliceCount=" + sliceCount + " | realLossesInARow=" + realLossesInARow);
+        }
+
+        private bool HasLiveOrders()
+        {
+            foreach (Order o in Orders)
+            {
+                if (o == null) continue;
+                OrderState s = o.OrderState;
+                if (s == OrderState.Working || s == OrderState.Accepted
+                    || s == OrderState.PartFilled || s == OrderState.Submitted
+                    || s == OrderState.ChangePending || s == OrderState.CancelPending)
+                    return true;
+            }
+            return false;
+        }
+
+        private void ProcessShutdown()
+        {
+            if (inFlatten) return;   // re-entrancy guard: an order submit can call back synchronously
+            inFlatten = true;
+            try
+            {
+                if (entryInFlight && workingEntryOrder != null)
+                {
+                    OrderState os = workingEntryOrder.OrderState;
+                    if (os == OrderState.Working || os == OrderState.Accepted || os == OrderState.Submitted)
+                    {
+                        try { DiagLog("Shutdown: cancelling entry order (state=" + os + ")."); CancelOrder(workingEntryOrder); }
+                        catch (Exception ex) { DiagLog("Shutdown CancelOrder error: " + ex.Message);
+                            entryInFlight = false; awaitingClose = false; workingEntryOrder = null; }
+                    }
+                }
+
+                // Cancel OUR OWN live orders first (never our own LR_Flatten), then close the LIVE
+                // position -- direction AND size fresh each pass (an oversized stop can overfill and
+                // FLIP the position) -- with an EMPTY-signal market exit (not tied to any entry, so
+                // NinjaTrader cannot ignore it). Bounded + throttled: never loops/spams.
+                if (!flattenGaveUp
+                    && (DateTime.UtcNow - lastFlattenUtc).TotalSeconds >= 1.0
+                    && (Position.MarketPosition != MarketPosition.Flat || HasLiveOrders()))
+                {
+                    if (flattenAttempts < MaxFlattenAttempts)
+                    {
+                        foreach (Order o in Orders)
+                        {
+                            if (o == null) continue;
+                            if ((o.Name ?? "") == "LR_Flatten") continue;
+                            OrderState s = o.OrderState;
+                            if (s == OrderState.Working || s == OrderState.Accepted
+                                || s == OrderState.PartFilled || s == OrderState.Submitted
+                                || s == OrderState.ChangePending)
+                            { try { CancelOrder(o); } catch { } }
+                        }
+
+                        if (Position.MarketPosition == MarketPosition.Long)
+                        {
+                            int q = Math.Abs(Position.Quantity);
+                            ExitLong(0, q, "LR_Flatten", "");
+                            DiagLog("[SHUTDOWN] pass " + (flattenAttempts + 1) + "/" + MaxFlattenAttempts + ": closing LONG " + q + ".");
+                        }
+                        else if (Position.MarketPosition == MarketPosition.Short)
+                        {
+                            int q = Math.Abs(Position.Quantity);
+                            ExitShort(0, q, "LR_Flatten", "");
+                            DiagLog("[SHUTDOWN] pass " + (flattenAttempts + 1) + "/" + MaxFlattenAttempts + ": closing SHORT " + q + " (flip).");
+                        }
+                        else
+                        {
+                            DiagLog("[SHUTDOWN] pass " + (flattenAttempts + 1) + "/" + MaxFlattenAttempts + ": flat, canceling leftover order(s).");
+                        }
+                        flattenAttempts++;
+                        lastFlattenUtc = DateTime.UtcNow;
+                    }
+                    else
+                    {
+                        flattenGaveUp = true;
+                        DiagLog("[SHUTDOWN][FLATTEN FAILED] not flat & order-free after " + MaxFlattenAttempts
+                            + " passes -> STOPPING (no more orders). CHECK ACCOUNT AND FLATTEN BY HAND.");
+                    }
+                }
+
+                if (Position.MarketPosition == MarketPosition.Flat && !entryInFlight && !HasLiveOrders())
+                    FinalizeTermination();
+            }
+            finally { inFlatten = false; }
+        }
+
+        // ===== NY CLOCK + MARGIN CUTOFF (fixed-slice; runs on OnEachTick, no 2nd series) =====
+        // Hour params are NEW YORK time, derived from UTC (DST-safe), independent of the
+        // platform/chart timezone and the user's location. The margin cutoff is an EARLY
+        // end-of-day that flattens before the broker's overnight-margin snapshot
+        // (Tradovate/NinjaTrader: 16:45 NY). Flatten-only - it does NOT disable the strategy;
+        // it resumes next session. Turn off via EnableMarginCutoff if well-funded.
+        // OPERATOR NOTE: for an account-wide backstop you CAN also enable NinjaTrader's
+        // Tools > Settings > Trading > Auto Close Position at 1:40 PM Pacific (= 4:40 PM NY),
+        // but that is account-wide, platform-local time, and may disable strategies (a
+        // day-by-day operation). This built-in cutoff is the hands-free default (ON).
+        private TimeZoneInfo EasternZone()
+        {
+            if (_etZone != null) return _etZone;
+            try { _etZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"); }
+            catch { try { _etZone = TimeZoneInfo.FindSystemTimeZoneById("America/New_York"); } catch { _etZone = null; } }
+            return _etZone;
+        }
+        private DateTime EasternNow()
+        {
+            TimeZoneInfo z = EasternZone();
+            if (z == null)
+            {
+                if (!_etWarned) { DiagLog("[CLOCK] WARNING: New York time zone not found; using platform local time - hour params may be wrong."); _etWarned = true; }
+                return DateTime.Now;
+            }
+            return TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, z);
+        }
+        private void UpdateMarginActive()
+        {
+            if (!EnableMarginCutoff) { marginActive = false; marginLogged = false; return; }
+            DateTime t = EasternNow();
+            int nowMin     = t.Hour * 60 + t.Minute;
+            int flattenMin = MarginCutoffHour * 60 + MarginCutoffMinute - MarginCutoffLeadMin;
+            const int blockMinutes = 80;
+            bool active    = (nowMin >= flattenMin && nowMin < flattenMin + blockMinutes);
+            if (active && !marginLogged)
+            {
+                DiagLog(string.Format("[MARGIN CUTOFF] window active (New York now {0:HH:mm}) - flatten @ {1:00}:{2:00} "
+                    + "New York: early EOD, no new entries (before {3:00}:{4:00} New York overnight-margin snapshot).",
+                    t, flattenMin / 60, flattenMin % 60, MarginCutoffHour, MarginCutoffMinute));
+                marginLogged = true;
+            }
+            if (!active) marginLogged = false;
+            marginActive = active;
+        }
+        // Slice-safe flatten that mirrors ProcessShutdown's cancel+exit sequence but HOLDS
+        // flat (resets slice state) instead of terminating - so the strategy resumes next session.
+        private void MarginProcess()
+        {
+            if (entryInFlight && workingEntryOrder != null)
+            {
+                OrderState os = workingEntryOrder.OrderState;
+                if (os == OrderState.Working || os == OrderState.Accepted || os == OrderState.Submitted)
+                {
+                    try { DiagLog("[MARGIN CUTOFF] cancelling working entry (state=" + os + ")."); CancelOrder(workingEntryOrder); }
+                    catch (Exception ex) { DiagLog("[MARGIN CUTOFF] CancelOrder error: " + ex.Message);
+                        entryInFlight = false; awaitingClose = false; workingEntryOrder = null; }
+                }
+                return;
+            }
+            // cancel our own live orders first (never our own LR_MarginFlat), then close the LIVE
+            // position with an EMPTY-signal exit -- both directions, so a flipped position is caught.
+            if (Position.MarketPosition != MarketPosition.Flat)
+            {
+                foreach (Order o in Orders)
+                {
+                    if (o == null) continue;
+                    if ((o.Name ?? "") == "LR_MarginFlat") continue;
+                    OrderState s = o.OrderState;
+                    if (s == OrderState.Working || s == OrderState.Accepted
+                        || s == OrderState.PartFilled || s == OrderState.Submitted
+                        || s == OrderState.ChangePending)
+                    { try { CancelOrder(o); } catch { } }
+                }
+
+                if (Position.MarketPosition == MarketPosition.Long)
+                {
+                    int q = Math.Abs(Position.Quantity);
+                    try { ExitLong(0, q, "LR_MarginFlat", "");
+                        DiagLog("[MARGIN CUTOFF] closing LONG " + q + "."); }
+                    catch (Exception ex) { DiagLog("[MARGIN CUTOFF] ExitLong error: " + ex.Message); }
+                }
+                else
+                {
+                    int q = Math.Abs(Position.Quantity);
+                    try { ExitShort(0, q, "LR_MarginFlat", "");
+                        DiagLog("[MARGIN CUTOFF] closing SHORT " + q + " (flip)."); }
+                    catch (Exception ex) { DiagLog("[MARGIN CUTOFF] ExitShort error: " + ex.Message); }
+                }
+                return;
+            }
+            // flat: clear slice state and hold (blocked) - NO FinalizeTermination
+            inSlice = false; isMoneySlice = false;
+        }
+
+        private void FinalizeTermination()
+        {
+            if (disabledSelf) return;
+            disabledSelf   = true;
+            pendingFlatten = false;
+            DiagLog(Name + " terminated. Reason: " + pendingReason
+                + " | sliceCount=" + sliceCount + " | realLossesInARow=" + realLossesInARow
+                + " | isArmed=" + isArmed + " | waitingForF1Outcome=" + waitingForF1Outcome
+                + " | nextIsMoney=" + nextIsMoney
+                + " | rawString=" + rawString.ToString()
+                + " | filter1Outcome=" + filter1Outcome.ToString()
+                + " | realTradeOutcome=" + realTradeOutcome.ToString());
+            try { SetState(State.Terminated); } catch { }
+        }
+
+        // =====================================================================
+        // Helpers
+        // =====================================================================
+        private string TailOf(StringBuilder sb, int n)
+        {
+            string s = sb.ToString();
+            return s.Length <= n ? s : "..." + s.Substring(s.Length - n);
+        }
+
+        // =====================================================================
+        // WILDCARD PATTERN MATCHING
+        // =====================================================================
+        // Pattern language (matches the Python research tooling exactly):
+        //     '0'  -> literal 0
+        //     '1'  -> literal 1
+        //     '*'  -> one-or-more 0s   (regex 0+)
+        //     '?'  -> one-or-more 1s   (regex 1+)
+        // The pattern is matched against the TAIL (suffix) of the text.
+        // Because '*' / '?' expand IN PLACE, a literal that precedes them stacks:
+        //     "0*"  = 0 then 0+  = "00+" = TWO-or-more 0s
+        //     "1*"  = 1 then 0+  = "10+"
+        //     "10?" = 1,0 then 1+ = "101+"
+        //     "1*?" = 1 then 0+ then 1+ = "10+1+"
+        //
+        // Implementation: small backtracking matcher (no System.Text.RegularExpressions
+        // dependency, and it only ever runs on short tails). The pattern must consume
+        // EXACTLY the end of the text.
+        private static bool PatternHasWildcard(string pattern)
+        {
+            return pattern.IndexOf('*') >= 0 || pattern.IndexOf('?') >= 0;
+        }
+
+        // Returns true if 'pattern' matches a suffix of 'text'.
+        private static bool TailMatches(string text, string pattern)
+        {
+            if (string.IsNullOrEmpty(pattern)) return false;
+            if (text.Length == 0) return false;
+
+            if (!PatternHasWildcard(pattern))
+                return text.Length >= pattern.Length && text.EndsWith(pattern);
+
+            for (int start = text.Length - 1; start >= 0; start--)
+            {
+                if (MatchHere(text, start, pattern, 0))
+                    return true;
+            }
+            return false;
+        }
+
+        // Recursive matcher: does pattern[pi..] match text[ti..] and consume to end?
+        private static bool MatchHere(string text, int ti, string pattern, int pi)
+        {
+            while (pi < pattern.Length)
+            {
+                char pc = pattern[pi];
+
+                if (pc == '*' || pc == '?')
+                {
+                    char want = (pc == '*') ? '0' : '1';   // '*' = 0+, '?' = 1+
+                    if (ti >= text.Length || text[ti] != want) return false;
+                    ti++;
+                    int maxConsume = ti;
+                    while (maxConsume < text.Length && text[maxConsume] == want) maxConsume++;
+                    for (int consume = maxConsume; consume >= ti; consume--)
+                    {
+                        if (MatchHere(text, consume, pattern, pi + 1))
+                            return true;
+                    }
+                    return false;
+                }
+                else
+                {
+                    if (ti >= text.Length || text[ti] != pc) return false;
+                    ti++; pi++;
+                }
+            }
+            return ti == text.Length;
+        }
+
+        // =====================================================================
+        // CountTodaysTrailingLosses — the breaker's streak, for TODAY only
+        // =====================================================================
+        // WHY: realTradeOutcome is CUMULATIVE and never resets, so counting its trailing
+        // zeros would reach BACK ACROSS the trading-day boundary into yesterday's losses.
+        // On RESUME that restores a bogus streak and re-trips the breaker immediately —
+        // bricking the strategy permanently.
+        //
+        // Instead we walk the LOG backwards and count consecutive losing REAL trades that
+        // belong to the CURRENT trading day only. We stop at:
+        //     - a winning real trade (streak broken), or
+        //     - a real trade from a PREVIOUS trading day (new day = clean slate).
+        // Observation rows (FAKE_* / OBS_* / CANCELLED_*) are skipped: they are not real
+        // trades and must never affect the breaker.
+        // =====================================================================
+        // ReadTodaysRealOutcomes — the ONE shared reader of today's real trades
+        // =====================================================================
+        // Returns TODAY's real-trade outcome bits, oldest-first (e.g. "1101").
+        // SINGLE SOURCE OF TRUTH used by BOTH the qty rule (rebuilds
+        // sessionRealOutcome on RESUME) and the breaker (trailing-loss count), so
+        // the two can never disagree. "Real trade" = side is exactly "Long"
+        // (not FAKE_/OBS_/WOULDBE_/CANCELLED_). "Today" = same 3 PM PT trading day.
+        // Returns "" on error / no real trades today (both callers treat as clean).
+        private string ReadTodaysRealOutcomes(string path, int todayKey)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(path) || !File.Exists(path)) return "";
+
+                string[] lines = File.ReadAllLines(path);
+                var rev = new System.Collections.Generic.List<char>();
+
+                for (int i = lines.Length - 1; i >= 0; i--)
+                {
+                    string line = lines[i].Trim();
+                    if (line.Length == 0) continue;
+                    if (line.StartsWith("timestamp")) continue;
+
+                    string[] p = line.Split(',');
+                    if (p.Length < 8) continue;
+
+                    string sideCol = p[2].Trim();
+                    string bitCol  = p[7].Trim();
+
+                    if (sideCol != "Long") continue;          // real trades only
+                    if (bitCol != "0" && bitCol != "1") continue;
+
+                    DateTime ts;
+                    if (!DateTime.TryParse(p[0].Trim(),
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            System.Globalization.DateTimeStyles.None, out ts))
+                        continue;
+
+                    if (TradingDayKeyOfLocal(ts) != todayKey) break;
+
+                    rev.Add(bitCol[0]);
+                }
+
+                rev.Reverse();
+                return new string(rev.ToArray());
+            }
+            catch (Exception ex)
+            {
+                DiagLog("ReadTodaysRealOutcomes error: " + ex.Message + " -> returning \"\" (clean start).");
+                return "";
+            }
+        }
+
+        // Trailing losses in TODAY's real-outcome string (breaker), from the shared reader.
+        private int CountTodaysTrailingLosses(string path, int todayKey)
+        {
+            string today = ReadTodaysRealOutcomes(path, todayKey);
+            int streak = 0;
+            for (int i = today.Length - 1; i >= 0; i--)
+            {
+                if (today[i] == '0') streak++;
+                else break;
+            }
+            return streak;
+        }
+
+        private int CountTrailingLosses(string realOutcome)
+        {
+            int c = 0;
+            for (int i = realOutcome.Length - 1; i >= 0; i--)
+            {
+                if (realOutcome[i] == '0') c++;
+                else break;
+            }
+            return c;
+        }
+
+        // ── file naming / discovery ────────────────────────────────────────────
+        private string BuildNewLogFilePath()
+        {
+            string stamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+            string fname = LogBaseName + "_" + stamp + ".csv";
+            return Path.Combine(LogFolder, fname);
+        }
+
+        // Find the most-recent existing log file matching the base name pattern.
+        private string FindMostRecentLogFile()
+        {
+            try
+            {
+                if (!Directory.Exists(LogFolder)) return null;
+                string pattern = LogBaseName + "_*.csv";
+                var files = Directory.GetFiles(LogFolder, pattern);
+                if (files == null || files.Length == 0) return null;
+                // EXCLUDE diag-log files (they end in "-diagLog.csv"). The diag log
+                // is written on every startup/slice so its LastWriteTime is newer than
+                // the data file, and it has no data rows — picking it would make the
+                // reader see "unreadable/empty" and wrongly FRESH-start.
+                var dataFiles = files
+                    .Where(p => !Path.GetFileNameWithoutExtension(p)
+                                     .EndsWith("-diagLog", StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+                if (dataFiles.Length == 0) return null;
+                // newest by last write time
+                return dataFiles.OrderByDescending(p => File.GetLastWriteTime(p)).First();
+            }
+            catch (Exception ex)
+            {
+                DiagLog("FindMostRecentLogFile error: " + ex.Message);
+                return null;
+            }
+        }
+
+        // ── snapshot read (last valid data row's cumulative columns) ───────────
+        private class PipelineSnapshot
+        {
+            public bool valid;
+            public DateTime lastBitLocal;
+            public string rawString = "";
+            public string filter1Outcome = "";
+            public string realTradeOutcome = "";
+        }
+
+        // Log row format (EnsureLogHeader):
+        // timestamp,slice_num,side,quantity,entry_price,exit_price,realized_pnl,
+        //   win_loss_bit,rawString,filter1Outcome,realTradeOutcome
+        private PipelineSnapshot ReadLastSnapshot(string path)
+        {
+            try
+            {
+                var snap = new PipelineSnapshot { valid = false };
+                string[] lines = File.ReadAllLines(path);
+                for (int i = lines.Length - 1; i >= 0; i--)
+                {
+                    string line = lines[i].Trim();
+                    if (line.Length == 0) continue;
+                    if (line.StartsWith("timestamp")) continue;   // header
+                    string[] p = line.Split(',');
+                    if (p.Length < 11) continue;                  // not a full data row
+                    // skip CANCELLED rows (bit column == '-') for the strings,
+                    // but they still carry cumulative strings, so we can use them;
+                    // however the cleanest is the last row that has the strings.
+                    string ts   = p[0].Trim();
+                    string raw  = p[8].Trim();
+                    string f1   = p[9].Trim();
+                    string real = p[10].Trim();
+
+                    DateTime tparsed;
+                    if (!DateTime.TryParse(ts,
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            System.Globalization.DateTimeStyles.None,
+                            out tparsed)) continue;   // BUG FIX: we WRITE with InvariantCulture
+
+                    snap.lastBitLocal     = tparsed;
+                    snap.rawString        = raw;
+                    snap.filter1Outcome   = f1;
+                    snap.realTradeOutcome = real;
+                    snap.valid            = raw.Length > 0;   // need at least some rawString
+                    return snap;
+                }
+                return snap; // valid stays false
+            }
+            catch (Exception ex)
+            {
+                DiagLog("ReadLastSnapshot error: " + ex.Message);
+                return null;
+            }
+        }
+
+        // =====================================================================
+        // Logging
+        // =====================================================================
+        private void EnsureLogHeader(string path)
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+                // Only write header if the file does NOT already exist
+                // (so a RESUME never overwrites; FRESH always makes a new name).
+                if (!File.Exists(path))
+                {
+                    File.WriteAllText(path,
+                        "timestamp(machine_local_time),slice_num,side,quantity,entry_price,exit_price,realized_pnl,win_loss_bit,rawString,filter1Outcome,realTradeOutcome\n");
+                }
+            }
+            catch (Exception ex) { Print("Log header error: " + ex.Message); }
+        }
+
+        // =====================================================================
+        // SafeAppend — concurrency-tolerant file append
+        // =====================================================================
+        // BUG FIX: File.AppendAllText opens the file WITHOUT sharing, so if two
+        // instances of this strategy are alive at once (which HAPPENS during
+        // NinjaTrader's auto-restart churn on a lost price connection), the second
+        // writer throws IOException and the old code SILENTLY LOST the row while the
+        // bit had already been appended to the in-memory rawString. Log and memory
+        // then diverge and the next RESUME restores a WRONG pipeline state.
+        private bool logWriteFailed = false;
+
+        private void SafeAppend(string path, string text)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                DiagLog("[LOG ERROR] no active log file path — row DROPPED: " + text.TrimEnd());
+                logWriteFailed = true;
+                return;
+            }
+
+            const int MAX_TRIES = 5;
+            for (int attempt = 1; attempt <= MAX_TRIES; attempt++)
+            {
+                try
+                {
+                    using (var fs = new FileStream(path, FileMode.Append, FileAccess.Write,
+                                                   FileShare.ReadWrite))
+                    using (var sw = new StreamWriter(fs))
+                    {
+                        sw.Write(text);
+                    }
+                    return;
+                }
+                catch (IOException)
+                {
+                    if (attempt == MAX_TRIES) break;
+                    System.Threading.Thread.Sleep(20 * attempt);
+                }
+                catch (Exception ex)
+                {
+                    DiagLog("[LOG ERROR] append failed: " + ex.Message + " — row DROPPED: " + text.TrimEnd());
+                    logWriteFailed = true;
+                    return;
+                }
+            }
+
+            DiagLog("[LOG ERROR] append failed after " + MAX_TRIES
+                + " tries (file locked by another instance?) — row DROPPED: " + text.TrimEnd());
+            logWriteFailed = true;
+        }
+
+        private void WriteLogRow(double entryPrice, double exitPrice, double pnl, int bit, int qty, DateTime exitTime)
+        {
+            try
+            {
+                // BUG FIX (timestamp consistency): ALL rows now use DateTime.Now — the
+                // SAME clock DecideGap() compares against on RESUME. The old code wrote
+                // the execution 'time' here but DateTime.Now in fake/cancelled rows; if
+                // those clocks differ, the RESUME gap is wrong by that offset and can
+                // exceed GapCeilingHours -> SPURIOUS FRESH START that WIPES rawString.
+                string row = string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6:0.00},{7},{8},{9},{10}\n",
+                    DateTime.Now, sliceCount, "Long", qty, entryPrice, exitPrice, pnl, bit,
+                    rawString.ToString(), filter1Outcome.ToString(), realTradeOutcome.ToString());
+                SafeAppend(activeLogFilePath, row);
+            }
+            catch (Exception ex) { DiagLog("[LOG ERROR] WriteLogRow: " + ex.Message); logWriteFailed = true; }
+        }
+
+        private void WriteLogRowFake(double entryPrice, double exitPrice, double pnl, int bit)
+        {
+            try
+            {
+                string row = string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6:0.00},{7},{8},{9},{10}\n",
+                    DateTime.Now, sliceCount,
+                    (suppressReason ?? "FAKE_Long"),   // distinguishes suppressed trades
+                    0, entryPrice, exitPrice, pnl, bit,
+                    rawString.ToString(), filter1Outcome.ToString(), realTradeOutcome.ToString());
+                SafeAppend(activeLogFilePath, row);
+            }
+            catch (Exception ex) { DiagLog("[LOG ERROR] WriteLogRowFake: " + ex.Message); logWriteFailed = true; }
+        }
+
+        private void WriteLogRowCancelled(double entryPrice)
+        {
+            try
+            {
+                string row = string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10}\n",
+                    DateTime.Now, sliceCount, "CANCELLED_no_fill", 0, entryPrice, 0, 0, "-",
+                    rawString.ToString(), filter1Outcome.ToString(), realTradeOutcome.ToString());
+                SafeAppend(activeLogFilePath, row);
+            }
+            catch (Exception ex) { DiagLog("[LOG ERROR] WriteLogRowCancelled: " + ex.Message); logWriteFailed = true; }
+        }
+
+        private void DiagLog(string msg)
+        {
+            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + msg;
+            Print(line);
+            try
+            {
+                string dir = Path.GetDirectoryName(activeLogFilePath ?? "");
+                if (string.IsNullOrEmpty(dir)) dir = LogFolder;
+                if (string.IsNullOrEmpty(dir)) dir = @"C:\temp";
+                string baseName = Path.GetFileNameWithoutExtension(activeLogFilePath ?? (LogBaseName + ".csv"));
+                string diagPath = Path.Combine(dir, baseName + "-diagLog.csv");
+
+                // Concurrency-safe. NOTE: do NOT call SafeAppend here — it calls
+                // DiagLog on failure, which would recurse forever.
+                for (int attempt = 1; attempt <= 3; attempt++)
+                {
+                    try
+                    {
+                        using (var fs = new FileStream(diagPath, FileMode.Append, FileAccess.Write,
+                                                       FileShare.ReadWrite))
+                        using (var sw = new StreamWriter(fs))
+                        {
+                            sw.Write(line + "\n");
+                        }
+                        break;
+                    }
+                    catch (IOException)
+                    {
+                        if (attempt == 3) break;
+                        System.Threading.Thread.Sleep(10 * attempt);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        // =====================================================================
+        // Properties
+        // =====================================================================
+        #region Properties
+
+        // ---- REQUIRED SETUP REMINDERS (read-only) -----------------------------
+        [Display(Name = "Template: CME US Index Futures ETH",
+            Description = "REQUIRED. Set the data series Trading Hours template (e.g. "
+                        + "'CME US Index Futures ETH') so the strategy can measure market-open "
+                        + "minutes correctly and cross the maintenance break. Search the template "
+                        + "name in NinjaTrader to see the session times.",
+            Order = 1, GroupName = "0. REQUIRED SETUP — read me")]
+        [ReadOnly(true)]
+        public string TemplateReminder { get { return "Set data series Trading Hours = CME US Index Futures ETH"; } set { } }
+
+        [Display(Name = "Enable EOD break on data series",
+            Description = "Keep IsExitOnSessionCloseStrategy ON (default). At the session close NT "
+                        + "flattens any open position. We CANNOT know that fill's outcome, so it is "
+                        + "recorded as a LOSS (conservative) in both rawString and realTradeOutcome.",
+            Order = 2, GroupName = "0. REQUIRED SETUP — read me")]
+        [ReadOnly(true)]
+        public string EodReminder { get { return "EOD flatten ON; flattened trade recorded as loss"; } set { } }
+
+        [Display(Name = "Tab shows 'enabled' even after a silent FRESH start — CHECK THE LOG",
+            Description = "After a big gap the strategy WIPES its pipeline and warms up again, but the "
+                        + "Strategies tab still shows 'enabled'. The tab CANNOT tell you fresh vs resume. "
+                        + "Read the log: a [FRESH START] or [RESUME] line is written at every startup.",
+            Order = 3, GroupName = "0. REQUIRED SETUP — read me")]
+        [ReadOnly(true)]
+        public string GapReminder { get { return "Big gap = silent fresh start; verify via log, not the tab"; } set { } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Trading Hours filter", Order = 1, GroupName = "1. Hours")]
+        public bool EnableTradingHours { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 23)]
+        [Display(Name = "Start hour (NY/Eastern, 24h)", Order = 2, GroupName = "1. Hours")]
+        public int TradingStartHour { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 59)]
+        [Display(Name = "Start minute (NY/Eastern)", Order = 3, GroupName = "1. Hours")]
+        public int TradingStartMinute { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 23)]
+        [Display(Name = "End hour (NY/Eastern, 24h)", Order = 4, GroupName = "1. Hours")]
+        public int TradingEndHour { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 59)]
+        [Display(Name = "End minute (NY/Eastern)", Order = 5, GroupName = "1. Hours")]
+        public int TradingEndMinute { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, int.MaxValue)]
+        [Display(Name = "Strategy life (minutes)", Order = 1, GroupName = "2. Timing")]
+        public int StrategyLifeMinutes { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 3600)]
+        [Display(Name = "Check interval (seconds)", Order = 2, GroupName = "2. Timing")]
+        public int CheckIntervalSeconds { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, int.MaxValue)]
+        [Display(Name = "Gap tolerance (market-open minutes)", Order = 3, GroupName = "2. Timing",
+            Description = "If MORE than this many MARKET-OPEN minutes were missed since the last "
+                        + "recorded bit, the pipeline is wiped (fresh start). The ~1h maintenance "
+                        + "break has 0 open-minutes so it is always crossed. Default 5.")]
+        public int GapToleranceMinutes { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 48)]
+        [Display(Name = "Gap ceiling (wall-clock hours)", Order = 4, GroupName = "2. Timing",
+            Description = "Absolute safety ceiling. If the wall-clock gap exceeds this many hours, "
+                        + "fresh start regardless of open-minutes. Default 4.")]
+        public int GapCeilingHours { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Use market entry (else limit)", Order = 1, GroupName = "3. Entry")]
+        public bool UseMarketEntry { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, double.MaxValue)]
+        [Display(Name = "Limit offset (points)", Order = 2, GroupName = "3. Entry")]
+        public double LimitOffsetPoints { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.0, double.MaxValue)]
+        [Display(Name = "Stop loss (points)", Order = 1, GroupName = "4. Bracket")]
+        public double StopLossPoints { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.0, double.MaxValue)]
+        [Display(Name = "Profit target (points)", Order = 2, GroupName = "4. Bracket")]
+        public double ProfitTargetPoints { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Trailing Stop", Order = 3, GroupName = "4. Bracket")]
+        public bool EnableTrailingStop { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.01, double.MaxValue)]
+        [Display(Name = "Trail distance (points)", Order = 4, GroupName = "4. Bracket")]
+        public double TrailDistancePoints { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Real Order", Order = 1, GroupName = "5. Filter & Real Order",
+            Description = "FALSE = observation only. TRUE = real order fires when armed and F1 matches.")]
+        public bool EnableRealOrder { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Filter 1 Pattern", Order = 2, GroupName = "5. Filter & Real Order",
+            Description = "Tail pattern on rawString. Match -> next digit feeds filter1Outcome. "
+                        + "Wildcards: '*'=one-or-more 0s, '?'=one-or-more 1s, '0'/'1'=literal. "
+                        + "They expand in place, so '0*'='00+' (two+ zeros), '10?'='101+', '1*?'='10+1+'. "
+                        + "Researched LONG default: 10?")]
+        public string Filter1Pattern { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Filter 2 Pattern", Order = 3, GroupName = "5. Filter & Real Order",
+            Description = "Tail pattern on filter1Outcome. Match -> isArmed=true. "
+                        + "Same wildcards as Filter 1 ('*'=0+, '?'=1+, expand in place). "
+                        + "Researched LONG default: 110")]
+        public string Filter2Pattern { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, int.MaxValue)]
+        [Display(Name = "Base quantity (fixed)", Order = 1, GroupName = "6. Quantity")]
+        public int BaseQuantity { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Qty Increment ({'0':2} per-day rule)",
+            Order = 2, GroupName = "6. Quantity",
+            Description = "FALSE = always BaseQuantity. TRUE = researched per-day loss-run rule "
+                        + "(see QtyMultiplierTable in source): after a win, losses 1-3 => x2; "
+                        + "losses 4-6 => SKIP (no trade). Resets every NY trading day. "
+                        + "REVIEW the table whenever MaxRealLossInARow changes.")]
+        public bool EnableQtyIncrement { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Qty rule  ***DANGER: TRIPLE-CHECK FORMAT***", Order = 3, GroupName = "6. Quantity",
+            Description = "DANGER: TRIPLE-CHECK THE FORMAT. A mistyped comma or colon can DROP or "
+                        + "shrink a rule (it can never INFLATE: any multiplier over 20 is refused, "
+                        + "and each (\"pat\":qty) group is read on its own). Verify via the [QTY RULE] "
+                        + "ACTIVE line in the diag log. "
+                        + "Applied only when Enable Qty Increment is ON. Loss-ratchet on the "
+                        + "REAL trade-outcome string (1=win,0=loss). Format pattern:qty pairs, e.g. "
+                        + "(\"10\":2),(\"100\":2),(\"10000\":0) . qty 0 = SKIP. Longest tail wins; "
+                        + "parens / quotes / spaces / trailing comma optional.")]
+        public string QtyRuleText { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, int.MaxValue)]
+        [Display(Name = "Max Total Slice Count", Order = 1, GroupName = "7. Limits",
+            Description = "Stop after this many total slices (fake + real).")]
+        public int MaxTotalSliceCount { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, int.MaxValue)]
+        [Display(Name = "Max Real Loss In A Row", Order = 2, GroupName = "7. Limits",
+            Description = "Stop after this many consecutive real losses. Default 3. Survives reconnect (restored on resume).")]
+        public int MaxRealLossInARow { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable trade-outcome exit", Order = 3, GroupName = "7. Limits")]
+        public bool EnableTradeOutcomeExit { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trade-outcome exit pattern (halt session)", Order = 4, GroupName = "7. Limits",
+            Description = "When enabled, HALT the session (manual re-enable) once the REAL "
+                        + "trade-outcome tail (1=win,0=loss) ends with this PLAIN pattern (no "
+                        + "wildcard). Slice default '1111111' + disabled = effectively inert.")]
+        public string TradeOutcomeExitPattern { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Log Folder", Order = 1, GroupName = "8. Logging",
+            Description = "Folder for log files. A timestamp is appended per pipeline session: "
+                        + "<base>_<YYYY-MM-DD_HH-mm-ss>.csv. A FRESH start makes a new file; a "
+                        + "RESUME continues the most recent file.")]
+        public string LogFolder { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Log Base Name", Order = 2, GroupName = "8. Logging",
+            Description = "Base file name (no extension / no date). The session timestamp and .csv are appended.")]
+        public string LogBaseName { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable margin cutoff (early EOD before overnight-margin)", Order = 1, GroupName = "9. Margin")]
+        public bool EnableMarginCutoff { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 23)]
+        [Display(Name = "Broker margin cutoff Hour (New York time)", Order = 2, GroupName = "9. Margin")]
+        public int MarginCutoffHour { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 59)]
+        [Display(Name = "Broker margin cutoff Minute (New York)", Order = 3, GroupName = "9. Margin")]
+        public int MarginCutoffMinute { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 120)]
+        [Display(Name = "Flatten lead minutes (before cutoff)", Order = 4, GroupName = "9. Margin")]
+        public int MarginCutoffLeadMin { get; set; }
+
+        #endregion
+    }
+}
