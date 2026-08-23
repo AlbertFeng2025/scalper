@@ -13,7 +13,7 @@ using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.Strategies;
 #endregion
 
-// scalper_SHORTrepeat_Layer3  v3  (reconnect-survival + file-per-session + EOD)
+// scalper_LONGrepeat_Layer3  v3  (reconnect-survival + file-per-session + EOD)
 //
 // ============================================================================
 // WHAT CHANGED IN v3  (vs v2) — SAME design as Layer2 v4
@@ -1206,6 +1206,29 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 return;
             }
+
+
+            // =====================================================================
+            // ORPHAN / NAKED GUARD (reject-event based). A protective order (stop/target) that is
+            // REJECTED -- e.g. "stop can't be placed, price already past it" after entry slippage --
+            // leaves the position UNPROTECTED (naked). Flatten at market now. (A modify failure is a
+            // DIFFERENT event: ErrorCode.UnableToChangeOrder with the order still Working -- the stop
+            // stays live and protecting, so we do NOT treat that as naked; it falls through to the
+            // ORDER WARN log below.) Uses the same name test as the fill scorer (Stop / Profit).
+            bool isProtective = oName.IndexOf("Stop",   StringComparison.OrdinalIgnoreCase) >= 0
+                             || oName.IndexOf("Profit", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (orderState == OrderState.Rejected && isProtective
+                && Position.MarketPosition != MarketPosition.Flat)
+            {
+                DiagLog(string.Format("[ORPHAN GUARD] protective order '{0}' REJECTED ({1}) -> position "
+                    + "unprotected, flattening at market now.", oName, error));
+                BeginShutdown("protective order rejected (orphan guard)");
+                return;
+            }
+
+            // While shutting down, re-drive the flatten/terminate on every order-state change
+            // (e.g. a cancel just confirmed) so we finish once flat AND order-free.
+            if (pendingFlatten) ProcessShutdown();
 
             if (error != ErrorCode.NoError || orderState == OrderState.Rejected)
                 DiagLog(string.Format("ORDER WARN: {0} state={1} err={2} native={3}",
