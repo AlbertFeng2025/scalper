@@ -58,7 +58,7 @@ using NinjaTrader.NinjaScript.Strategies;
 //   3. filter1Outcome tail matches Filter2 -> next f1-digit feeds filter2Outcome
 //   4. filter2Outcome tail matches Filter3 -> isArmed
 //   5. isArmed AND waitingForF2Outcome AND waitingForF1Outcome -> next slice money
-//   TARGET = 1 = price UP (LONG).
+//   TARGET = 1 = price DOWN (SHORT).
 // ============================================================================
 
 namespace NinjaTrader.NinjaScript.Strategies
@@ -109,7 +109,7 @@ namespace NinjaTrader.NinjaScript.Strategies
     //
     // #####################################################################
 
-    public class scalper_LONGrepeat_Layer3 : Strategy
+    public class scalper_SHORTrepeat_Layer3 : Strategy
     {
         // ── strategy lifecycle ────────────────────────────────────────────────
         private DateTime strategyStartUtc;
@@ -157,16 +157,29 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string activeLogFilePath = null;
 
         // ── qty multiplier table ──────────────────────────────────────────────
-        // LONGEST-MATCHING pattern wins (order-independent; see CalcQty). Matched
-        // against the tail of the PER-DAY session real outcome (sessionRealOutcome),
-        // so the qty rule resets every trading day. NO wildcards here.
-        //   Every pattern starts with '1' (a WIN) — bug-guard: losses-from-open
-        //   (e.g. "0000..." from a bug) match nothing -> stay at base qty, never
-        //   double into a disaster. Hard stop = MaxRealLossInARow.
-        //   "10","100","1000" -> x2 ; "10000","100000","1000000" -> 0 (SKIP trade).
+        // LONGEST-MATCHING pattern wins (order-independent; see CalcQty). Patterns
+        // are matched against the tail of the PER-DAY session real outcome string
+        // (sessionRealOutcome), so the qty rule resets every trading day.
+        // NO wildcards here — literal 0/1 only.
+        //
+        // DESIGN (researched {'0':2} extended into a layered loss-run rule):
+        //   Every pattern starts with '1' (a WIN) on purpose — this is a bug-guard.
+        //   Sizing only kicks in on a loss run that FOLLOWED a win in the session.
+        //   If the day opens with losses (e.g. "0000..." from a data/logic bug),
+        //   NONE of these match, so those trades stay at BASE qty (x1) and never
+        //   double into a disaster. The hard stop is MaxRealLossInARow.
+        //
+        //   "10","100","1000"        -> x2  (win then 1-3 losses)
+        //   "10000","100000","1000000" -> 0 (win then 4-6 losses: SKIP the trade)
+        //
         //   qty 0 == DO NOT place a real order (observe only). See CalcQty caller.
-        // *** COUPLING WARNING: review table when MaxRealLossInARow changes.
-        //   L3 filter params are NOT researched yet; table carried over from L2. ***
+        //
+        // *** COUPLING WARNING ***
+        //   Review this table whenever MaxRealLossInARow changes. The x0 "skip"
+        //   lines only cover loss-runs up to their length; a run LONGER than the
+        //   longest pattern reverts to base qty. NOTE: Layer 3 filter params are
+        //   NOT researched yet — this qty table is carried over from Layer 2 for
+        //   consistency; revisit once L3 is tested.
         // NOTE: default below is overwritten at startup by ParseQtyRule() from the
         // UI-editable QtyRuleText parameter (no recompile needed to change it).
         private (string pattern, int multiplier)[] qtyTable =
@@ -204,16 +217,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool     inFlatten        = false;              // re-entrancy guard
         private const int MaxFlattenAttempts = 8;               // hard cap so we can NEVER spam orders
 
-        private const string ENTRY_SIGNAL = "LR_Entry";
+        private const string ENTRY_SIGNAL = "SR_Entry";
 
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
             {
-                Description = "LONG scalper v3 Layer3. Reconnect-survival: reloads its own log "
+                Description = "SHORT scalper v3 Layer3. Reconnect-survival: reloads its own log "
                             + "and RESUMES the 3-layer pipeline across reconnect / maintenance break, "
                             + "or FRESH-starts a new file when the gap is too big. Target=1=price UP.";
-                Name        = "scalper_LONGrepeat_Layer3";
+                Name        = "scalper_SHORTrepeat_Layer3";
 
                 Calculate                    = Calculate.OnEachTick;
                 EntriesPerDirection          = 1;
@@ -247,9 +260,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 EnableTrailingStop   = false;
                 TrailDistancePoints  = 10;
                 EnableRealOrder      = false;
-                Filter1Pattern       = "011";
+                Filter1Pattern       = "01";
                 Filter2Pattern       = "01";
-                Filter3Pattern       = "01";
+                Filter3Pattern       = "001";
                 BaseQuantity         = 1;
                 EnableQtyIncrement   = false;
                 QtyRuleText          = "(\"10\":2),(\"100\":2),(\"1000\":2),(\"10000\":0),(\"100000\":0),(\"1000000\":0)";
@@ -259,7 +272,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MaxRealLossInARow    = 3;
 
                 LogFolder            = @"C:\temp";
-                LogBaseName          = "scalper_LONGrepeat_Layer3";
+                LogBaseName          = "scalper_SHORTrepeat_Layer3";
 
                 GapToleranceMinutes  = 7;
                 GapCeilingHours      = 4;
@@ -496,7 +509,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                   + "slice_num restarts at 1 on every strategy instance. "
                   + "This string will NOT match the standalone recorder bit-for-bit "
                   + "(independent slicers / throttle phase) — that is expected.");
-            DiagLog(Name + " ready (LONG). EnableRealOrder=" + EnableRealOrder
+            DiagLog(Name + " ready (SHORT). EnableRealOrder=" + EnableRealOrder
                 + ", Filter1=[" + Filter1Pattern + "], Filter2=[" + Filter2Pattern + "], Filter3=[" + Filter3Pattern + "]"
                 + ", MaxRealLossInARow=" + MaxRealLossInARow
                 + ", Stop=" + StopLossPoints + "pt, Target=" + ProfitTargetPoints + "pt"
@@ -600,7 +613,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // CalcQty (unchanged)
+        // CalcQty — researched layered per-day loss-run rule (see QtyMultiplierTable)
+        // Returns the real order quantity, or 0 meaning "SKIP the trade" (caller
+        // must NOT place a real order when this returns 0). LONGEST match wins.
         // =====================================================================
         // Parse QtyRuleText into qtyTable. Lenient: strips ( ) " then scans for every
         // "<pattern>:<qty>" pair (pattern = run of 0/1, qty >= 0) and ignores the rest.
@@ -793,6 +808,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // Append a real outcome bit to the per-day session string, rolling to a
+        // fresh session string when the NY day changes.
         private void RecordSessionOutcome(int bit)
         {
             int key = CurrentTradingDayKey();   // same 3PM-PT boundary as the pipeline
@@ -816,15 +833,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             nextIsMoney = false;
 
             sliceCount++;
-            double refPrice = GetCurrentBid();
+            double refPrice = GetCurrentAsk();
             if (refPrice <= 0) { sliceCount--; return; }
 
             if (!UseMarketEntry)
-                refPrice = Instrument.MasterInstrument.RoundToTickSize(refPrice - LimitOffsetPoints);
+                refPrice = Instrument.MasterInstrument.RoundToTickSize(refPrice + LimitOffsetPoints);
 
             sliceEntryPrice  = refPrice;
-            sliceStopPrice   = Instrument.MasterInstrument.RoundToTickSize(sliceEntryPrice - StopLossPoints);
-            sliceTargetPrice = Instrument.MasterInstrument.RoundToTickSize(sliceEntryPrice + ProfitTargetPoints);
+            sliceStopPrice   = Instrument.MasterInstrument.RoundToTickSize(sliceEntryPrice + StopLossPoints);   // ABOVE entry
+            sliceTargetPrice = Instrument.MasterInstrument.RoundToTickSize(sliceEntryPrice - ProfitTargetPoints); // BELOW entry
             inSlice          = true;
             isMoneySlice     = startMoney && EnableRealOrder;
             suppressReason   = null;   // reset; set by the guards below if demoted
@@ -904,7 +921,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (UseMarketEntry)
                     {
-                        workingEntryOrder = EnterLong(currentQty, ENTRY_SIGNAL);
+                        workingEntryOrder = EnterShort(currentQty, ENTRY_SIGNAL);
                         DiagLog(string.Format(
                             "MONEY SLICE #{0} MARKET qty={1} entry~{2:F2} stop={3:F2} target={4:F2} | raw={5} | f1={6} | f2={7} | real={8}",
                             sliceCount, currentQty, sliceEntryPrice, sliceStopPrice, sliceTargetPrice,
@@ -913,8 +930,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     else
                     {
                         double limitPx = Instrument.MasterInstrument.RoundToTickSize(
-                            GetCurrentBid() - LimitOffsetPoints);
-                        workingEntryOrder = EnterLongLimit(0, true, currentQty, limitPx, ENTRY_SIGNAL);
+                            GetCurrentAsk() + LimitOffsetPoints);
+                        workingEntryOrder = EnterShortLimit(0, true, currentQty, limitPx, ENTRY_SIGNAL);
                         DiagLog(string.Format(
                             "MONEY SLICE #{0} LIMIT qty={1} limit={2:F2} | raw={3} | f1={4} | f2={5} | real={6}",
                             sliceCount, currentQty, limitPx,
@@ -950,8 +967,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double ask = GetCurrentAsk();
                 if (bid <= 0 || ask <= 0) return;
 
-                bool stopHit   = bid <= sliceStopPrice;
-                bool targetHit = ask >= sliceTargetPrice;
+                bool stopHit   = ask >= sliceStopPrice;
+                bool targetHit = bid <= sliceTargetPrice;
                 if (!stopHit && !targetHit) return;
 
                 int    bit       = stopHit ? 0 : 1;
@@ -983,10 +1000,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                         return;
                     }
 
-                    if (Position.MarketPosition == MarketPosition.Long)
+                    if (Position.MarketPosition == MarketPosition.Short)
                     {
                         DiagLog(string.Format("[BRICK CLEANUP Case2] Slice #{0} position still open. Force close. bit={1}", sliceCount, bit));
-                        try { ExitLong(Math.Abs(Position.Quantity), "LR_ForceClose", ENTRY_SIGNAL); }
+                        try { ExitShort(Math.Abs(Position.Quantity), "SR_ForceClose", ENTRY_SIGNAL); }
                         catch (Exception ex) { DiagLog("ForceClose error: " + ex.Message); }
                         awaitingClose = false; entryInFlight = false; workingEntryOrder = null;
                         // MONEY: bracket did NOT fill, force-closed -> conservative LOSS (0).
@@ -1120,9 +1137,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                              || oName.IndexOf("Target", StringComparison.OrdinalIgnoreCase) >= 0;
 
             // ── EOD / forced flatten detection ────────────────────────────────
-            bool isOurForceClose = oName.IndexOf("LR_ForceClose",  StringComparison.OrdinalIgnoreCase) >= 0
-                                 || oName.IndexOf("LR_Flatten",    StringComparison.OrdinalIgnoreCase) >= 0
-                                 || oName.IndexOf("LR_MarginFlat", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool isOurForceClose = oName.IndexOf("SR_ForceClose",  StringComparison.OrdinalIgnoreCase) >= 0
+                                 || oName.IndexOf("SR_Flatten",    StringComparison.OrdinalIgnoreCase) >= 0
+                                 || oName.IndexOf("SR_MarginFlat", StringComparison.OrdinalIgnoreCase) >= 0;
             bool isExitFill = !(oName == ENTRY_SIGNAL);
 
             // MONEY (broker side): MAJORITY-QUANTITY. Stop -> loss, Target -> win, our flatten -> no
@@ -1189,6 +1206,29 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 return;
             }
+
+
+            // =====================================================================
+            // ORPHAN / NAKED GUARD (reject-event based). A protective order (stop/target) that is
+            // REJECTED -- e.g. "stop can't be placed, price already past it" after entry slippage --
+            // leaves the position UNPROTECTED (naked). Flatten at market now. (A modify failure is a
+            // DIFFERENT event: ErrorCode.UnableToChangeOrder with the order still Working -- the stop
+            // stays live and protecting, so we do NOT treat that as naked; it falls through to the
+            // ORDER WARN log below.) Uses the same name test as the fill scorer (Stop / Profit).
+            bool isProtective = oName.IndexOf("Stop",   StringComparison.OrdinalIgnoreCase) >= 0
+                             || oName.IndexOf("Profit", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (orderState == OrderState.Rejected && isProtective
+                && Position.MarketPosition != MarketPosition.Flat)
+            {
+                DiagLog(string.Format("[ORPHAN GUARD] protective order '{0}' REJECTED ({1}) -> position "
+                    + "unprotected, flattening at market now.", oName, error));
+                BeginShutdown("protective order rejected (orphan guard)");
+                return;
+            }
+
+            // While shutting down, re-drive the flatten/terminate on every order-state change
+            // (e.g. a cancel just confirmed) so we finish once flat AND order-free.
+            if (pendingFlatten) ProcessShutdown();
 
             if (error != ErrorCode.NoError || orderState == OrderState.Rejected)
                 DiagLog(string.Format("ORDER WARN: {0} state={1} err={2} native={3}",
@@ -1361,7 +1401,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                 }
 
-                // Cancel OUR OWN live orders first (never our own LR_Flatten), then close the LIVE
+                // Cancel OUR OWN live orders first (never our own SR_Flatten), then close the LIVE
                 // position -- direction AND size fresh each pass (flip-aware) -- with an EMPTY-signal
                 // market exit. Bounded + throttled: never loops/spams.
                 if (!flattenGaveUp
@@ -1373,7 +1413,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         foreach (Order o in Orders)
                         {
                             if (o == null) continue;
-                            if ((o.Name ?? "") == "LR_Flatten") continue;
+                            if ((o.Name ?? "") == "SR_Flatten") continue;
                             OrderState s = o.OrderState;
                             if (s == OrderState.Working || s == OrderState.Accepted
                                 || s == OrderState.PartFilled || s == OrderState.Submitted
@@ -1381,17 +1421,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                             { try { CancelOrder(o); } catch { } }
                         }
 
-                        if (Position.MarketPosition == MarketPosition.Long)
+                        if (Position.MarketPosition == MarketPosition.Short)
                         {
                             int q = Math.Abs(Position.Quantity);
-                            ExitLong(0, q, "LR_Flatten", "");
-                            DiagLog("[SHUTDOWN] pass " + (flattenAttempts + 1) + "/" + MaxFlattenAttempts + ": closing LONG " + q + ".");
+                            ExitShort(0, q, "SR_Flatten", "");
+                            DiagLog("[SHUTDOWN] pass " + (flattenAttempts + 1) + "/" + MaxFlattenAttempts + ": closing SHORT " + q + ".");
                         }
-                        else if (Position.MarketPosition == MarketPosition.Short)
+                        else if (Position.MarketPosition == MarketPosition.Long)
                         {
                             int q = Math.Abs(Position.Quantity);
-                            ExitShort(0, q, "LR_Flatten", "");
-                            DiagLog("[SHUTDOWN] pass " + (flattenAttempts + 1) + "/" + MaxFlattenAttempts + ": closing SHORT " + q + " (flip).");
+                            ExitLong(0, q, "SR_Flatten", "");
+                            DiagLog("[SHUTDOWN] pass " + (flattenAttempts + 1) + "/" + MaxFlattenAttempts + ": closing LONG " + q + " (flip).");
                         }
                         else
                         {
@@ -1479,7 +1519,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 foreach (Order o in Orders)
                 {
                     if (o == null) continue;
-                    if ((o.Name ?? "") == "LR_MarginFlat") continue;
+                    if ((o.Name ?? "") == "SR_MarginFlat") continue;
                     OrderState s = o.OrderState;
                     if (s == OrderState.Working || s == OrderState.Accepted
                         || s == OrderState.PartFilled || s == OrderState.Submitted
@@ -1487,19 +1527,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                     { try { CancelOrder(o); } catch { } }
                 }
 
-                if (Position.MarketPosition == MarketPosition.Long)
+                if (Position.MarketPosition == MarketPosition.Short)
                 {
                     int q = Math.Abs(Position.Quantity);
-                    try { ExitLong(0, q, "LR_MarginFlat", "");
-                        DiagLog("[MARGIN CUTOFF] closing LONG " + q + "."); }
-                    catch (Exception ex) { DiagLog("[MARGIN CUTOFF] ExitLong error: " + ex.Message); }
+                    try { ExitShort(0, q, "SR_MarginFlat", "");
+                        DiagLog("[MARGIN CUTOFF] closing SHORT " + q + "."); }
+                    catch (Exception ex) { DiagLog("[MARGIN CUTOFF] ExitShort error: " + ex.Message); }
                 }
                 else
                 {
                     int q = Math.Abs(Position.Quantity);
-                    try { ExitShort(0, q, "LR_MarginFlat", "");
-                        DiagLog("[MARGIN CUTOFF] closing SHORT " + q + " (flip)."); }
-                    catch (Exception ex) { DiagLog("[MARGIN CUTOFF] ExitShort error: " + ex.Message); }
+                    try { ExitLong(0, q, "SR_MarginFlat", "");
+                        DiagLog("[MARGIN CUTOFF] closing LONG " + q + " (flip)."); }
+                    catch (Exception ex) { DiagLog("[MARGIN CUTOFF] ExitLong error: " + ex.Message); }
                 }
                 return;
             }
@@ -1532,8 +1572,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             return s.Length <= n ? s : "..." + s.Substring(s.Length - n);
         }
 
-        // ===== WILDCARD PATTERN MATCHING (same as Layer 2) =====
-        //   '*'->one-or-more 0s, '?'->one-or-more 1s, expand in place, suffix match.
+        // =====================================================================
+        // WILDCARD PATTERN MATCHING (same as Layer 2)
+        //   '0'->literal 0, '1'->literal 1, '*'->one-or-more 0s, '?'->one-or-more 1s
+        //   Expand in place: "0*"="00+" (two+ zeros), "10?"="101+", "1*?"="10+1+".
+        //   Suffix (tail) match. Small backtracking matcher; runs only on short tails.
+        // =====================================================================
         private static bool PatternHasWildcard(string pattern)
         {
             return pattern.IndexOf('*') >= 0 || pattern.IndexOf('?') >= 0;
@@ -1543,8 +1587,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (string.IsNullOrEmpty(pattern)) return false;
             if (text.Length == 0) return false;
+
             if (!PatternHasWildcard(pattern))
                 return text.Length >= pattern.Length && text.EndsWith(pattern);
+
             for (int start = text.Length - 1; start >= 0; start--)
             {
                 if (MatchHere(text, start, pattern, 0))
@@ -1558,9 +1604,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             while (pi < pattern.Length)
             {
                 char pc = pattern[pi];
+
                 if (pc == '*' || pc == '?')
                 {
-                    char want = (pc == '*') ? '0' : '1';
+                    char want = (pc == '*') ? '0' : '1';   // '*' = 0+, '?' = 1+
                     if (ti >= text.Length || text[ti] != want) return false;
                     ti++;
                     int maxConsume = ti;
@@ -1601,7 +1648,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Returns TODAY's real-trade outcome bits, oldest-first (e.g. "1101").
         // SINGLE SOURCE OF TRUTH used by BOTH the qty rule (rebuilds
         // sessionRealOutcome on RESUME) and the breaker (trailing-loss count), so
-        // the two can never disagree. "Real trade" = side is exactly "Long"
+        // the two can never disagree. "Real trade" = side is exactly "Short"
         // (not FAKE_/OBS_/WOULDBE_/CANCELLED_). "Today" = same 3 PM PT trading day.
         // Returns "" on error / no real trades today (both callers treat as clean).
         private string ReadTodaysRealOutcomes(string path, int todayKey)
@@ -1625,7 +1672,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     string sideCol = p[2].Trim();
                     string bitCol  = p[7].Trim();
 
-                    if (sideCol != "Long") continue;          // real trades only
+                    if (sideCol != "Short") continue;          // real trades only
                     if (bitCol != "0" && bitCol != "1") continue;
 
                     DateTime ts;
@@ -1843,7 +1890,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // and trigger a SPURIOUS FRESH START that WIPES rawString.
                 string row = string.Format(System.Globalization.CultureInfo.InvariantCulture,
                     "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6:0.00},{7},{8},{9},{10},{11}\n",
-                    DateTime.Now, sliceCount, "Long", qty, entryPrice, exitPrice, pnl, bit,
+                    DateTime.Now, sliceCount, "Short", qty, entryPrice, exitPrice, pnl, bit,
                     rawString.ToString(), filter1Outcome.ToString(), filter2Outcome.ToString(), realTradeOutcome.ToString());
                 SafeAppend(activeLogFilePath, row);
             }
@@ -1857,7 +1904,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string row = string.Format(System.Globalization.CultureInfo.InvariantCulture,
                     "{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6:0.00},{7},{8},{9},{10},{11}\n",
                     DateTime.Now, sliceCount,
-                    (suppressReason ?? "FAKE_Long"),   // distinguishes suppressed trades
+                    (suppressReason ?? "FAKE_Short"),   // distinguishes suppressed trades
                     0, entryPrice, exitPrice, pnl, bit,
                     rawString.ToString(), filter1Outcome.ToString(), filter2Outcome.ToString(), realTradeOutcome.ToString());
                 SafeAppend(activeLogFilePath, row);
