@@ -1,0 +1,228 @@
+# -*- coding: utf-8 -*-
+"""
+trade_filter.py
+---------------
+Distill a raw market string through two pattern filters to find
+the best trading signal.
+
+Each filter layer now accepts ONE OR MORE patterns. Supply them as a
+comma-delimited string ("10,01" or '"10","01"') or as a Python list
+(["10", "01"]). At every position the layer tests each pattern; on a
+match it collects the digit immediately after the match. Results are
+kept in left-to-right (temporal) order, so the streak stats stay
+meaningful.
+
+Pipeline:
+    Raw String → Filter 1 → Filter 2 → Trade (Live)
+
+Usage:
+    result = run(market_string="010011000001110", f1="10,01", f2="01")
+    print(result["report"])
+
+Or run directly:
+    python trade_filter.py
+"""
+
+
+def parse_patterns(spec) -> list:
+    """
+    Normalise a pattern spec into a clean list of pattern strings.
+
+    Accepts:
+        - a list/tuple:    ["10", "01"]
+        - a comma string:  "10,01"  or  '"10", "01"'  or  "10, 01"
+
+    Surrounding whitespace and quote characters are stripped from each
+    token; empty tokens are dropped.
+    """
+    if spec is None:
+        return []
+    items = spec if isinstance(spec, (list, tuple)) else str(spec).split(",")
+    out = []
+    for item in items:
+        p = str(item).strip(" \t\r\n\"'")
+        if p:
+            out.append(p)
+    return out
+
+
+def apply_filter(input_str: str, patterns) -> str:
+    """
+    Scan input_str once, left to right. At each position, test every
+    pattern; for each pattern that matches there, collect the digit
+    immediately after the match. The concatenated digits become the
+    output string for the next layer.
+
+    With same-length patterns (e.g. "10","01") each position contributes
+    at most one digit. With mixed-length patterns a single position may
+    contribute one digit per matching pattern, appended in the order the
+    patterns were supplied.
+    """
+    patterns = parse_patterns(patterns)
+    out = []
+    n = len(input_str)
+    for i in range(n):
+        for p in patterns:
+            plen = len(p)
+            # i + plen < n guarantees BOTH that the pattern slice fits and
+            # that a "next" digit exists at index i + plen.
+            if plen and i + plen < n and input_str[i:i + plen] == p:
+                out.append(input_str[i + plen])
+    return "".join(out)
+
+
+def stats(s: str) -> dict:
+    """
+    Compute stats for a binary string:
+        length, win count, lose count, win%, lose%,
+        max consecutive wins, max consecutive losses,
+        win streaks list, loss streaks list.
+    """
+    n = len(s)
+    if n == 0:
+        return {
+            "length"         : 0,
+            "win_count"      : 0,
+            "lose_count"     : 0,
+            "win_pct"        : 0.0,
+            "lose_pct"       : 0.0,
+            "max_consec_win" : 0,
+            "max_consec_lose": 0,
+            "win_streaks"    : [],
+            "lose_streaks"   : [],
+        }
+
+    wins  = s.count('1')
+    loses = s.count('0')
+
+    # Streak tracking
+    win_streaks, lose_streaks = [], []
+    cur_win = cur_lose = 0
+    for ch in s:
+        if ch == '1':
+            cur_win += 1
+            if cur_lose > 0:
+                lose_streaks.append(cur_lose)
+                cur_lose = 0
+        else:
+            cur_lose += 1
+            if cur_win > 0:
+                win_streaks.append(cur_win)
+                cur_win = 0
+    if cur_win  > 0: win_streaks.append(cur_win)
+    if cur_lose > 0: lose_streaks.append(cur_lose)
+
+    return {
+        "length"         : n,
+        "win_count"      : wins,
+        "lose_count"     : loses,
+        "win_pct"        : round(wins  / n * 100, 2),
+        "lose_pct"       : round(loses / n * 100, 2),
+        "max_consec_win" : max(win_streaks)  if win_streaks  else 0,
+        "max_consec_lose": max(lose_streaks) if lose_streaks else 0,
+        "win_streaks"    : win_streaks,
+        "lose_streaks"   : lose_streaks,
+    }
+
+
+def run(market_string: str, f1="01", f2="01") -> dict:
+    """
+    Run the full pipeline:
+        Raw → Filter 1 → Filter 2 → Trade
+
+    Parameters
+    ----------
+    market_string : str          Binary string e.g. "010011000001110"
+    f1            : str | list   Filter 1 pattern(s). Comma-delimited
+                                 string ("10,01") or list (["10","01"]).
+    f2            : str | list   Filter 2 pattern(s). Same formats.
+
+    Returns
+    -------
+    dict with keys:
+        raw_string      : str
+        f1_patterns     : list   (parsed pattern list for layer 1)
+        f2_patterns     : list   (parsed pattern list for layer 2)
+        raw_stats       : dict
+        filter1_string  : str
+        filter1_stats   : dict
+        filter2_string  : str    (= Live / Trade string)
+        filter2_stats   : dict
+        report          : str    (human-readable summary)
+    """
+    raw = market_string.strip()
+
+    f1_patterns = parse_patterns(f1)
+    f2_patterns = parse_patterns(f2)
+
+    f1_str = apply_filter(raw, f1_patterns)
+    f2_str = apply_filter(f1_str, f2_patterns)
+
+    raw_st = stats(raw)
+    f1_st  = stats(f1_str)
+    f2_st  = stats(f2_str)
+
+    report = _format_report(raw, f1_patterns, f2_patterns,
+                            f1_str, f2_str, raw_st, f1_st, f2_st)
+
+    return {
+        "raw_string"    : raw,
+        "f1_patterns"   : f1_patterns,
+        "f2_patterns"   : f2_patterns,
+        "raw_stats"     : raw_st,
+        "filter1_string": f1_str,
+        "filter1_stats" : f1_st,
+        "filter2_string": f2_str,
+        "filter2_stats" : f2_st,
+        "report"        : report,
+    }
+
+
+def _format_report(raw, f1_patterns, f2_patterns,
+                   f1_str, f2_str, raw_st, f1_st, f2_st) -> str:
+    W = 62
+    lines = []
+    lines.append("=" * W)
+    lines.append("  TRADE FILTER  :  Raw → Filter 1 → Filter 2 → Trade")
+    lines.append("=" * W)
+
+    def fmt_patterns(ps):
+        return ", ".join(f"'{p}'" for p in ps) if ps else "(none)"
+
+    def section(header, string, st, show_full=False):
+        shown = string if string else "(empty)"
+        if not show_full and len(shown) > 70:
+            shown = shown[:70] + "..."
+        lines.append(f"  {header}")
+        lines.append(f"    String          : {shown}")
+        lines.append(f"    Length          : {st['length']}")
+        lines.append(f"    Win  (1)        : {st['win_count']}  ({st['win_pct']}%)")
+        lines.append(f"    Lose (0)        : {st['lose_count']}  ({st['lose_pct']}%)")
+        lines.append(f"    Max consec Win  : {st['max_consec_win']}   streaks={st['win_streaks']}")
+        lines.append(f"    Max consec Lose : {st['max_consec_lose']}   streaks={st['lose_streaks']}")
+        lines.append("")
+
+    section("RAW STRING", raw, raw_st)
+    section(f"FILTER 1  (patterns: {fmt_patterns(f1_patterns)})",
+            f1_str, f1_st, show_full=True)
+    section(f"FILTER 2 → TRADE (LIVE)  (patterns: {fmt_patterns(f2_patterns)})",
+            f2_str, f2_st, show_full=True)
+
+    lines.append("=" * W)
+    return "\n".join(lines)
+
+
+# ── Run directly ──────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+
+    big = ("1111000100100001111000100110011000000010110010010100001010000000"
+           "0010011000001100111001111100000111100100100101100000010011000000"
+           "1011100001100011000010100000011011110010001011011011110001110000"
+           "0000010000010010011100011010000100010110111001101001111111001000"
+           "100101010000")
+
+    # Single pattern per layer (original behaviour)
+    print(run(market_string=big, f1="01", f2="01")["report"])
+
+    # Multiple patterns per layer, comma-delimited
+    print(run(market_string=big, f1="10,01", f2="01")["report"])
