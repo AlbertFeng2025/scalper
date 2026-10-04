@@ -2,212 +2,384 @@
 using System;
 using System.IO;
 using System.Text;
+using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
-using System.Windows.Media;
+using System.Windows.Media;                       // Brushes
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
-using NinjaTrader.Gui;
-using NinjaTrader.Gui.Chart;
+using NinjaTrader.Gui.Tools;                       // SimpleFont
 using NinjaTrader.NinjaScript;
-using NinjaTrader.NinjaScript.DrawingTools;
-using System.ComponentModel;
-using System.Xml.Serialization;
+using NinjaTrader.NinjaScript.DrawingTools;        // Draw.TextFixed / TextPosition
 #endregion
 
+// HUD corner choices exposed to the user (mapped to NT's TextPosition at draw time).
+// IMPORTANT: declared in the GLOBAL namespace (outside NinjaTrader.NinjaScript.Indicators) on purpose.
+// At compile time NinjaTrader auto-generates wrapper methods for this indicator in several OTHER
+// namespaces (Strategies, MarketAnalyzers, ...) that reference this enum by its simple name; only a
+// global-namespace type is visible from all of them. Nesting it in the Indicators namespace causes
+// CS0246 "HudCornerType could not be found" in that generated code.
+public enum HudCornerType { BottomLeft, BottomRight, TopLeft, TopRight, Center }
+
 // =============================================================================
-// Alert_renko_layer1  —  ALERT-ONLY Renko Layer-1 INDICATOR (draws on the chart)
+// Indicator_Renko_mergedLayer1  —  F1 MERGED-TRANSIT OUTCOME STRING (observer)
+// =============================================================================
+// WHAT CHANGED IN THIS VERSION
+//   The HUD header now also shows the 1's percentage:
+//     (F1=10)  bits=123  1s=45 = 36.6%  |  last 20: 40.0%
+//   * "1s=45 = 36.6%"  -> wins so far THIS SESSION (resets on a fresh start /
+//                         new session, exactly like the string itself).
+//   * "last 20: 40.0%" -> rolling 1's percentage over the most recent N bits
+//                         (N = "Rolling window (bits)"; 0 = hide). This works like
+//                         an RSI for the string: it shows the CURRENT stretch,
+//                         while the session % shows the whole day.
+//   The CSV log gains two columns: pct_session, pct_rolling.
 //
-// Same bit + wildcard engine as the trading strategy, but places NO orders.
-// Each closed Renko brick = one bit (up=1/green, down=0/red).
-// When rawString tail matches an F1 pattern during the alert window it:
-//   (1) plays the alert sound N times,
-//   (2) draws a marker ON THE CHART (arrow + text at the signal bar), and
-//   (3) writes to the Alerts window (Alert()).
-// Wildcards:  ? = one-or-more '1's    * = one-or-more '0's
-// Default F1 = 1?0*1?0*1?  =>  (>=2 ones)(>=2 zeros)(>=2 ones)(>=2 zeros)(>=2 ones)
+//   The rolling-window setting is a plain (non-NinjaScriptProperty) property on
+//   purpose: it shows in the indicator dialog and is saved with the chart, but it
+//   does NOT change the indicator's generated method signature, so the
+//   "NinjaScript generated code" region at the bottom stays valid unchanged.
+//
+// PURPOSE
+//   This indicator does NOT trade. It is a *pre-processing lens*: it converts the
+//   raw Renko brick stream into the same merged 1/0 outcome string that the
+//   Renko_mergedTransit strategies build internally, and prints it on the chart so
+//   your eye can read the transit history at a glance and THEN decide — by
+//   intuition — which layer (1/2/3) and which F1/F2/F3 pattern combo to deploy.
+//
+//   The merge logic below (bit derivation, both-book test, next-brick resolution,
+//   seeding, and session/gap resets) is a VERBATIM port of Renko_mergedTransit_Layer1
+//   so the string you read here equals what a deployed strategy holds — provided
+//   the two parity switches (Seed / Restart-on-new-session) are set the same.
+//
+// MULTIPLE INSTANCES ON ONE CHART
+//   * IsOverlay = false and DrawOnPricePanel = false: each instance draws its HUD on
+//     ITS OWN panel (set "Panel" in the indicator dialog, e.g. F1=10 -> panel 2,
+//     F1=1000 -> panel 3). After compiling, REMOVE and RE-ADD the indicator so new
+//     defaults apply. The panel shows only the HUD (this indicator has no plots).
+//   * The HUD tag includes the F1 pattern, so instances never share a drawing tag.
+//   * The log file name includes the F1 pattern, so two instances started in the
+//     same second never write into the same CSV.
+//
+// -----------------------------------------------------------------------------
+// HOW THE STRING IS BUILT
+//   Brick bit (LONG encoding):   Close rose = GREEN = 1 ,  Close fell = RED = 0.
+//   shortStr = the bitwise flip of longStr (GREEN=0 / RED=1).
+//
+//   Each brick, F1 is tested against BOTH strings' tails:
+//     - longStr  tail matches F1  -> a LONG  transit setup (e.g. "10" = green->red,
+//                                     chase the next GREEN)
+//     - shortStr tail matches F1  -> a SHORT transit setup (e.g. "10" = real
+//                                     red->green, chase the next RED)
+//   For F1="10" the two never fire on the same brick.
+//
+//   A match ARMS an outcome that is RESOLVED on the NEXT brick, and appends ONE bit
+//   to the merged outcome string:
+//     - LONG  match:  next brick GREEN (bit==1) -> WIN -> '1' , else '0'
+//     - SHORT match:  next brick RED   (bit==0) -> WIN -> '1' , else '0'
+//   So: one bit per F1 occurrence, long and short interleaved in time,
+//       1 = the chase would have won (transit completed) , 0 = missed.
+//
+// ONE-BRICK LAG (inherent, not a bug)
+//   A match on the just-closed brick cannot be scored until the FOLLOWING brick
+//   closes. So the newest occurrence's bit appears one brick later.
+//
+// PARITY — IMPORTANT
+//   To make your eye-read equal a deployed strategy's internal string, run this
+//   observer with the SAME "Seed forming brick on start" and "Restart clean on new
+//   session" values you'll deploy. Defaults here match the strategy defaults (both ON).
+//
+// LOG
+//   Optional CSV (open-append-close, never holds the file open). One row per new
+//   bit:  timestamp,side,bit,pct_session,pct_rolling,string
+//   File name: <LogBaseName>_F1-<pattern>_<yyyy-MM-dd_HH-mm-ss>.csv
+//   ('*' is written as 'z', '?' as 'o', ',' as '_').
 // =============================================================================
 namespace NinjaTrader.NinjaScript.Indicators
 {
-    public class Alert_renko_layer1 : Indicator
+    public class Indicator_Renko_mergedLayer1 : Indicator
     {
-        private readonly StringBuilder rawString = new StringBuilder();
-        private string[] filter1Patterns = new string[0];
-        private int      barCount        = 0;
-        private DateTime lastAlertTime   = DateTime.MinValue;
-        private string   activeLogFilePath = null;
-        private bool     logHeaderWritten  = false;
+        // ── merged pipeline strings (LONG encoding: green=1/red=0) ────────────
+        private readonly StringBuilder longStr        = new StringBuilder();
+        private readonly StringBuilder shortStr       = new StringBuilder();
+        private readonly StringBuilder filter1Outcome = new StringBuilder(); // merged, win-encoded
+
+        // ── 1's counter for the session percentage (reset with the string) ───
+        private int onesCount = 0;
+
+        // ── pipeline state ────────────────────────────────────────────────────
+        private int  prevBarBit       = -1;    // 1=green, 0=red
+        private bool waitLongOutcome  = false;
+        private bool waitShortOutcome = false;
+
+        // ── life / session / gap ──────────────────────────────────────────────
+        private bool lifeStarted     = false;
+        private bool seedPending      = false;
+        private bool firstBrickDone   = false;
+        private int  lastProcessedBar = -1;
+        private string activeLogFilePath = null;
+
+        // ── parsed F1 list ────────────────────────────────────────────────────
+        private readonly List<string> filter1Patterns = new List<string>();
+
+        private const string HUD_TAG = "Renko_mergedLayer1_F1HUD";
 
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
             {
-                Name                        = "Alert_renko_layer1";
-                Description                 = "ALERT-ONLY Renko Layer-1 (chart markers + sound). Based on the NATURAL raw "
-                                            + "Renko brick string (single book), NOT the merged Layer-2 result. up=1/green, down=0/red. "
-                                            + "Matches F1 on the raw brick string; no orders. ?=1+ ones, *=1+ zeros.";
-                Calculate                   = Calculate.OnBarClose;
-                IsOverlay                   = true;   // draw ON the price panel
-                DisplayInDataBox            = false;
-                DrawOnPricePanel            = true;
-                PaintPriceMarkers           = false;
-                IsSuspendedWhileInactive    = false;
+                Name        = "Indicator_Renko_mergedLayer1";
+                Description = "Observer: prints the MERGED F1 transit-outcome 1/0 string (1=transit completed, "
+                            + "0=missed) plus the session and rolling 1's percentage. Does not trade.";
 
-                // 1. Alert
-                EnableAlert    = true;
-                Filter1Pattern = "1?0*1?0*1?";
-                AlertRepeat    = 5;
-                AlertSoundFile = "Alert4.wav";
-                RearmSeconds   = 5;
-                ShowText       = true;
-                MarkerColor    = Brushes.DarkSlateGray;   // darker, higher-contrast marker/text
-                EnableBarLog   = true;
-                LogFolder      = @"C:\temp";
+                Calculate        = Calculate.OnBarClose;   // match the strategy: score at brick close
+                IsOverlay        = false;                  // own panel by default (one panel per instance)
+                DrawOnPricePanel = false;                  // draw the HUD on THIS indicator's panel
+                IsAutoScale      = false;
+                DisplayInDataBox = false;
+                PaintPriceMarkers = false;
+                IsSuspendedWhileInactive = false;
 
-                // 2. Alert Hours
-                EnableAlertHours = true;
-                AlertStartHour   = 9;
-                AlertStartMinute = 30;
-                AlertEndHour     = 11;
-                AlertEndMinute   = 30;
+                // ── defaults (mirror the strategy) ──
+                Filter1Pattern        = "10";          // comma-OR; wildcards ?=1+ ones, *=1+ zeros supported
+                DisplayLastNBits      = 100;           // how many trailing bits to show on the chart
+                BitFontSize           = 18;            // HUD font size
+                HudCorner             = HudCornerType.BottomLeft;
+                SeedPendingBarOnStart = true;          // parity: same as strategy
+                RestartOnNewSession   = true;          // parity: string clears each session
+                EnableStringLog       = true;
+                LogFolder             = @"C:\temp";
+                LogBaseName           = "Indicator_Renko_mergedLayer1";
+                RollingWindowBits     = 20;            // rolling 1's % over the last N bits (0 = hide)
             }
-            else if (State == State.DataLoaded)
+            else if (State == State.Realtime)
             {
-                ParseFilter1Patterns();
+                // Build from ENABLE-TIME forward (historical bars are ignored below), exactly
+                // like the strategy which only processes State.Realtime.
+                if (!lifeStarted)
+                {
+                    lifeStarted = true;
+                    ParseFilter1Patterns();
+                    FreshStart("indicator enabled (fresh start)", SeedPendingBarOnStart);
+                }
             }
         }
 
+        // =====================================================================
+        // OnBarUpdate — brick close -> bit -> merged pipeline -> display + log
+        // =====================================================================
         protected override void OnBarUpdate()
         {
-            if (State != State.Realtime) return;   // alert on live closed bricks only
+            if (State != State.Realtime) return;   // ignore historical; build forward from enable
             if (CurrentBar < 1) return;
 
-            int bit;
-            if (Close[0] > Close[1])      bit = 1;   // up brick   (green)
-            else if (Close[0] < Close[1]) bit = 0;   // down brick (red)
-            else                          bit = 0;   // anomaly (no move) -> red/down
-
-            barCount++;
-            rawString.Append(bit);
-            if (rawString.Length > 2048)
-                rawString.Remove(0, rawString.Length - 2048);
-
-            // ── diagnostics for the bar log (computed on every brick) ────────
-            bool f1        = TailMatchesAny(rawString.ToString());
-            bool inWin     = InAlertWindow(Time[0]);
-            bool rearmOk   = (Time[0] - lastAlertTime).TotalSeconds >= RearmSeconds;
-            bool willAlert = EnableAlert && f1 && inWin && rearmOk;
-
-            string note = !EnableAlert ? "alert-disabled"
-                        : !f1          ? "no-match"
-                        : !inWin       ? "match-OUTSIDE-window"
-                        : !rearmOk     ? "match-rearm-hold"
-                        :                "MATCH-ALERT";
-
-            BarLog(string.Format("{0},{1},{2},{3},{4},{5},{6},{7}",
-                barCount, bit, bit == 1 ? "G" : "R", TailOf(rawString, 24),
-                f1, inWin, willAlert, note));
-
-            if (willAlert)
+            // ── NEW SESSION: optional clean roll (no seed across days) ──────────
+            if (firstBrickDone && Bars.IsFirstBarOfSession)
             {
-                lastAlertTime = Time[0];
-                FireAlert(bit);
+                if (RestartOnNewSession)
+                    FreshStart("new trading session", false);
             }
-        }
-
-        private void FireAlert(int bit)
-        {
-            string tail = TailOf(rawString, 16);
-            string tag  = "AL" + barCount;
-
-            // (1) chart marker: arrow under the bar + optional text label
-            try
+            // ── HOLE: bricks were skipped (disconnect that MISSED bricks) -> clean restart, NO seed
+            else if (lastProcessedBar >= 0 && CurrentBar > lastProcessedBar + 1)
             {
-                Draw.ArrowUp(this, "arw" + tag, true, 0, Low[0] - 2 * TickSize, MarkerColor);
-                if (ShowText)
-                    Draw.Text(this, "txt" + tag, "F1 " + tail, 0, High[0] + 3 * TickSize, MarkerColor);
+                FreshStart("brick gap: CurrentBar " + lastProcessedBar + " -> " + CurrentBar
+                    + " (missed " + (CurrentBar - lastProcessedBar - 1) + " brick(s))", false);
             }
-            catch { }
+            lastProcessedBar = CurrentBar;
+            firstBrickDone   = true;
 
-            // (2) sound x N  — LOUD PC beep via the system speaker / default audio device.
-            //     Console.Beep goes straight to the PC's default audio device and ignores
-            //     NinjaTrader's alert-volume slider, so it is reliably louder than a WAV.
-            //     It runs on a background thread so beeping never blocks brick processing.
-            //     The WAV is still passed to Alert() below as a quiet backup.
-            string soundPath = ResolveSoundPath(AlertSoundFile);
-            int beeps = Math.Max(1, AlertRepeat);
-            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            // ── SEED (one time, after a clean enable) ───────────────────────────
+            if (seedPending)
             {
-                for (int i = 0; i < beeps; i++)
+                seedPending = false;
+                if (CurrentBar >= 2)
                 {
-                    try { Console.Beep(1000, 300); } catch { }   // 1000 Hz, 300 ms tone
-                    try { System.Threading.Thread.Sleep(120); } catch { }   // gap between pulses
+                    int seedBit;
+                    if (Close[1] > Close[2])      seedBit = 1;   // green
+                    else if (Close[1] < Close[2]) seedBit = 0;   // red
+                    else                          seedBit = 0;
+                    longStr.Append(seedBit == 1 ? "1" : "0");
+                    shortStr.Append(seedBit == 1 ? "0" : "1");
+                    prevBarBit = seedBit;
                 }
-            });
+            }
 
-            // (3) Alerts window entry (no Output window needed)
+            // ── derive the brick bit (green=1 / red=0) from close-vs-close ──────
+            int bit;
+            if (Close[0] > Close[1])      bit = 1;   // up brick  (green)
+            else if (Close[0] < Close[1]) bit = 0;   // down brick (red)
+            else                          bit = (prevBarBit >= 0) ? prevBarBit : 0;
+            prevBarBit = bit;
+
+            // ── resolve the prior F1 match into ONE merged outcome bit ──────────
+            if (waitLongOutcome)
+            {
+                waitLongOutcome = false;
+                AppendOutcome('L', bit == 1 ? '1' : '0');
+            }
+            if (waitShortOutcome)
+            {
+                waitShortOutcome = false;
+                AppendOutcome('S', bit == 0 ? '1' : '0');
+            }
+
+            // ── append bit to both books ────────────────────────────────────────
+            longStr.Append(bit == 1 ? "1" : "0");
+            shortStr.Append(bit == 1 ? "0" : "1");
+            if (longStr.Length  > 2048) longStr.Remove(0, longStr.Length - 2048);
+            if (shortStr.Length > 2048) shortStr.Remove(0, shortStr.Length - 2048);
+
+            // ── test F1 against BOTH books; arm the next-brick outcome ──────────
+            if (TailMatchesAny(longStr.ToString()))  waitLongOutcome  = true;
+            if (TailMatchesAny(shortStr.ToString())) waitShortOutcome = true;
+
+            // ── refresh the on-chart string ─────────────────────────────────────
+            UpdateDisplay();
+        }
+
+        // ── percentages ─────────────────────────────────────────────────────────
+        // Session %: 1's so far since the last fresh start / new session.
+        private double SessionPct()
+        {
+            int n = filter1Outcome.Length;
+            return n > 0 ? 100.0 * onesCount / n : 0.0;
+        }
+
+        // Rolling %: 1's in the most recent N bits (N = RollingWindowBits, capped
+        // at the number of bits available so far). Returns -1 when hidden.
+        private double RollingPct(out int windowUsed)
+        {
+            windowUsed = 0;
+            if (RollingWindowBits <= 0 || filter1Outcome.Length == 0) return -1;
+            int n = filter1Outcome.Length;
+            windowUsed = Math.Min(RollingWindowBits, n);
+            int ones = 0;
+            for (int i = n - windowUsed; i < n; i++) if (filter1Outcome[i] == '1') ones++;
+            return 100.0 * ones / windowUsed;
+        }
+
+        // ── append one outcome bit to the merged string + log it ───────────────
+        private void AppendOutcome(char side, char bit)
+        {
+            filter1Outcome.Append(bit);
+            if (bit == '1') onesCount++;
+
+            if (!EnableStringLog || activeLogFilePath == null) return;
             try
             {
-                Alert(tag, Priority.High,
-                      "Renko F1 match  " + (Instrument != null ? Instrument.FullName : "") + "  tail=" + tail,
-                      soundPath, RearmSeconds, Brushes.Black, MarkerColor);
+                int w;
+                double roll = RollingPct(out w);
+                string row = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff")
+                           + "," + side + "," + bit
+                           + "," + SessionPct().ToString("F1", System.Globalization.CultureInfo.InvariantCulture)
+                           + "," + (roll < 0 ? "" : roll.ToString("F1", System.Globalization.CultureInfo.InvariantCulture))
+                           + "," + filter1Outcome.ToString();
+                File.AppendAllText(activeLogFilePath, row + Environment.NewLine);
             }
-            catch { }
+            catch { /* a reader momentarily locking the file must never break the indicator;
+                       the next bit re-writes the full string, so nothing is lost. */ }
         }
 
-        private string ResolveSoundPath(string file)
+        // ── draw the running string as a fixed HUD (one object, updated in place) ─
+        private void UpdateDisplay()
         {
-            if (string.IsNullOrWhiteSpace(file)) return "";
-            if (file.IndexOf('\\') >= 0 || file.IndexOf('/') >= 0) return file;
-            try { return NinjaTrader.Core.Globals.InstallDir + @"\sounds\" + file; }
-            catch { return file; }
+            string full = filter1Outcome.ToString();
+            int n = (DisplayLastNBits > 0 && full.Length > DisplayLastNBits) ? DisplayLastNBits : full.Length;
+            string tail = (n == full.Length) ? full : full.Substring(full.Length - n);
+
+            // header: F1, bit count, session 1's %, rolling 1's %
+            string header = "(F1=" + Filter1Pattern + ")  bits=" + full.Length;
+            if (full.Length > 0)
+            {
+                header += "  1s=" + onesCount + " = " + SessionPct().ToString("F1") + "%";
+                int w;
+                double roll = RollingPct(out w);
+                if (roll >= 0)
+                    header += "  |  last " + w + ": " + roll.ToString("F1") + "%";
+            }
+            if (full.Length > n) header += "  (showing last " + n + ")";
+
+            string body = (tail.Length == 0) ? "<no transit yet>" : tail;
+
+            NinjaTrader.NinjaScript.DrawingTools.TextPosition pos;
+            switch (HudCorner)
+            {
+                case HudCornerType.BottomRight: pos = NinjaTrader.NinjaScript.DrawingTools.TextPosition.BottomRight; break;
+                case HudCornerType.TopLeft:     pos = NinjaTrader.NinjaScript.DrawingTools.TextPosition.TopLeft;     break;
+                case HudCornerType.TopRight:    pos = NinjaTrader.NinjaScript.DrawingTools.TextPosition.TopRight;    break;
+                case HudCornerType.Center:      pos = NinjaTrader.NinjaScript.DrawingTools.TextPosition.Center;      break;
+                default:                        pos = NinjaTrader.NinjaScript.DrawingTools.TextPosition.BottomLeft;  break;
+            }
+
+            Draw.TextFixed(this, HUD_TAG + "_" + Filter1Pattern, header + Environment.NewLine + body,
+                pos,
+                Brushes.White, new SimpleFont("Consolas", BitFontSize),
+                Brushes.DimGray, Brushes.Black, 50);
         }
 
-        private bool InAlertWindow(DateTime t)
+        // ── clear pipeline + open a fresh log file ──────────────────────────────
+        private void FreshStart(string reason, bool seed)
         {
-            if (!EnableAlertHours) return true;
-            int cur = t.Hour * 60 + t.Minute;
-            int s   = AlertStartHour * 60 + AlertStartMinute;
-            int e   = AlertEndHour   * 60 + AlertEndMinute;
-            return (s <= e) ? (cur >= s && cur <= e) : (cur >= s || cur <= e);
+            seedPending = seed;
+            longStr.Clear(); shortStr.Clear(); filter1Outcome.Clear();
+            onesCount = 0;                                   // session % restarts with the string
+            waitLongOutcome = false; waitShortOutcome = false;
+            prevBarBit = -1;
+
+            if (EnableStringLog)
+            {
+                string stamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+                try
+                {
+                    if (!Directory.Exists(LogFolder)) Directory.CreateDirectory(LogFolder);
+                    string safeF1 = (Filter1Pattern ?? "").Replace("*", "z").Replace("?", "o").Replace(",", "_");
+                    activeLogFilePath = Path.Combine(LogFolder, LogBaseName + "_F1-" + safeF1 + "_" + stamp + ".csv");
+                    File.AppendAllText(activeLogFilePath,
+                        "# Indicator_Renko_mergedLayer1  F1=" + Filter1Pattern
+                            + "  reason=" + reason + "  seed=" + seed
+                            + "  rollingWindow=" + RollingWindowBits + Environment.NewLine
+                        + "timestamp,side,bit,pct_session,pct_rolling,string" + Environment.NewLine);
+                }
+                catch { activeLogFilePath = null; }
+            }
+            else activeLogFilePath = null;
+
+            Print("[Indicator_Renko_mergedLayer1] FRESH START: " + reason
+                + " | F1=[" + string.Join(",", filter1Patterns) + "] | seed=" + seed
+                + " | log=" + (activeLogFilePath ?? "(off)"));
         }
 
+        // =====================================================================
+        // F1 parser + wildcard tail matcher  (verbatim port from the strategy)
+        // =====================================================================
         private void ParseFilter1Patterns()
         {
-            var list = new System.Collections.Generic.List<string>();
+            filter1Patterns.Clear();
             if (!string.IsNullOrEmpty(Filter1Pattern))
-            {
-                foreach (string tokenRaw in Filter1Pattern.Split(','))
+                foreach (string tok in Filter1Pattern.Split(','))
                 {
-                    string tok = (tokenRaw ?? "").Trim();
-                    if (tok.Length == 0) continue;
+                    string t = (tok ?? "").Trim();
+                    if (t.Length == 0) continue;
                     bool ok = true;
-                    foreach (char c in tok)
-                        if (c != '0' && c != '1' && c != '*' && c != '?') { ok = false; break; }
-                    if (ok) list.Add(tok);
+                    foreach (char c in t) if (c != '0' && c != '1' && c != '*' && c != '?') { ok = false; break; }
+                    if (ok) filter1Patterns.Add(t);
                 }
-            }
-            filter1Patterns = list.ToArray();
+            Print("[Indicator_Renko_mergedLayer1] F1 active=[" + string.Join(",", filter1Patterns) + "]");
         }
 
         private bool TailMatchesAny(string text)
         {
-            for (int i = 0; i < filter1Patterns.Length; i++)
+            for (int i = 0; i < filter1Patterns.Count; i++)
                 if (TailMatches(text, filter1Patterns[i])) return true;
             return false;
         }
 
-        private static bool PatternHasWildcard(string pattern)
-        {
-            for (int i = 0; i < pattern.Length; i++)
-                if (pattern[i] == '*' || pattern[i] == '?') return true;
-            return false;
-        }
+        private static bool HasWild(string p)
+        { for (int i = 0; i < p.Length; i++) if (p[i] == '*' || p[i] == '?') return true; return false; }
 
         private static bool TailMatches(string text, string pattern)
         {
-            if (string.IsNullOrEmpty(pattern) || text.Length == 0) return false;
-            if (!PatternHasWildcard(pattern))
-                return text.Length >= pattern.Length && text.EndsWith(pattern);
+            if (string.IsNullOrEmpty(pattern) || string.IsNullOrEmpty(text)) return false;
+            if (!HasWild(pattern)) return text.Length >= pattern.Length && text.EndsWith(pattern);
             for (int start = text.Length - 1; start >= 0; start--)
                 if (MatchHere(text, start, pattern, 0)) return true;
             return false;
@@ -223,122 +395,58 @@ namespace NinjaTrader.NinjaScript.Indicators
                     char want = (pc == '*') ? '0' : '1';
                     if (ti >= text.Length || text[ti] != want) return false;
                     ti++;
-                    int maxConsume = ti;
-                    while (maxConsume < text.Length && text[maxConsume] == want) maxConsume++;
-                    for (int consume = maxConsume; consume >= ti; consume--)
-                        if (MatchHere(text, consume, pattern, pi + 1)) return true;
+                    int maxC = ti;
+                    while (maxC < text.Length && text[maxC] == want) maxC++;
+                    for (int c = maxC; c >= ti; c--) if (MatchHere(text, c, pattern, pi + 1)) return true;
                     return false;
                 }
-                else
-                {
-                    if (ti >= text.Length || text[ti] != pc) return false;
-                    ti++; pi++;
-                }
+                else { if (ti >= text.Length || text[ti] != pc) return false; ti++; pi++; }
             }
             return ti == text.Length;
         }
 
-        private string TailOf(StringBuilder sb, int n)
-        {
-            int len = sb.Length;
-            if (len <= n) return sb.ToString();
-            return sb.ToString(len - n, n);
-        }
-
-        // ── bar log: one CSV row per closed brick (+ mirror to Output window) ──
-        private void EnsureLogFile()
-        {
-            if (logHeaderWritten) return;
-            logHeaderWritten = true;
-            if (!EnableBarLog) return;
-            try
-            {
-                if (!Directory.Exists(LogFolder)) Directory.CreateDirectory(LogFolder);
-                string stamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
-                activeLogFilePath = Path.Combine(LogFolder, "Alert_renko_layer1_" + stamp + ".csv");
-                File.AppendAllText(activeLogFilePath,
-                    "time,barCount,bit,GR,rawTail,f1Match,inWindow,willAlert,note" + Environment.NewLine);
-            }
-            catch { activeLogFilePath = null; }
-        }
-
-        private void BarLog(string csv)
-        {
-            if (!EnableBarLog) return;
-            EnsureLogFile();
-            string line = Time[0].ToString("yyyy-MM-dd HH:mm:ss") + "," + csv;
-            try { if (activeLogFilePath != null) File.AppendAllText(activeLogFilePath, line + Environment.NewLine); }
-            catch { }
-            Print(Name + "  " + line);
-        }
-
         #region Properties
         [NinjaScriptProperty]
-        [Display(Name = "Enable Alert", Order = 1, GroupName = "1. Alert")]
-        public bool EnableAlert { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "F1 Pattern  (?=1+ ones, *=1+ zeros; comma = OR list)", Order = 2, GroupName = "1. Alert")]
+        [Display(Name="F1 Pattern (comma OR; ?=1+ ones *=1+ zeros)", Order=1, GroupName="1. Pattern")]
         public string Filter1Pattern { get; set; }
 
-        [NinjaScriptProperty]
-        [Range(1, 10)]
-        [Display(Name = "Alert sound repeats", Order = 3, GroupName = "1. Alert")]
-        public int AlertRepeat { get; set; }
+        [NinjaScriptProperty] [Range(1, int.MaxValue)]
+        [Display(Name="Display last N bits", Order=1, GroupName="2. Display")]
+        public int DisplayLastNBits { get; set; }
+
+        [NinjaScriptProperty] [Range(6, 72)]
+        [Display(Name="HUD font size", Order=2, GroupName="2. Display")]
+        public int BitFontSize { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Alert sound file  (name in \\sounds\\ or full path)", Order = 4, GroupName = "1. Alert")]
-        public string AlertSoundFile { get; set; }
+        [Display(Name="HUD corner", Order=3, GroupName="2. Display")]
+        public HudCornerType HudCorner { get; set; }
+
+        // Plain property (NOT [NinjaScriptProperty]) so the generated code region stays unchanged.
+        [Range(0, 1000)]
+        [Display(Name="Rolling window (bits, 0 = hide)", Order=4, GroupName="2. Display",
+            Description="Shows the 1's percentage over the most recent N bits, next to the session %. 0 hides it.")]
+        public int RollingWindowBits { get; set; }
 
         [NinjaScriptProperty]
-        [Range(0, 3600)]
-        [Display(Name = "Re-arm seconds", Order = 5, GroupName = "1. Alert")]
-        public int RearmSeconds { get; set; }
+        [Display(Name="Seed forming brick on start (match strategy)", Order=1, GroupName="3. Parity")]
+        public bool SeedPendingBarOnStart { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Show text label on chart", Order = 6, GroupName = "1. Alert")]
-        public bool ShowText { get; set; }
+        [Display(Name="Restart clean on new session (match strategy)", Order=2, GroupName="3. Parity")]
+        public bool RestartOnNewSession { get; set; }
 
-        [XmlIgnore]
-        [Display(Name = "Marker color", Order = 7, GroupName = "1. Alert")]
-        public Brush MarkerColor { get; set; }
+        [NinjaScriptProperty]
+        [Display(Name="Enable string log", Order=1, GroupName="4. Log")]
+        public bool EnableStringLog { get; set; }
 
-        [Browsable(false)]
-        public string MarkerColorSerialize
-        {
-            get { return Serialize.BrushToString(MarkerColor); }
-            set { MarkerColor = Serialize.StringToBrush(value); }
-        }
-
-        [Display(Name = "Enable Bar Log (CSV + Output)", Order = 8, GroupName = "1. Alert")]
-        public bool EnableBarLog { get; set; }
-
-        [Display(Name = "Log Folder", Order = 9, GroupName = "1. Alert")]
+        [NinjaScriptProperty]
+        [Display(Name="Log Folder", Order=2, GroupName="4. Log")]
         public string LogFolder { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Enable Alert Hours", Order = 1, GroupName = "2. Alert Hours")]
-        public bool EnableAlertHours { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0, 23)]
-        [Display(Name = "Start Hour", Order = 2, GroupName = "2. Alert Hours")]
-        public int AlertStartHour { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0, 59)]
-        [Display(Name = "Start Minute", Order = 3, GroupName = "2. Alert Hours")]
-        public int AlertStartMinute { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0, 23)]
-        [Display(Name = "End Hour", Order = 4, GroupName = "2. Alert Hours")]
-        public int AlertEndHour { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0, 59)]
-        [Display(Name = "End Minute", Order = 5, GroupName = "2. Alert Hours")]
-        public int AlertEndMinute { get; set; }
+        [Display(Name="Log Base Name", Order=3, GroupName="4. Log")]
+        public string LogBaseName { get; set; }
         #endregion
     }
 }
@@ -349,19 +457,19 @@ namespace NinjaTrader.NinjaScript.Indicators
 {
 	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
 	{
-		private Alert_renko_layer1[] cacheAlert_renko_layer1;
-		public Alert_renko_layer1 Alert_renko_layer1(bool enableAlert, string filter1Pattern, int alertRepeat, string alertSoundFile, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		private Indicator_Renko_mergedLayer1[] cacheIndicator_Renko_mergedLayer1;
+		public Indicator_Renko_mergedLayer1 Indicator_Renko_mergedLayer1(string filter1Pattern, int displayLastNBits, int bitFontSize, HudCornerType hudCorner, bool seedPendingBarOnStart, bool restartOnNewSession, bool enableStringLog, string logFolder, string logBaseName)
 		{
-			return Alert_renko_layer1(Input, enableAlert, filter1Pattern, alertRepeat, alertSoundFile, rearmSeconds, showText, enableAlertHours, alertStartHour, alertStartMinute, alertEndHour, alertEndMinute);
+			return Indicator_Renko_mergedLayer1(Input, filter1Pattern, displayLastNBits, bitFontSize, hudCorner, seedPendingBarOnStart, restartOnNewSession, enableStringLog, logFolder, logBaseName);
 		}
 
-		public Alert_renko_layer1 Alert_renko_layer1(ISeries<double> input, bool enableAlert, string filter1Pattern, int alertRepeat, string alertSoundFile, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		public Indicator_Renko_mergedLayer1 Indicator_Renko_mergedLayer1(ISeries<double> input, string filter1Pattern, int displayLastNBits, int bitFontSize, HudCornerType hudCorner, bool seedPendingBarOnStart, bool restartOnNewSession, bool enableStringLog, string logFolder, string logBaseName)
 		{
-			if (cacheAlert_renko_layer1 != null)
-				for (int idx = 0; idx < cacheAlert_renko_layer1.Length; idx++)
-					if (cacheAlert_renko_layer1[idx] != null && cacheAlert_renko_layer1[idx].EnableAlert == enableAlert && cacheAlert_renko_layer1[idx].Filter1Pattern == filter1Pattern && cacheAlert_renko_layer1[idx].AlertRepeat == alertRepeat && cacheAlert_renko_layer1[idx].AlertSoundFile == alertSoundFile && cacheAlert_renko_layer1[idx].RearmSeconds == rearmSeconds && cacheAlert_renko_layer1[idx].ShowText == showText && cacheAlert_renko_layer1[idx].EnableAlertHours == enableAlertHours && cacheAlert_renko_layer1[idx].AlertStartHour == alertStartHour && cacheAlert_renko_layer1[idx].AlertStartMinute == alertStartMinute && cacheAlert_renko_layer1[idx].AlertEndHour == alertEndHour && cacheAlert_renko_layer1[idx].AlertEndMinute == alertEndMinute && cacheAlert_renko_layer1[idx].EqualsInput(input))
-						return cacheAlert_renko_layer1[idx];
-			return CacheIndicator<Alert_renko_layer1>(new Alert_renko_layer1(){ EnableAlert = enableAlert, Filter1Pattern = filter1Pattern, AlertRepeat = alertRepeat, AlertSoundFile = alertSoundFile, RearmSeconds = rearmSeconds, ShowText = showText, EnableAlertHours = enableAlertHours, AlertStartHour = alertStartHour, AlertStartMinute = alertStartMinute, AlertEndHour = alertEndHour, AlertEndMinute = alertEndMinute }, input, ref cacheAlert_renko_layer1);
+			if (cacheIndicator_Renko_mergedLayer1 != null)
+				for (int idx = 0; idx < cacheIndicator_Renko_mergedLayer1.Length; idx++)
+					if (cacheIndicator_Renko_mergedLayer1[idx] != null && cacheIndicator_Renko_mergedLayer1[idx].Filter1Pattern == filter1Pattern && cacheIndicator_Renko_mergedLayer1[idx].DisplayLastNBits == displayLastNBits && cacheIndicator_Renko_mergedLayer1[idx].BitFontSize == bitFontSize && cacheIndicator_Renko_mergedLayer1[idx].HudCorner == hudCorner && cacheIndicator_Renko_mergedLayer1[idx].SeedPendingBarOnStart == seedPendingBarOnStart && cacheIndicator_Renko_mergedLayer1[idx].RestartOnNewSession == restartOnNewSession && cacheIndicator_Renko_mergedLayer1[idx].EnableStringLog == enableStringLog && cacheIndicator_Renko_mergedLayer1[idx].LogFolder == logFolder && cacheIndicator_Renko_mergedLayer1[idx].LogBaseName == logBaseName && cacheIndicator_Renko_mergedLayer1[idx].EqualsInput(input))
+						return cacheIndicator_Renko_mergedLayer1[idx];
+			return CacheIndicator<Indicator_Renko_mergedLayer1>(new Indicator_Renko_mergedLayer1(){ Filter1Pattern = filter1Pattern, DisplayLastNBits = displayLastNBits, BitFontSize = bitFontSize, HudCorner = hudCorner, SeedPendingBarOnStart = seedPendingBarOnStart, RestartOnNewSession = restartOnNewSession, EnableStringLog = enableStringLog, LogFolder = logFolder, LogBaseName = logBaseName }, input, ref cacheIndicator_Renko_mergedLayer1);
 		}
 	}
 }
@@ -370,14 +478,14 @@ namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
 {
 	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
 	{
-		public Indicators.Alert_renko_layer1 Alert_renko_layer1(bool enableAlert, string filter1Pattern, int alertRepeat, string alertSoundFile, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		public Indicators.Indicator_Renko_mergedLayer1 Indicator_Renko_mergedLayer1(string filter1Pattern, int displayLastNBits, int bitFontSize, HudCornerType hudCorner, bool seedPendingBarOnStart, bool restartOnNewSession, bool enableStringLog, string logFolder, string logBaseName)
 		{
-			return indicator.Alert_renko_layer1(Input, enableAlert, filter1Pattern, alertRepeat, alertSoundFile, rearmSeconds, showText, enableAlertHours, alertStartHour, alertStartMinute, alertEndHour, alertEndMinute);
+			return indicator.Indicator_Renko_mergedLayer1(Input, filter1Pattern, displayLastNBits, bitFontSize, hudCorner, seedPendingBarOnStart, restartOnNewSession, enableStringLog, logFolder, logBaseName);
 		}
 
-		public Indicators.Alert_renko_layer1 Alert_renko_layer1(ISeries<double> input , bool enableAlert, string filter1Pattern, int alertRepeat, string alertSoundFile, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		public Indicators.Indicator_Renko_mergedLayer1 Indicator_Renko_mergedLayer1(ISeries<double> input , string filter1Pattern, int displayLastNBits, int bitFontSize, HudCornerType hudCorner, bool seedPendingBarOnStart, bool restartOnNewSession, bool enableStringLog, string logFolder, string logBaseName)
 		{
-			return indicator.Alert_renko_layer1(input, enableAlert, filter1Pattern, alertRepeat, alertSoundFile, rearmSeconds, showText, enableAlertHours, alertStartHour, alertStartMinute, alertEndHour, alertEndMinute);
+			return indicator.Indicator_Renko_mergedLayer1(input, filter1Pattern, displayLastNBits, bitFontSize, hudCorner, seedPendingBarOnStart, restartOnNewSession, enableStringLog, logFolder, logBaseName);
 		}
 	}
 }
@@ -386,14 +494,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 {
 	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
 	{
-		public Indicators.Alert_renko_layer1 Alert_renko_layer1(bool enableAlert, string filter1Pattern, int alertRepeat, string alertSoundFile, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		public Indicators.Indicator_Renko_mergedLayer1 Indicator_Renko_mergedLayer1(string filter1Pattern, int displayLastNBits, int bitFontSize, HudCornerType hudCorner, bool seedPendingBarOnStart, bool restartOnNewSession, bool enableStringLog, string logFolder, string logBaseName)
 		{
-			return indicator.Alert_renko_layer1(Input, enableAlert, filter1Pattern, alertRepeat, alertSoundFile, rearmSeconds, showText, enableAlertHours, alertStartHour, alertStartMinute, alertEndHour, alertEndMinute);
+			return indicator.Indicator_Renko_mergedLayer1(Input, filter1Pattern, displayLastNBits, bitFontSize, hudCorner, seedPendingBarOnStart, restartOnNewSession, enableStringLog, logFolder, logBaseName);
 		}
 
-		public Indicators.Alert_renko_layer1 Alert_renko_layer1(ISeries<double> input , bool enableAlert, string filter1Pattern, int alertRepeat, string alertSoundFile, int rearmSeconds, bool showText, bool enableAlertHours, int alertStartHour, int alertStartMinute, int alertEndHour, int alertEndMinute)
+		public Indicators.Indicator_Renko_mergedLayer1 Indicator_Renko_mergedLayer1(ISeries<double> input , string filter1Pattern, int displayLastNBits, int bitFontSize, HudCornerType hudCorner, bool seedPendingBarOnStart, bool restartOnNewSession, bool enableStringLog, string logFolder, string logBaseName)
 		{
-			return indicator.Alert_renko_layer1(input, enableAlert, filter1Pattern, alertRepeat, alertSoundFile, rearmSeconds, showText, enableAlertHours, alertStartHour, alertStartMinute, alertEndHour, alertEndMinute);
+			return indicator.Indicator_Renko_mergedLayer1(input, filter1Pattern, displayLastNBits, bitFontSize, hudCorner, seedPendingBarOnStart, restartOnNewSession, enableStringLog, logFolder, logBaseName);
 		}
 	}
 }
