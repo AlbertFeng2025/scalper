@@ -36,6 +36,18 @@ using NinjaTrader.NinjaScript.Strategies;
 //   Use a 40-TICK Renko series with Stop=10 / Target=20 (1x / 2x brick).
 //   On 80-tick bricks this pipeline fires too rarely (18 trades in 48 days).
 //
+//   SPEED GATE (optional, OFF by default): skips a REAL entry when the market is
+//   moving fast relative to its recent norm:
+//       ratio = avg 1-min bar range (high-low) over the last SpeedGateShortBars
+//               / avg 1-min bar range over the last SpeedGateLongBars
+//   Default 10 / 200 bars, max ratio 1.8. Research (40-tick, 48 days, SHORT
+//   F1=10 > F2=10? > F3=00, 09:30-15:30): 132 trades 37.9% unfiltered; with the
+//   gate 87 trades 41.4% (both data halves ~41%), max losses in a row 12 -> 5;
+//   the skipped (fast) trades won only 31%. Small sample, NOT proven.
+//   Like the trend gate, it only suppresses the REAL order; the pipeline keeps
+//   advancing. The ratio is printed in the diag log for EVERY would-be trade, so
+//   you can compare filtered vs unfiltered results even in observation mode.
+//
 //   LOG: one extra LAST column 'filter2Outcome' (columns 0-10 unchanged), so
 //   the RESUME reader and Python checks that use columns 8-10 still work.
 //
@@ -280,6 +292,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TrendGateMaxNetUp     = 3;
                 EnableReconnectRewarm = false;
 
+                // Speed Gate (OFF by default) - see header
+                EnableSpeedGate       = false;
+                SpeedGateShortBars    = 10;
+                SpeedGateLongBars     = 200;
+                SpeedGateMaxRatio     = 1.8;
+
                 // RESUME across a reconnect is DISABLED by default for Renko: the
                 // gap tolerance is measured in minutes but the pipeline advances in
                 // BRICKS, and a fast move can print many bricks in a few minutes.
@@ -497,7 +515,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             int trendNet = 0; foreach (int d in trendWindow) trendNet += d;
             bool trendGateOK = !EnableTrendGate || (trendNet <= TrendGateMaxNetUp);
 
-            if (nextIsMoney && EnableRealOrder && !hasOpenPosition && trendGateOK)
+            // Speed Gate: ratio of recent vs longer 1-min bar range (see header).
+            // Computed only when the pipeline fired, so it costs nothing otherwise.
+            bool speedGateOK = true;
+            if (nextIsMoney)
+            {
+                string speedNote;
+                double speedRatio = ComputeSpeedRatio(out speedNote);
+                bool wouldBlock = speedRatio >= 0 && speedRatio > SpeedGateMaxRatio;
+                if (EnableSpeedGate && wouldBlock) speedGateOK = false;
+                DiagLog(string.Format("[SPEED] ratio{0}/{1}={2} (max {3:F2}) -> {4}{5}",
+                    SpeedGateShortBars, SpeedGateLongBars,
+                    speedRatio >= 0 ? speedRatio.ToString("F2") : "n/a", SpeedGateMaxRatio,
+                    wouldBlock ? "FAST (gate would block)" : "ok",
+                    EnableSpeedGate ? "" : "  [gate OFF - info only]")
+                    + (speedNote.Length > 0 ? " | " + speedNote : ""));
+            }
+
+            if (nextIsMoney && EnableRealOrder && !hasOpenPosition && trendGateOK && speedGateOK)
             {
                 nextIsMoney = false;  // consume the trigger
                 TryOpenRealTrade();
@@ -510,6 +545,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 WriteLogRowObs(GetCurrentAsk(), "OBS_TREND_GATE");
                 nextIsMoney = false;
             }
+            else if (nextIsMoney && EnableRealOrder && !hasOpenPosition && !speedGateOK)
+            {
+                DiagLog("[SPEED GATE] real order suppressed: market moving fast vs its recent norm. Pipeline intact.");
+                WriteLogRowObs(GetCurrentAsk(), "OBS_SPEED_GATE");
+                nextIsMoney = false;
+            }
             else if (nextIsMoney)
             {
                 // Pipeline fired, but no real order: either observation mode is on,
@@ -518,6 +559,42 @@ namespace NinjaTrader.NinjaScript.Strategies
                     ? "[WOULDBE TRADE] fired but a position is already open; no order."
                     : "[WOULDBE TRADE] fired but EnableRealOrder=false; no order.");
                 nextIsMoney = false;
+            }
+        }
+
+        // =====================================================================
+        // ComputeSpeedRatio — avg 1-min range (short window) / avg 1-min range (long window)
+        // =====================================================================
+        // Uses the 1-minute clock series (BarsArray[1]) already added in Configure.
+        // With Calculate.OnBarClose, index 0 of series 1 is its most recently CLOSED
+        // minute, so k = 0..N-1 are completed minutes only (no look-ahead).
+        // Returns -1 (gate does not block) when there is not enough 1-min history.
+        private double ComputeSpeedRatio(out string note)
+        {
+            note = "";
+            try
+            {
+                int nS = Math.Max(1, SpeedGateShortBars);
+                int nL = Math.Max(nS + 1, SpeedGateLongBars);
+                if (BarsArray == null || BarsArray.Length < 2 || CurrentBars.Length < 2)
+                { note = "no 1-min series"; return -1; }
+                if (CurrentBars[1] < nL - 1)
+                { note = "not enough 1-min history (" + (CurrentBars[1] + 1) + "/" + nL + ")"; return -1; }
+                double sumS = 0, sumL = 0;
+                for (int k = 0; k < nL; k++)
+                {
+                    double r = Highs[1][k] - Lows[1][k];
+                    sumL += r;
+                    if (k < nS) sumS += r;
+                }
+                double avgL = sumL / nL;
+                if (avgL <= 0) { note = "flat long window"; return -1; }
+                return (sumS / nS) / avgL;
+            }
+            catch (Exception ex)
+            {
+                note = "error: " + ex.Message;
+                return -1;
             }
         }
 
@@ -1973,6 +2050,31 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Trend Gate: max net UP-bricks to allow SHORT", Order = 3, GroupName = "9. Trend Gate",
             Description = "SHORT: skip the entry when net up-bricks over the window EXCEEDS this (a strong rally). Default 3 (research: net10 >= 4 was below breakeven).")]
         public int TrendGateMaxNetUp { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Speed Gate", Order = 4, GroupName = "9. Trend Gate",
+            Description = "OFF by default. Skips a REAL entry when recent 1-min bars are much larger than usual "
+                        + "(fast market: a 1-brick bounce rarely transits). Pipeline / arming / logging unaffected. "
+                        + "The ratio is always printed in the diag log for every would-be trade.")]
+        public bool EnableSpeedGate { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 60)]
+        [Display(Name = "Speed Gate: short window (1-min bars)", Order = 5, GroupName = "9. Trend Gate",
+            Description = "Recent window. Default 10.")]
+        public int SpeedGateShortBars { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(20, 250)]
+        [Display(Name = "Speed Gate: long window (1-min bars)", Order = 6, GroupName = "9. Trend Gate",
+            Description = "Baseline window. Default 200 (max 250, within the strategy's 256-bar lookback).")]
+        public int SpeedGateLongBars { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.5, 10.0)]
+        [Display(Name = "Speed Gate: max ratio to allow entry", Order = 7, GroupName = "9. Trend Gate",
+            Description = "Skip the entry when short-window avg range / long-window avg range EXCEEDS this. Default 1.8.")]
+        public double SpeedGateMaxRatio { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Re-warm pipeline on disconnect (advanced)", Order = 6, GroupName = "2. Timing",
