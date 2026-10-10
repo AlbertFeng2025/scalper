@@ -29,21 +29,14 @@ using NinjaTrader.NinjaScript.Strategies;
 //   trades; the fixed book gets that free by fixing direction.
 //
 //   WARM-UP / SESSION TEMPLATE:  filter2Outcome (=> F3) needs several L2 would-be
-//   trades to accumulate before it can arm. To carry a pre-market warm-up into the
-//   09:30 RTH window, apply an ETH (24h Globex) session template and enable ~5 AM.
-//   An RTH template opens a NEW session at 09:30 and (with RestartOnNewSession=true)
-//   WIPES the pipeline at 09:30 -> you start cold. Use ETH, or RestartOnNewSession=false.
+//   trades to accumulate before it can arm. The SEED BACK-FILL (below) now does that
+//   warm-up from the chart's history of the CURRENT SESSION at enable time. Use an
+//   ETH (24h Globex) template so the session (and the back-fill) reaches back to the
+//   18:00 ET open; an RTH template starts the session at 09:30 -> little/no history.
 //
 //   Bit convention (MERGED / LONG-string):  Close rose = GREEN = 1
 //                                            Close fell = RED   = 0
 //   shortString = bitwise flip of longString.
-//
-//   Each brick, F1 is tested against BOTH strings:
-//     - longString  tail matches F1  ->  a LONG transit  -> place LONG
-//     - shortString tail matches F1  ->  a SHORT transit -> place SHORT
-//   For F1="10" the two never match on the same brick (a tail can't be both
-//   "10" and "01"); if a symmetric F1 ever matches both, LONG is taken first
-//   and (serialized) SHORT is skipped while the long is open.
 //
 //   DIRECTION = the book that matched. "Chase the transit":
 //     long-string "10" (green->red) -> bet next green -> LONG
@@ -53,17 +46,19 @@ using NinjaTrader.NinjaScript.Strategies;
 //     LONG : stop = brickClose - StopLossPoints (below), target = brickClose + ProfitTargetPoints (above)
 //     SHORT: stop = brickClose + StopLossPoints (above), target = brickClose - ProfitTargetPoints (below)
 //
-//   Layer 1 = fires on EVERY F1 match (no F2 gate). filter1Outcome (merged,
-//   win-encoded) is still collected for observation/logging.
-//
 //   ONE account, SERIALIZED: a new signal is skipped while a position/order is
-//   open. With exit-bit=1 (win-and-quit) the book clears fast, so the next
-//   transit is usually free to take.
+//   open. Qty rule / exit-bit / breaker all read the MERGED realTradeOutcome.
 //
-//   Qty rule, breaker, exit-bit, trading hours, gap fresh-start, and the
-//   StopCancelCloseIgnoreRejects safety are the SAME as the single-book files.
-//   Qty rule / exit-bit / breaker all read the MERGED realTradeOutcome (a loss
-//   is a loss regardless of side).
+// CHANGES 2026-10-10
+//   (1) SEED BACK-FILL: on enable, replays up to SeedBrickCount already-closed
+//       bricks of the CURRENT SESSION (stops at the session start) through the
+//       same pipeline as live bricks -> color strings, filter1Outcome, F2 arm,
+//       filter2Outcome and F3 arm are rebuilt "as if the strategy had been running".
+//       If fully armed after the replay, the next qualifying live F1 brick trades.
+//       Replay NEVER places orders and does not count toward MaxTotalBarCount.
+//   (2) Entry-fill re-drive of DoFlatten during shutdown (was only in Layer 1).
+//   (3) SHUTDOWN HEARTBEAT: while a shutdown is in progress, a 1-second timer
+//       re-drives DoFlatten until flat + order-free.
 // =============================================================================
 namespace NinjaTrader.NinjaScript.Strategies
 {
@@ -72,7 +67,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ── merged pipeline strings (LONG encoding: green=1/red=0) ────────────
         private readonly StringBuilder longStr        = new StringBuilder();
         private readonly StringBuilder shortStr       = new StringBuilder();
-        private readonly StringBuilder filter1Outcome = new StringBuilder(); // merged, win-encoded (observation)
+        private readonly StringBuilder filter1Outcome = new StringBuilder(); // merged, win-encoded (feeds F2)
         private readonly StringBuilder realTradeOutcome = new StringBuilder(); // merged real W/L
         private readonly StringBuilder filter2Outcome = new StringBuilder(); // L3: win/loss of ARMED (L2) would-be trades
 
@@ -117,6 +112,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool     flattenGaveUp    = false;              // stop firing after MaxFlattenAttempts
         private bool     inDoFlatten      = false;              // re-entrancy guard (order submit can call back synchronously)
         private const int MaxFlattenAttempts = 8;               // hard cap so we can NEVER spam orders
+        private System.Timers.Timer flattenTimer = null;        // shutdown heartbeat: re-drives DoFlatten ~1/sec until clean
         private int      winQtyThisTrade  = 0;                  // contracts this trade closed on Profit target
         private int      lossQtyThisTrade = 0;                  // contracts this trade closed on Stop loss (or unknown)
         private DateTime entryFillUtc     = DateTime.MinValue;  // when the current entry last filled
@@ -127,7 +123,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // ── logging / gap ─────────────────────────────────────────────────────
         private string  activeLogFilePath = null;
-        private bool    seedPending      = false;   // prepend the previously-closed bar once after a clean enable (NOT the forming bar)
+        private bool    seedPending      = false;   // back-fill history once after a clean enable (on the first live brick)
         private bool    firstBrickDone   = false;
         private int     lastProcessedBar = -1;      // brick-contiguity (hole) detection
         private bool    marginActive     = false;   // inside the margin-cutoff flat window
@@ -150,15 +146,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Name        = "Renko_mergedTransit_layer3";
                 Description = "Dual-direction MERGED Renko Layer-3. green=1/red=0. F1 picks direction; F2 arms on the "
                             + "F1-trade win/loss string (filter1Outcome); F3 arms on the ARMED-trade win/loss string "
-                            + "(filter2Outcome). Real order needs F1 signal AND F2-armed AND F3-armed. Use an ETH "
-                            + "template for a pre-market warm-up into 09:30.";
+                            + "(filter2Outcome). Real order needs F1 signal AND F2-armed AND F3-armed. Seed back-fill "
+                            + "warms all layers from the current session's history at enable (use an ETH template).";
 
                 Calculate                    = Calculate.OnBarClose;
                 EntriesPerDirection          = 1;
                 EntryHandling                = EntryHandling.AllEntries;
                 IsExitOnSessionCloseStrategy = true;
                 ExitOnSessionCloseSeconds    = 30;
-                MaximumBarsLookBack          = MaximumBarsLookBack.TwoHundredFiftySix;
+                MaximumBarsLookBack          = MaximumBarsLookBack.Infinite;   // seed back-fill may read far back
                 StartBehavior                = StartBehavior.WaitUntilFlat;
                 TimeInForce                  = TimeInForce.Gtc;
                 RealtimeErrorHandling        = RealtimeErrorHandling.StopCancelCloseIgnoreRejects;
@@ -190,6 +186,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 LogFolder            = @"C:\temp";
                 LogBaseName          = "Renko_mergedTransit_layer3";
                 SeedPendingBarOnStart = true;
+                SeedBrickCount        = 1000;   // back-fill up to 1000 closed bricks (current session only)
                 RestartOnNewSession   = true;
                 EnableMarginCutoff    = true;   // early EOD before broker overnight-margin snapshot
                 MarginCutoffHour      = 16;     // 16:35 NY cutoff -> flatten 16:30 NY (15 min before the 16:45 NY snapshot)
@@ -214,6 +211,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     ParseQtyRule();
                     FreshStart("strategy enabled (fresh start)", SeedPendingBarOnStart);
                 }
+            }
+            else if (State == State.Terminated)
+            {
+                StopFlattenTimer();   // never leave the shutdown heartbeat running
             }
         }
 
@@ -297,31 +298,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string thName = "(unknown)";
                 try { if (Bars != null && Bars.TradingHours != null) thName = Bars.TradingHours.Name; } catch {}
                 DiagLog("[SESSION TEMPLATE] " + thName + " | RestartOnNewSession=" + RestartOnNewSession
-                    + " -- WARM-UP: for 09:30 RTH trading with a pre-market warm-up, use an ETH (24h) template. "
-                    + "An RTH template resets the pipeline at the 09:30 session open (when RestartOnNewSession=true) -> no warm-up.");
+                    + " -- the seed back-fill reaches back only to this template's session start. For 09:30 RTH "
+                    + "trading with a full overnight warm-up, use an ETH (24h) template.");
             }
 
-            // ── SEED (one time, after a clean enable): prepend the PREVIOUSLY-CLOSED bar (the bar just BEFORE the one forming at enable),
-            //    recovered from Close[1] vs Close[2] on the first realtime brick. (Verified 2026-08-14: seededCloseTime predated enable -> this is the prior closed bar; the forming bar is captured normally as the first live brick / Close[0].) Observation only - it NEVER places an order. ──
+            // ── SEED BACK-FILL (one time, after a clean enable): replay the already-closed bricks of
+            //    the CURRENT SESSION (up to SeedBrickCount) through the same pipeline, so all strings and
+            //    the F2/F3 armed states are warm before this first live brick. NEVER places an order. ──
             if (seedPending)
             {
                 seedPending = false;
-                if (CurrentBar >= 2)
-                {
-                    int seedBit;
-                    if (Close[1] > Close[2])      seedBit = 1;   // green
-                    else if (Close[1] < Close[2]) seedBit = 0;   // red
-                    else                          seedBit = 0;
-                    longStr.Append(seedBit == 1 ? "1" : "0");
-                    shortStr.Append(seedBit == 1 ? "0" : "1");
-                    prevBarBit = seedBit;
-                    barCount++;
-                    DiagLog("[SEED BAR #" + barCount + "] seededClose=" + Close[1].ToString("F2")
-                        + " seededCloseTime=" + Time[1].ToString("yyyy-MM-dd HH:mm:ss")
-                        + " (compare to enable time: before=previous-closed bar, after=forming bar)"
-                        + " prevClose=" + Close[2].ToString("F2") + " bit="
-                        + seedBit + " (" + (seedBit == 1 ? "GREEN" : "RED") + ") - observation only, no order.");
-                }
+                ReplaySeedBricks();
             }
 
             // ── life / bar-count / breaker shutdown checks ───────────────────
@@ -331,53 +318,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (realLossesInARow >= MaxRealLossInARow) { BeginShutdown("MaxRealLossInARow reached"); return; }
 
             // ── derive the brick bit (green=1 / red=0) from close-vs-close ────
-            int bit;
-            if (Close[0] > Close[1])      bit = 1;   // up brick  (green)
-            else if (Close[0] < Close[1]) bit = 0;   // down brick (red)
-            else                          bit = (prevBarBit >= 0) ? prevBarBit : 0;
-            prevBarBit = bit;
+            int bit = BitFor(Close[0], Close[1]);
             barCount++;
 
-            // ── collect prior-match observation outcomes (merged, win-encoded)
-            // long win = green next (bit==1); short win = red next (bit==0)
-            if (waitLongOutcome)
-            {
-                waitLongOutcome = false;
-                filter1Outcome.Append(bit == 1 ? "1" : "0");
-                isArmed = TailMatchesAnyF2(filter1Outcome.ToString());
-                DiagLog(isArmed ? "[F2 MATCH] armed=true" : "[F2] armed=false");
-            }
-            if (waitShortOutcome)
-            {
-                waitShortOutcome = false;
-                filter1Outcome.Append(bit == 0 ? "1" : "0");
-                isArmed = TailMatchesAnyF2(filter1Outcome.ToString());
-                DiagLog(isArmed ? "[F2 MATCH] armed=true" : "[F2] armed=false");
-            }
-            if (filter1Outcome.Length > 2048) filter1Outcome.Remove(0, filter1Outcome.Length - 2048);
-
-            // ── L3: collect ARMED (L2) would-be-trade outcomes -> feeds F3 (win-encoded) ─
-            if (waitLongOutcome2)
-            {
-                waitLongOutcome2 = false;
-                filter2Outcome.Append(bit == 1 ? "1" : "0");   // long L2 trade wins on next GREEN
-                isArmed3 = TailMatchesAnyF3(filter2Outcome.ToString());
-                DiagLog(isArmed3 ? "[F3 MATCH] armed3=true" : "[F3] armed3=false");
-            }
-            if (waitShortOutcome2)
-            {
-                waitShortOutcome2 = false;
-                filter2Outcome.Append(bit == 0 ? "1" : "0");   // short L2 trade wins on next RED
-                isArmed3 = TailMatchesAnyF3(filter2Outcome.ToString());
-                DiagLog(isArmed3 ? "[F3 MATCH] armed3=true" : "[F3] armed3=false");
-            }
-            if (filter2Outcome.Length > 2048) filter2Outcome.Remove(0, filter2Outcome.Length - 2048);
-
-            // ── append bit to both strings ───────────────────────────────────
-            longStr.Append(bit == 1 ? "1" : "0");
-            shortStr.Append(bit == 1 ? "0" : "1");
-            if (longStr.Length  > 2048) longStr.Remove(0, longStr.Length - 2048);
-            if (shortStr.Length > 2048) shortStr.Remove(0, shortStr.Length - 2048);
+            // ── pipeline: collect L1/L2 outcomes (updates F2/F3 arms), append bit, test F1, arm observation ──
+            bool longMatch, shortMatch;
+            ProcessBrick(bit, true, out longMatch, out shortMatch);
 
             DiagLog(string.Format("[BRICK #{0}] Close={1:F2} Prev={2:F2} bit={3}({4}) | longTail={5} shortTail={6}",
                 barCount, Close[0], Close[1], bit, bit == 1 ? "GREEN/up" : "RED/down",
@@ -387,14 +333,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             // f1out = every F1 transit; f2out = F2-armed transits only (sparser subsequence).
             DiagLog(string.Format("[OUT   #{0}] f1out={1} f2out={2}",
                 barCount, TailOf(filter1Outcome, 24), TailOf(filter2Outcome, 24)));
-
-            // ── test F1 against BOTH books ───────────────────────────────────
-            bool longMatch  = TailMatchesAny(longStr.ToString());
-            bool shortMatch = TailMatchesAny(shortStr.ToString());
-
-            // observation arm (collect next-brick outcome regardless of trading)
-            if (longMatch)  waitLongOutcome  = true;
-            if (shortMatch) waitShortOutcome = true;
 
             // ── fire (serialized): LONG first, then SHORT if still free ───────
             bool busy = hasOpenPosition() || entryInFlight || awaitingClose;
@@ -410,20 +348,135 @@ namespace NinjaTrader.NinjaScript.Strategies
                 busy = true;
             }
 
+            // (the L2 would-be outcome arming for F3 learning now happens inside ProcessBrick)
             if (longMatch)
             {
-                bool l2long = isArmed;                  // Layer-2 would-be LONG trade (F1 while F2-armed)
-                if (l2long) waitLongOutcome2 = true;    // record its outcome into filter2Outcome next brick (always, for F3 learning)
-                if (l2long && isArmed3 && !busy && EnableRealOrder) { TryOpenRealTrade(+1); busy = true; }
+                if (isArmed && isArmed3 && !busy && EnableRealOrder) { TryOpenRealTrade(+1); busy = true; }
                 else DiagLog("[LONG SIGNAL] " + (!isArmed ? "not armed (F2)" : !isArmed3 ? "L2 obs only (F3 not armed)" : busy ? "skipped (busy)" : "obs only (real orders off)"));
             }
             if (shortMatch)
             {
-                bool l2short = isArmed;                 // Layer-2 would-be SHORT trade
-                if (l2short) waitShortOutcome2 = true;
-                if (l2short && isArmed3 && !busy && EnableRealOrder) { TryOpenRealTrade(-1); }
+                if (isArmed && isArmed3 && !busy && EnableRealOrder) { TryOpenRealTrade(-1); }
                 else DiagLog("[SHORT SIGNAL] " + (!isArmed ? "not armed (F2)" : !isArmed3 ? "L2 obs only (F3 not armed)" : busy ? "skipped (busy)" : "obs only (real orders off)"));
             }
+        }
+
+        // =====================================================================
+        // PIPELINE (shared by live bricks and the seed replay)
+        // =====================================================================
+        // Bit from close-vs-close; an equal close repeats the previous bit.
+        private int BitFor(double close, double prevClose)
+        {
+            int bit;
+            if (close > prevClose)      bit = 1;   // up brick  (green)
+            else if (close < prevClose) bit = 0;   // down brick (red)
+            else                        bit = (prevBarBit >= 0) ? prevBarBit : 0;
+            prevBarBit = bit;
+            return bit;
+        }
+
+        // One brick through the pipeline. Never places orders. 'live' only controls logging.
+        private void ProcessBrick(int bit, bool live, out bool longMatch, out bool shortMatch)
+        {
+            // ── L1: collect prior-match observation outcomes (merged, win-encoded) -> re-evaluate F2
+            // long win = green next (bit==1); short win = red next (bit==0)
+            if (waitLongOutcome)
+            {
+                waitLongOutcome = false;
+                filter1Outcome.Append(bit == 1 ? "1" : "0");
+                isArmed = TailMatchesAnyF2(filter1Outcome.ToString());
+                if (live) DiagLog(isArmed ? "[F2 MATCH] armed=true" : "[F2] armed=false");
+            }
+            if (waitShortOutcome)
+            {
+                waitShortOutcome = false;
+                filter1Outcome.Append(bit == 0 ? "1" : "0");
+                isArmed = TailMatchesAnyF2(filter1Outcome.ToString());
+                if (live) DiagLog(isArmed ? "[F2 MATCH] armed=true" : "[F2] armed=false");
+            }
+            if (filter1Outcome.Length > 2048) filter1Outcome.Remove(0, filter1Outcome.Length - 2048);
+
+            // ── L3: collect ARMED (L2) would-be-trade outcomes -> re-evaluate F3 (win-encoded)
+            if (waitLongOutcome2)
+            {
+                waitLongOutcome2 = false;
+                filter2Outcome.Append(bit == 1 ? "1" : "0");   // long L2 trade wins on next GREEN
+                isArmed3 = TailMatchesAnyF3(filter2Outcome.ToString());
+                if (live) DiagLog(isArmed3 ? "[F3 MATCH] armed3=true" : "[F3] armed3=false");
+            }
+            if (waitShortOutcome2)
+            {
+                waitShortOutcome2 = false;
+                filter2Outcome.Append(bit == 0 ? "1" : "0");   // short L2 trade wins on next RED
+                isArmed3 = TailMatchesAnyF3(filter2Outcome.ToString());
+                if (live) DiagLog(isArmed3 ? "[F3 MATCH] armed3=true" : "[F3] armed3=false");
+            }
+            if (filter2Outcome.Length > 2048) filter2Outcome.Remove(0, filter2Outcome.Length - 2048);
+
+            // ── append bit to both strings
+            longStr.Append(bit == 1 ? "1" : "0");
+            shortStr.Append(bit == 1 ? "0" : "1");
+            if (longStr.Length  > 2048) longStr.Remove(0, longStr.Length - 2048);
+            if (shortStr.Length > 2048) shortStr.Remove(0, shortStr.Length - 2048);
+
+            // ── test F1 against BOTH books
+            longMatch  = TailMatchesAny(longStr.ToString());
+            shortMatch = TailMatchesAny(shortStr.ToString());
+
+            // ── observation arm (collect next-brick outcome regardless of trading)
+            if (longMatch)  waitLongOutcome  = true;
+            if (shortMatch) waitShortOutcome = true;
+
+            // ── L2 would-be trade = F1 transit while F2-armed -> record its outcome into
+            //    filter2Outcome next brick (always, for F3 learning; independent of real trading)
+            if (longMatch  && isArmed) waitLongOutcome2  = true;
+            if (shortMatch && isArmed) waitShortOutcome2 = true;
+        }
+
+        // =====================================================================
+        // SEED BACK-FILL — replay closed bricks of the CURRENT SESSION.
+        // Close[0] is the first live brick. Bricks Close[1..k] closed before enable.
+        // k = the smaller of SeedBrickCount and "bricks back to the session start".
+        // The session's first brick is included (its bit compares to the prior
+        // session's last brick, exactly as the live code does at a session roll).
+        // =====================================================================
+        private void ReplaySeedBricks()
+        {
+            if (Bars.IsFirstBarOfSession)
+            {
+                DiagLog("[SEED] first live brick opens a new session -> nothing to back-fill (session gate).");
+                return;
+            }
+
+            int maxN = Math.Max(1, SeedBrickCount);
+            int k = 0;
+            string stopReason = "SeedBrickCount (" + maxN + ") reached";
+            for (int i = 1; i <= maxN; i++)
+            {
+                if (i + 1 > CurrentBar) { stopReason = "no older bricks loaded (increase Days to load)"; break; }
+                k = i;
+                if (Bars.IsFirstBarOfSessionByIndex(CurrentBar - i)) { stopReason = "session start reached"; break; }
+            }
+
+            if (k == 0)
+            {
+                DiagLog("[SEED] no closed bricks available to back-fill (" + stopReason + ").");
+                return;
+            }
+
+            for (int i = k; i >= 1; i--)   // oldest first
+            {
+                int bit = BitFor(Close[i], Close[i + 1]);
+                bool lm, sm;
+                ProcessBrick(bit, false, out lm, out sm);
+            }
+
+            DiagLog(string.Format("[SEED] back-filled {0} brick(s): {1:yyyy-MM-dd HH:mm:ss} -> {2:yyyy-MM-dd HH:mm:ss} "
+                + "(stopped: {3}). Observation only - no orders, not counted in MaxTotalBarCount.",
+                k, Time[k], Time[1], stopReason));
+            DiagLog(string.Format("[SEED] state after back-fill | longTail={0} shortTail={1} | f1out={2} | armedF2={3} | f2out={4} | armedF3={5}",
+                TailOf(longStr, 24), TailOf(shortStr, 24), TailOf(filter1Outcome, 40), isArmed,
+                TailOf(filter2Outcome, 40), isArmed3));
         }
 
         // =====================================================================
@@ -509,6 +562,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 entryFillUtc   = DateTime.UtcNow;   // stamp fill -> starts the naked-guard grace window
                 if (execution.Order.OrderState == OrderState.Filled)
                     entryInFlight = false;
+                // If we're shutting down while the entry is still filling, re-drive the flatten so
+                // the newly-arrived contracts get covered (same fix as Layer 1, test3).
+                if (pendingFlatten) DoFlatten();
                 return;
             }
 
@@ -529,7 +585,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 RecordTradeOutcome(win, price);
             }
 
-            // NEW: re-drive shutdown completion on every fill (e.g. the flatten just filled).
+            // re-drive shutdown completion on every fill (e.g. the flatten just filled).
             if (pendingFlatten) DoFlatten();
         }
 
@@ -581,7 +637,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool isProtective = (nm == "Stop loss" || nm == "Profit target");
             bool isEntry      = (nm == ENTRY_LONG || nm == ENTRY_SHORT);
 
-            // NEW: a modify/REPLACE reject (e.g. NinjaTrader's OCO reduce-to-zero on a
+            // a modify/REPLACE reject (e.g. NinjaTrader's OCO reduce-to-zero on a
             // partial-fill exit) leaves the protective order LIVE at the broker. Force-cancel
             // that leftover so it cannot fill later as an orphan. No shutdown here.
             // Only when FLAT: a modify-rejected protective order is then a genuine leftover
@@ -604,35 +660,35 @@ namespace NinjaTrader.NinjaScript.Strategies
                     + "in place (still protecting the position); the naked guard is the backstop.", nm, error));
             }
 
-            // EXISTING (unchanged): a REJECTED protective order -> flatten + shutdown (8:22 case).
+            // a REJECTED protective order -> flatten + shutdown (8:22 case).
             if (orderState == OrderState.Rejected)
             {
-            if (isProtective)
-            {
-                DiagLog(string.Format("[ORPHAN GUARD] protective order '{0}' REJECTED ({1}) -> "
-                    + "position is unprotected, flattening at market now.", nm, error));
-                BeginShutdown("protective order rejected (orphan guard)");
-                return;
+                if (isProtective)
+                {
+                    DiagLog(string.Format("[ORPHAN GUARD] protective order '{0}' REJECTED ({1}) -> "
+                        + "position is unprotected, flattening at market now.", nm, error));
+                    BeginShutdown("protective order rejected (orphan guard)");
+                    return;
+                }
+
+                if (isEntry)
+                {
+                    if (hasOpenPosition())
+                    {
+                        DiagLog(string.Format("[ORPHAN GUARD] entry '{0}' REJECTED ({1}) but a partial "
+                            + "position exists -> flattening at market now.", nm, error));
+                        BeginShutdown("entry rejected with open position (orphan guard)");
+                    }
+                    else
+                    {
+                        DiagLog(string.Format("[ORPHAN GUARD] entry '{0}' REJECTED ({1}), nothing filled "
+                            + "-> clearing in-flight state so the strategy does not freeze.", nm, error));
+                        awaitingClose = false; entryInFlight = false; tradeSide = 0;
+                    }
+                }
             }
 
-            if (isEntry)
-            {
-                if (hasOpenPosition())
-                {
-                    DiagLog(string.Format("[ORPHAN GUARD] entry '{0}' REJECTED ({1}) but a partial "
-                        + "position exists -> flattening at market now.", nm, error));
-                    BeginShutdown("entry rejected with open position (orphan guard)");
-                }
-                else
-                {
-                    DiagLog(string.Format("[ORPHAN GUARD] entry '{0}' REJECTED ({1}), nothing filled "
-                        + "-> clearing in-flight state so the strategy does not freeze.", nm, error));
-                    awaitingClose = false; entryInFlight = false; tradeSide = 0;
-                }
-            }
-            }
-
-            // NEW: while shutting down, re-drive the flatten/terminate check on every order
+            // while shutting down, re-drive the flatten/terminate check on every order
             // state change (e.g. a cancel just confirmed) so we finish once flat AND order-free.
             if (pendingFlatten) DoFlatten();
         }
@@ -689,7 +745,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // =====================================================================
-        // F1 parse + wildcard matcher (?=1+ ones, *=1+ zeros)
+        // F1 / F2 / F3 parse + wildcard matcher (?=1+ ones, *=1+ zeros)
         // =====================================================================
         private void ParseFilter1Patterns()
         {
@@ -824,13 +880,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             catch { activeLogFilePath = null; }
             DiagLog("[FRESH START] " + reason + " | seed=" + seed + " | new log=" + activeLogFilePath
-                + " | pipeline EMPTY, will arm naturally (no real trades until a transit fires).");
+                + " | pipeline EMPTY" + (seed ? " (session back-fill runs on the first live brick)" : ", will arm naturally")
+                + " (no real trades until a transit fires).");
             DiagLog(string.Format("{0} ready (MERGED L3). EnableRealOrder={1}, F1=[{2}], F2=[{3}], F3=[{11}], Stop={4}pt, Target={5}pt, "
                 + "ExitBit={6}({7}), MaxLossRow={8}, Seed={9}, RestartOnNewSession={10} | "
                 + "Hours={12}({13:00}:{14:00}-{15:00}:{16:00} NY) | MarginCutoff={17} flat@{18:00}:{19:00} NY "
                 + "(cutoff {20:00}:{21:00} lead {22}m)",
                 Name, EnableRealOrder, Filter1Pattern, Filter2Pattern, StopLossPoints, ProfitTargetPoints,
-                EnableTradeOutcomeExit, TradeOutcomeExitPattern, MaxRealLossInARow, SeedPendingBarOnStart, RestartOnNewSession, Filter3Pattern,
+                EnableTradeOutcomeExit, TradeOutcomeExitPattern, MaxRealLossInARow,
+                SeedPendingBarOnStart ? ("ON(" + SeedBrickCount + " bricks, session-gated)") : "OFF", RestartOnNewSession, Filter3Pattern,
                 EnableTradingHours ? "ON" : "OFF", TradingStartHour, TradingStartMinute, TradingEndHour, TradingEndMinute,
                 EnableMarginCutoff ? "ON" : "OFF",
                 (MarginCutoffHour * 60 + MarginCutoffMinute - MarginCutoffLeadMin) / 60,
@@ -863,7 +921,52 @@ namespace NinjaTrader.NinjaScript.Strategies
             pendingFlatten = true;
             pendingReason  = reason;
             DiagLog("[SHUTDOWN] " + reason + " -> flatten + disable");
+            StartFlattenTimer();   // heartbeat first, so it is running even if this first pass is throttled
             DoFlatten();
+        }
+
+        // =====================================================================
+        // SHUTDOWN HEARTBEAT. DoFlatten only runs when an event wakes it (fill, order
+        // update, brick) and it is throttled to one pass per second. If several fills
+        // land inside that same second, every wake-up can be throttled and nothing
+        // else would wake it until the next brick. This timer wakes it ~once per
+        // second until flat AND order-free (or the 8-pass cap gives up). The throttle
+        // and cap are unchanged, so it can still never spam orders.
+        // =====================================================================
+        private void StartFlattenTimer()
+        {
+            if (flattenTimer != null) return;
+            try
+            {
+                flattenTimer = new System.Timers.Timer(1000);
+                flattenTimer.AutoReset = true;
+                flattenTimer.Elapsed += OnFlattenHeartbeat;
+                flattenTimer.Start();
+            }
+            catch (Exception ex) { DiagLog("[SHUTDOWN] heartbeat start error: " + ex.Message); }
+        }
+
+        private void StopFlattenTimer()
+        {
+            System.Timers.Timer t = flattenTimer;
+            flattenTimer = null;
+            if (t == null) return;
+            try { t.Stop(); t.Elapsed -= OnFlattenHeartbeat; t.Dispose(); } catch { }
+        }
+
+        private void OnFlattenHeartbeat(object sender, System.Timers.ElapsedEventArgs e)
+        {
+            try
+            {
+                // TriggerCustomEvent runs the callback on the strategy's own thread with a
+                // valid bar context, so DoFlatten can read Position and submit orders safely.
+                TriggerCustomEvent(o =>
+                {
+                    if (State != State.Realtime || !pendingFlatten || flattenGaveUp) { StopFlattenTimer(); return; }
+                    DoFlatten();
+                }, null);
+            }
+            catch { }
         }
 
         // =====================================================================
@@ -1016,8 +1119,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 //       (a flip), or a different quantity than last look -- and close exactly that
                 //       at market with an EMPTY-signal exit (not tied to any entry, so NinjaTrader
                 //       cannot ignore it the way it ignored the entry-bound form in test5).
-                // Repeat (re-driven by fills / order updates) until flat AND no live orders, then
-                // disable. Hard-capped so it can NEVER loop or spam market orders.
+                // Repeat (re-driven by fills / order updates / the 1-sec heartbeat) until flat AND
+                // no live orders, then disable. Hard-capped so it can NEVER loop or spam market orders.
                 if (!flattenGaveUp
                     && (DateTime.UtcNow - lastFlattenUtc).TotalSeconds >= 1.0
                     && (Position.MarketPosition != MarketPosition.Flat || HasLiveOrders()))
@@ -1063,6 +1166,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     else
                     {
                         flattenGaveUp = true;
+                        StopFlattenTimer();
                         DiagLog("[SHUTDOWN][FLATTEN FAILED] not flat & order-free after " + MaxFlattenAttempts
                             + " passes -> STOPPING (no more orders). CHECK ACCOUNT AND FLATTEN BY HAND.");
                     }
@@ -1075,6 +1179,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 try { DiagLog("[SHUTDOWN] flat & no working orders -> disabling."); } catch { }
                 pendingFlatten = false;
+                StopFlattenTimer();
                 try { SetState(State.Terminated); } catch { }
             }
             }
@@ -1164,10 +1269,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Max Total Bar Count", Order=2, GroupName="5. Session")]
         public int MaxTotalBarCount { get; set; }
 
-        [NinjaScriptProperty] [Display(Name="Seed forming brick on start", Order=3, GroupName="5. Session")]
+        [NinjaScriptProperty] [Display(Name="Seed: back-fill history on start", Order=3, GroupName="5. Session")]
         public bool SeedPendingBarOnStart { get; set; }
 
-        [NinjaScriptProperty] [Display(Name="Restart clean on new session (ETH template keeps 5AM warm-up; RTH wipes at 09:30)", Order=6, GroupName="5. Session")]
+        [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Seed brick count (max bricks back, current session only)", Order=7, GroupName="5. Session")]
+        public int SeedBrickCount { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Restart clean on new session (ETH template keeps the overnight warm-up)", Order=6, GroupName="5. Session")]
         public bool RestartOnNewSession { get; set; }
 
         [NinjaScriptProperty] [Display(Name="Log Folder", Order=4, GroupName="5. Session")]
