@@ -79,8 +79,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double entryFillPrice = 0.0;
         private int    entryFillQty   = 0;
         private int    tradeSide      = 0;      // +1 long, -1 short, 0 flat (side of the working money trade)
-        private const string ENTRY_LONG  = "ML2_Long";
-        private const string ENTRY_SHORT = "ML2_Short";
+        private const string ENTRY_LONG  = "ML3_Long";
+        private const string ENTRY_SHORT = "ML3_Short";
 
         // waiting-for-outcome (observation string, per book)
         private bool waitLongOutcome  = false;
@@ -570,11 +570,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             // Tally which bracket closed each contract, for MAJORITY-QUANTITY scoring.
             //   Profit target -> win contracts;  Stop loss -> loss contracts;
-            //   our own flatten (ML2_Flatten / ML2_MarginFlat) does NOT vote (forced cleanup, not
+            //   our own flatten (ML3_Flatten / ML3_MarginFlat) does NOT vote (forced cleanup, not
             //   a real outcome);  any unexpected name -> counted as loss (conservative).
             if      (oName == "Profit target")                            winQtyThisTrade  += quantity;
             else if (oName == "Stop loss")                                lossQtyThisTrade += quantity;
-            else if (oName == "ML2_Flatten" || oName == "ML2_MarginFlat") { /* flatten: does not vote */ }
+            else if (oName == "ML3_Flatten" || oName == "ML3_MarginFlat") { /* flatten: does not vote */ }
             else                                                          lossQtyThisTrade += quantity;
 
             // once flat, record ONE bit for the whole (possibly multi-lot, possibly split) trade:
@@ -1048,9 +1048,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // is called from the 1-min clock (BarsInProgress==1), per NinjaTrader's rule that
                 // same-instrument orders must target the first bars context.
                 if (Position.MarketPosition == MarketPosition.Short)
-                    ExitShort(0, Math.Abs(Position.Quantity), "ML2_MarginFlat", "");
+                    ExitShort(0, Math.Abs(Position.Quantity), "ML3_MarginFlat", "");
                 else if (Position.MarketPosition == MarketPosition.Long)
-                    ExitLong(0, Math.Abs(Position.Quantity), "ML2_MarginFlat", "");
+                    ExitLong(0, Math.Abs(Position.Quantity), "ML3_MarginFlat", "");
             }
             catch (Exception ex) { DiagLog("[MARGIN CUTOFF] flatten error: " + ex.Message); }
         }
@@ -1113,7 +1113,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Clean-up loop for BOTH shutdown cases (a bracket that never built -> naked from
                 // the start, OR a bracket that built then got messed up / flipped). Each pass, at
                 // most once per second and up to MaxFlattenAttempts times:
-                //   (1) cancel OUR OWN live orders FIRST (never our own ML2_Flatten) so no hidden
+                //   (1) cancel OUR OWN live orders FIRST (never our own ML3_Flatten) so no hidden
                 //       stop/target can fill and open a NEW position behind us;
                 //   (2) read the LIVE position -- direction AND size, because it can be long, short
                 //       (a flip), or a different quantity than last look -- and close exactly that
@@ -1128,11 +1128,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (flattenAttempts < MaxFlattenAttempts)
                     {
                         // (1) cancel our own live orders first -- only THIS strategy's, and never
-                        //     our own ML2_Flatten market order that is doing the closing.
+                        //     our own ML3_Flatten market order that is doing the closing.
                         foreach (Order o in Orders)
                         {
                             if (o == null) continue;
-                            if ((o.Name ?? "") == "ML2_Flatten") continue;
+                            if ((o.Name ?? "") == "ML3_Flatten") continue;
                             OrderState s = o.OrderState;
                             if (s == OrderState.Working || s == OrderState.Accepted
                                 || s == OrderState.PartFilled || s == OrderState.Submitted
@@ -1144,14 +1144,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                         if (Position.MarketPosition == MarketPosition.Long)
                         {
                             int q = Math.Abs(Position.Quantity);
-                            ExitLong(0, q, "ML2_Flatten", "");
+                            ExitLong(0, q, "ML3_Flatten", "");
                             DiagLog("[SHUTDOWN] pass " + (flattenAttempts + 1) + "/" + MaxFlattenAttempts
                                 + ": canceled own orders, closing LONG " + q + ".");
                         }
                         else if (Position.MarketPosition == MarketPosition.Short)
                         {
                             int q = Math.Abs(Position.Quantity);
-                            ExitShort(0, q, "ML2_Flatten", "");
+                            ExitShort(0, q, "ML3_Flatten", "");
                             DiagLog("[SHUTDOWN] pass " + (flattenAttempts + 1) + "/" + MaxFlattenAttempts
                                 + ": canceled own orders, closing SHORT " + q + ".");
                         }
