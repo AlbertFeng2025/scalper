@@ -348,6 +348,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Configure)
             {
+                // LIMIT ENTRY DISABLED (2026-10-21): the limit option has a known bug (an unfilled limit is
+                // never cancelled, and a late fill keeps the stale stop/target). The setting is hidden in the
+                // UI and FORCED to market here, so an old saved template/workspace with limit=on can't use it.
+                if (!UseMarketEntry)
+                    Print(Name + ": limit entry is disabled in this version -> forcing MARKET entry.");
+                UseMarketEntry = true;
+
                 // Bracket is NOT set here. It is set per-entry in TryOpenRealTrade,
                 // anchored to the BRICK CLOSE (not the entry fill), so stop/target sit
                 // exactly on the next brick thresholds and "brick color == trade
@@ -2130,11 +2137,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool AllowLogResume { get; set; }
 
         [NinjaScriptProperty]
+        [Browsable(false)]   // limit entry disabled until the limit-order fix (see Configure)
         [Display(Name = "Use market entry (else limit)", Order = 1, GroupName = "3. Entry")]
         public bool UseMarketEntry { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, double.MaxValue)]
+        [Browsable(false)]   // limit entry disabled until the limit-order fix (see Configure)
         [Display(Name = "Limit offset (points)", Order = 2, GroupName = "3. Entry")]
         public double LimitOffsetPoints { get; set; }
 

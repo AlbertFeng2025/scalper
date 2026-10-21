@@ -2,6 +2,7 @@
 using System;
 using System.IO;
 using System.Text;
+using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
@@ -175,6 +176,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Configure)
             {
+                // LIMIT ENTRY DISABLED (2026-10-21): the limit option has a known bug (an unfilled limit is
+                // never cancelled, and a late fill keeps the stale stop/target). The setting is hidden in the
+                // UI and FORCED to market here, so an old saved template/workspace with limit=on can't use it.
+                if (!UseMarketEntry)
+                    Print(Name + ": limit entry is disabled in this version -> forcing MARKET entry.");
+                UseMarketEntry = true;
+
                 // 1-minute clock series: a reliable heartbeat so the margin cutoff fires on
                 // time even when Renko bricks are sparse (thin post-RTH tape near 16:40 ET).
                 AddDataSeries(BarsPeriodType.Minute, 1);
@@ -296,7 +304,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             DiagLog(string.Format("[BRICK #{0}] Close={1:F2} Prev={2:F2} bit={3}({4}) | longTail={5} shortTail={6}",
                 barCount, Close[0], Close[1], bit, bit == 1 ? "GREEN/up" : "RED/down",
                 TailOf(longStr, 12), TailOf(shortStr, 12)));
-            DiagLog(string.Format("[OUT   #{0}] f1out={1}", barCount, TailOf(filter1Outcome, 24)));
+            DiagLog(string.Format("[OUT   #{0}] f1out={1}", barCount, ("(" + filter1Outcome.Length + ") " + filter1Outcome.ToString())));
 
             // ── fire (serialized): LONG first, then SHORT if still free ───────
             bool busy = hasOpenPosition() || entryInFlight || awaitingClose;
@@ -412,7 +420,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 + "(stopped: {3}). Observation only - no orders, not counted in MaxTotalBarCount.",
                 k, Time[k], Time[1], stopReason));
             DiagLog(string.Format("[SEED] state after back-fill | longTail={0} shortTail={1} | f1out={2}",
-                TailOf(longStr, 24), TailOf(shortStr, 24), TailOf(filter1Outcome, 40)));
+                TailOf(longStr, 24), TailOf(shortStr, 24), ("(" + filter1Outcome.Length + ") " + filter1Outcome.ToString())));
         }
 
         // =====================================================================
@@ -1125,10 +1133,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Base Quantity", Order=3, GroupName="1. Core")]
         public int BaseQuantity { get; set; }
 
-        [NinjaScriptProperty] [Display(Name="Use Market Entry", Order=4, GroupName="1. Core")]
+        [NinjaScriptProperty] [Browsable(false)] [Display(Name="Use Market Entry", Order=4, GroupName="1. Core")]
         public bool UseMarketEntry { get; set; }
 
-        [NinjaScriptProperty] [Range(0,double.MaxValue)] [Display(Name="Limit Offset Points", Order=5, GroupName="1. Core")]
+        [NinjaScriptProperty] [Browsable(false)] [Range(0,double.MaxValue)] [Display(Name="Limit Offset Points", Order=5, GroupName="1. Core")]
         public double LimitOffsetPoints { get; set; }
 
         [NinjaScriptProperty] [Range(0.25,double.MaxValue)] [Display(Name="Stop Loss Points", Order=6, GroupName="1. Core")]
